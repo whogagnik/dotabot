@@ -137,8 +137,11 @@ class ThreadRegistry:
                 entry.stop_event.set()
 
         # Затем ждём
+        current = threading.current_thread()
         for name, entry in items:
             t = entry.thread
+            if t is current:
+                continue
             if t.is_alive():
                 t.join(timeout_per_thread if timeout_per_thread is not None else self._default_join_timeout)
                 if t.is_alive():
