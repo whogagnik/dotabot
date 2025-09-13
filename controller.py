@@ -353,6 +353,23 @@ class Controller:
         for idx, acc in enumerate(selected_accounts):
             tasks.put((acc, idx))
 
+        # резервные аккаунты, которые не были изначально выбраны
+        reserve: Queue[Account] = Queue()
+        for acc in self.accounts:
+            if acc not in selected_accounts:
+                reserve.put(acc)
+
+        def _schedule_replacement(box_id: int):
+            """Подставить следующий аккаунт из резерва вместо ошибочного."""
+            if not self.farm_running or self.stop_event.is_set():
+                return
+            try:
+                next_acc = reserve.get_nowait()
+            except Empty:
+                return
+            self.farming_accounts.append(next_acc)
+            tasks.put((next_acc, box_id))
+
         workers = max(1, int(max_parallel))
         workers = min(workers, tasks.qsize())
         self.logger.info(f"Фарм: параллельность={workers}, аккаунтов={tasks.qsize()}")
@@ -370,9 +387,12 @@ class Controller:
                     # 1) запуск Steam+Dota
                     acc.set_status("launching")
                     self.logger.info(f"{acc.username}: бокс #{box_id}")
-                    hwnd = acc.launch_until_login_window(self.steam_path, app_id, box_id=box_id)
+                    hwnd = acc.launch_until_login_window(
+                        self.steam_path, app_id, box_id=box_id, stop_event=self.stop_event
+                    )
                     if not hwnd:
                         acc.set_status("error")
+                        _schedule_replacement(box_id)
                         continue
 
                     # 2) (опц.) локальный calm
@@ -387,13 +407,19 @@ class Controller:
                     if rc != 0:
                         self.logger.error(f"{acc.username}: QR rc={rc}")
                         acc.set_status("error")
+                        _schedule_replacement(box_id)
                         continue
                     self.logger.info(f"{acc.username}: QR подтверждён")
 
                     # 4) Dota окно/раскладка/лимит
-                    ok = acc.wait_dota_and_arrange(index_for_layout=box_id, cpu_limit_percent=self.cpu_limit_percent)
+                    ok = acc.wait_dota_and_arrange(
+                        index_for_layout=box_id,
+                        cpu_limit_percent=self.cpu_limit_percent,
+                        stop_event=self.stop_event,
+                    )
                     if not ok:
                         acc.set_status("error")
+                        _schedule_replacement(box_id)
                         continue
 
                     # зарегистрируем hwnd для автоматики
@@ -404,6 +430,11 @@ class Controller:
 
                     # пробуем стартануть image-automation, когда готово достаточно окон
                     self._try_start_image_automation(total_planned=len(selected_accounts), make_party=make_party)
+
+                except Exception as e:
+                    self.logger.error(f"{acc.username}: исключение воркера: {e}")
+                    acc.set_status("error")
+                    _schedule_replacement(box_id)
 
                 finally:
                     try:
