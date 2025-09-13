@@ -5,6 +5,7 @@ from stat import S_IWRITE
 from pathlib import Path
 import psutil
 from windowPlacer import WindowPlacer
+from threadRegistry import ThreadRegistry
 import win32gui, win32api, win32con, win32process
 import ctypes
 import pyautogui as p
@@ -112,8 +113,9 @@ def _client_region(hwnd: int) -> Tuple[int,int,int,int]:
 
 class Account:
     def __init__(self, username:str, password:str, logger:logging.Logger, placer:WindowPlacer,
-                 status_cb:Callable[[str,str],None]):
+                 status_cb:Callable[[str,str],None], *, thread_registry: Optional[ThreadRegistry] = None):
         self.username=username; self.password=password; self.logger=logger; self.placer=placer; self.status_cb=status_cb
+        self.thread_registry = thread_registry
         self.mafile_data:Optional[dict]=None; self.mafile_path:Optional[str]=None
         self.steam_id:Optional[str] = None
         self._qr_proc:Optional[subprocess.Popen]=None
@@ -451,10 +453,15 @@ class Account:
                 try:
                     if self._qr_proc and self._qr_proc.stdout:
                         for line in self._qr_proc.stdout:
-                            if not line: break
+                            if not line:
+                                break
                             self.logger.info(line.rstrip("\r\n"))
-                except Exception: pass
-            threading.Thread(target=_tail_stdout, daemon=True).start()
+                except Exception:
+                    pass
+            t = threading.Thread(target=_tail_stdout, daemon=True)
+            if self.thread_registry:
+                self.thread_registry.set(f"qr-tail-{self.username}", t, manage_stop=False)
+            t.start()
 
             absent_since = None
             grace = max(LOGIN_GONE_GRACE_SEC, 6)
