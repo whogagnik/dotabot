@@ -5,10 +5,20 @@ from stat import S_IWRITE
 from pathlib import Path
 import psutil
 from windowPlacer import WindowPlacer
-# import win32job  # для Job Object cpu cap (не используем здесь)
 import win32gui, win32api, win32con, win32process
 import ctypes
 import pyautogui as p
+
+"""
+Адаптация под «Avast Sandbox» (или любой автосэндбокс), где:
+  • мы НЕ используем Sandboxie Start.exe и /box:<id>;
+  • Steam будет запускаться пользователем заранее сконфигурированным «в песочнице»;
+  • мы просто стартуем steam.exe напрямую и работаем с ЕГО деревом процессов.
+
+ВАЖНО: Для совместимости с существующим кодом мы сохраняем те же публичные
+методы/сигнатуры (get_box_pids(box_id), _find_login_hwnd_in_box, wait_for_process_in_box и т.д.).
+Теперь они игнорируют box_id и опираются на «дерево процессов» текущего аккаунта.
+"""
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -107,10 +117,13 @@ class Account:
         self.mafile_data:Optional[dict]=None; self.mafile_path:Optional[str]=None
         self.steam_id:Optional[str] = None
         self._qr_proc:Optional[subprocess.Popen]=None
-        self.login_hwnd:Optional[int]=None; self.box_id:Optional[int]=None
+        self.login_hwnd:Optional[int]=None; self.box_id:Optional[int]=None  # box_id теперь только для раскладки (индекс)
         self.dota_pid:Optional[int]=None; self.dota_hwnd:Optional[int]=None
         self.hours_played:Optional[int] = None
         self.status="idle"; self.session_seconds=0
+
+        # новое: корневой процесс steam.exe, который мы запустили (держим pid)
+        self._root_pid: Optional[int] = None
         self._steam_path: Optional[str] = None
         self._app_id: Optional[int] = None
 
@@ -120,111 +133,61 @@ class Account:
         except Exception: pass
 
     def attach_mafile(self, path:str, data:dict): self.mafile_path=path; self.mafile_data=data
-    @staticmethod
-    def _sandboxie_path()->str: return SANDBOXIE_START_EXE
 
-    # ---------- процессы в боксе ----------
-    def wait_for_process_in_box(
-            self,
-            box_id: int,
-            names: List[str],
-            max_attempts: int = WAIT_STEAM_PROC_ATTEMPTS,
-            interval: float = WAIT_STEAM_PROC_INTERVAL,
-            match_fn: Optional[Callable[[psutil.Process], bool]] = None
-    ) -> Optional[psutil.Process]:
-        if box_id is None:
-            return None
-        target_names = {n.lower() for n in names if n}
-        for _ in range(max_attempts):
-            pids = self.get_box_pids(box_id)
-            if pids:
-                for pid in pids:
-                    try:
-                        p = psutil.Process(pid)
-                        pname = (p.name() or "").lower()
-                        if pname in target_names and (match_fn is None or match_fn(p)):
-                            return p
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                        continue
-            time.sleep(interval)
-        return None
-
-    def get_box_pids(self, box_id:int)->List[int]:
+    # ================== helpers: процессное дерево для текущего аккаунта ==================
+    def _proc_tree_pids(self) -> List[int]:
+        """
+        PID'ы корневого процесса и всех его потомков (на момент вызова).
+        Используется вместо «песочницы».
+        """
+        res: List[int] = []
+        if not self._root_pid:
+            return res
         try:
-            out=subprocess.check_output([self._sandboxie_path(), f"/box:{box_id}", "/listpids"],
-                                        text=True, stderr=subprocess.DEVNULL)
-            lines=(out or "").strip().splitlines()
-            if not lines: return []
-            count=int(lines[0]); return [int(x) for x in lines[1:1+count]]
-        except Exception: return []
-
-    def kill_box_processes(self, box_id:int):
-        pids=self.get_box_pids(box_id)
-        if not pids: return
-        for pid in pids:
-            try: psutil.Process(pid).terminate()
-            except Exception: pass
-        t0=time.time()
-        while time.time()-t0<3:
-            alive=False
-            for pid in list(pids):
+            root = psutil.Process(self._root_pid)
+        except Exception:
+            return res
+        try:
+            res.append(root.pid)
+            for ch in root.children(recursive=True):
                 try:
-                    if psutil.Process(pid).is_running(): alive=True; break
-                except Exception: pass
-            if not alive: break
-            time.sleep(0.2)
-        for pid in self.get_box_pids(box_id):
-            try: psutil.Process(pid).kill()
-            except Exception: pass
-
-    # ---------- каталоги / очистка ----------
-    def _sandbox_dirs(self, box_name: str) -> List[Path]:
-        user = os.environ.get("USERNAME") or ""
-        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-        local_appdata = os.environ.get("LOCALAPPDATA", rf"C:\Users\{user}\AppData\Local")
-        candidates = [
-            Path(r"C:\Sandbox") / user / box_name,
-            Path(program_data) / "Sandboxie-Plus" / "Sandboxes" / box_name,
-            Path(program_data) / "Sandboxie" / "Sandboxes" / box_name,
-            Path(local_appdata) / "Sandboxie-Plus" / "Sandboxes" / box_name,
-        ]
-        uniq, seen = [], set()
-        for p in candidates:
-            try: rp = p.resolve()
-            except Exception: rp = p
-            k=str(rp).lower()
-            if k in seen: continue
-            uniq.append(rp); seen.add(k)
-        return uniq
-
-    def _rmtree_force(self, p:Path):
-        if not p.exists(): return
-        for root,dirs,files in os.walk(p, topdown=False):
-            for name in files:
-                try: os.chmod(os.path.join(root,name), S_IWRITE)
-                except Exception: pass
-        try: shutil.rmtree(p, ignore_errors=True)
-        except Exception: pass
-
-    def clear_sandboxie_cache(self, box_id:int):
-        box_name = str(box_id)
-        try:
-            subprocess.run([self._sandboxie_path(), f"/box:{box_name}", "/terminate"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                    res.append(ch.pid)
+                except Exception:
+                    pass
         except Exception:
             pass
-        removed_any = False
-        for p in self._sandbox_dirs(box_name):
-            if p.exists():
-                try:
-                    self._rmtree_force(p); removed_any = True
-                    self.logger.info(f"{self.username}: песочница очищена: {p}")
-                except Exception as e:
-                    self.logger.warning(f"{self.username}: не удалось удалить {p}: {e}")
-        if not removed_any:
-            self.logger.info(f"{self.username}: каталоги песочницы для {box_name} не найдены — пропуск чистки")
+        return res
+
+    # Совместимость для Controller._box_proc_list(...)
+    def get_box_pids(self, box_id:int) -> List[int]:
+        return self._proc_tree_pids()
+
+    # ================== «очистки» (минимально-неопасные) ==================
+    def kill_box_processes(self, box_id:int):
+        """Завершаем дерево процессов, запущенных нами (steam.exe и дети)."""
+        pids = self._proc_tree_pids()
+        if not pids: return
+        # Сначала мягко
+        for pid in pids:
+            try:
+                psutil.Process(pid).terminate()
+            except Exception:
+                pass
+        t0 = time.time()
+        while time.time() - t0 < 3:
+            if not any(psutil.pid_exists(pid) for pid in pids):
+                break
+            time.sleep(0.2)
+        # Жёстко оставшихся
+        for pid in list(pids):
+            try:
+                if psutil.pid_exists(pid):
+                    psutil.Process(pid).kill()
+            except Exception:
+                pass
 
     def clear_real_steam_auth(self, steam_path:str):
+        """Как и раньше: чистим реальный Steam (config/loginusers + userdata)."""
         try:
             root=Path(steam_path).resolve().parent
             cfg=root/"config"; userdata=root/"userdata"
@@ -235,25 +198,33 @@ class Account:
             if userdata.exists():
                 for child in userdata.iterdir():
                     if child.is_dir():
-                        try: self._rmtree_force(child)
-                        except Exception as e: self.logger.warning(f"Не удалось удалить {child}: {e}")
+                        try:
+                            shutil.rmtree(child, ignore_errors=True)
+                        except Exception as e:
+                            self.logger.warning(f"Не удалось удалить {child}: {e}")
             self.logger.info("Очистка реального Steam: config/loginusers + userdata — ОК")
         except Exception as e:
             self.logger.warning(f"Очистка реального Steam не удалась: {e}")
 
-    # ---------- поиск окна логина ----------
-    def _find_login_hwnd_in_box(self, box_id:int, timeout_s:int=WAIT_LOGIN_WIN_TIMEOUT)->Optional[int]:
+    # Заглушка для старого API (ничего не делаем — Avast сам управляет песочницей)
+    def clear_sandboxie_cache(self, box_id:int):
+        self.logger.debug(f"{self.username}: Avast режим — clear_sandboxie_cache пропущен.")
+
+    # ================== поиск окна логина, привязка к нашему дереву ==================
+    def _find_login_hwnd_in_box(self, box_id:int, timeout_s:int=WAIT_LOGIN_WIN_TIMEOUT) -> Optional[int]:
+        """Совместимость: ищем логин-окно в ДЕРЕВЕ ПРОЦЕССОВ текущего аккаунта."""
         end=time.time()+timeout_s
         while time.time()<end:
-            pids=set(self.get_box_pids(box_id))
-            if not pids: time.sleep(0.5); continue
+            pids=set(self._proc_tree_pids())
+            if not pids:
+                time.sleep(0.5); continue
             found=_any_login_hwnd_for_pids(pids)
             if found: return found
             time.sleep(0.5)
         return None
 
-    def _any_login_hwnd_now(self, box_id:int)->Optional[int]:
-        pids=set(self.get_box_pids(box_id))
+    def _any_login_hwnd_now(self, box_id:int) -> Optional[int]:
+        pids=set(self._proc_tree_pids())
         return _any_login_hwnd_for_pids(pids) if pids else None
 
     def _login_window_absent_stably(self, box_id:int, duration:int=LOGIN_GONE_GRACE_SEC)->bool:
@@ -263,80 +234,112 @@ class Account:
             time.sleep(0.5)
         return True
 
-    # ---------- стадия 1: запуск до окна входа ----------
+    # ================== стадия 1: запуск до окна входа ==================
+    def wait_for_process_in_box(
+            self,
+            box_id: int,
+            names: List[str],
+            max_attempts: int = WAIT_STEAM_PROC_ATTEMPTS,
+            interval: float = WAIT_STEAM_PROC_INTERVAL,
+            match_fn: Optional[Callable[[psutil.Process], bool]] = None
+    ) -> Optional[psutil.Process]:
+        """
+        Совместимостьная обёртка: ищем процесс с заданным именем в нашем дереве.
+        """
+        target_names = {n.lower() for n in names if n}
+        for _ in range(max_attempts):
+            pids = self._proc_tree_pids()
+            for pid in pids:
+                try:
+                    p = psutil.Process(pid)
+                    pname = (p.name() or "").lower()
+                    if pname in target_names and (match_fn is None or match_fn(p)):
+                        return p
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            time.sleep(interval)
+        return None
+
     def launch_until_login_window(self, steam_path:str, app_id:int, box_id:int)->Optional[int]:
+        """
+        Запускаем steam.exe напрямую (пользователь настроил «всегда в песочнице»).
+        Дальше — ждём окно входа в пределах НАШЕГО дерева процессов.
+        """
         self.box_id=box_id
         self._steam_path = steam_path
         self._app_id = app_id
-        start_exe=self._sandboxie_path()
-        if not os.path.exists(start_exe):
-            self.logger.error("Sandboxie Start.exe не найден."); return None
-        for attempt in range(1, MAX_LAUNCH_RETRIES+1):
-            self.set_status("launching")
-            self.kill_box_processes(box_id)
-            self.clear_real_steam_auth(steam_path)
-            #self.clear_sandboxie_cache(box_id)
 
-            cmd=[start_exe, f"/box:{box_id}", steam_path, "-applaunch", str(app_id)]
-            cmd.extend(DOTA_LAUNCH_OPTS)
-            try:
-                subprocess.Popen(cmd); self.logger.info(f"{self.username}: запуск Steam+Dota в боксе {box_id} (попытка {attempt}/{MAX_LAUNCH_RETRIES})")
-            except Exception as e:
-                self.logger.error(f"{self.username}: ошибка запуска → {e}"); time.sleep(RELAUNCH_DELAY_SEC); continue
+        # Полная зачистка от предыдущего запуска
+        try: self.kill_box_processes(box_id)
+        except Exception: pass
+        try: self.clear_real_steam_auth(steam_path)
+        except Exception: pass
 
-            steam_proc=self.wait_for_process_in_box(box_id, ["steam.exe"])
-            if not steam_proc:
-                self.logger.error(f"{self.username}: steam.exe не появился"); time.sleep(RELAUNCH_DELAY_SEC); continue
-
-            self.logger.info(f"{self.username}: жду окно входа Steam…")
-            hwnd=self._find_login_hwnd_in_box(box_id, timeout_s=WAIT_LOGIN_WIN_TIMEOUT)
-            if not hwnd:
-                self.logger.error(f"{self.username}: окно входа не найдено"); time.sleep(RELAUNCH_DELAY_SEC); continue
-
-            x,y,_,_=self.placer.rect_for(box_id); _reposition_window_keep_size(hwnd,x,y)
-            self.login_hwnd=hwnd; self.set_status("ready")
-            self.logger.info(f"{self.username}: окно входа найдено: HWND={hex(hwnd)} — готов к скану.")
-            return hwnd
-        self.set_status("error"); return None
-
-    # ---------- полный рестарт и ожидание окна входа ----------
-    def _full_restart_to_login(self) -> Optional[int]:
-        if self.box_id is None or not self._steam_path or not self._app_id:
+        # Старт
+        cmd=[steam_path, "-applaunch", str(app_id)]
+        cmd.extend(DOTA_LAUNCH_OPTS)
+        try:
+            proc = subprocess.Popen(cmd)
+            self._root_pid = int(proc.pid)
+            self.logger.info(f"{self.username}: запуск Steam+Dota (PID={self._root_pid}) (автосэндбокс извне)")
+        except Exception as e:
+            self.logger.error(f"{self.username}: ошибка запуска → {e}")
             return None
-        try: self.kill_box_processes(self.box_id)
+
+        # Ждём steam.exe (в нашем дереве это обычно уже root)
+        steam_proc=self.wait_for_process_in_box(box_id, ["steam.exe"])
+        if not steam_proc:
+            self.logger.error(f"{self.username}: steam.exe не появился")
+            return None
+
+        # Ищем окно входа
+        self.logger.info(f"{self.username}: жду окно входа Steam…")
+        hwnd=self._find_login_hwnd_in_box(box_id, timeout_s=WAIT_LOGIN_WIN_TIMEOUT)
+        if not hwnd:
+            self.logger.error(f"{self.username}: окно входа не найдено")
+            return None
+
+        # Раскладка окна логина
+        x,y,_,_=self.placer.rect_for(box_id); _reposition_window_keep_size(hwnd,x,y)
+        self.login_hwnd=hwnd; self.set_status("ready")
+        self.logger.info(f"{self.username}: окно входа найдено: HWND={hex(hwnd)} — готов к скану.")
+        return hwnd
+
+    # ================== полный рестарт и ожидание окна входа ==================
+    def _full_restart_to_login(self) -> Optional[int]:
+        if self._steam_path is None or self._app_id is None:
+            return None
+        try: self.kill_box_processes(self.box_id or -1)
         except Exception: pass
         try: self.clear_real_steam_auth(self._steam_path)
         except Exception: pass
-        try: self.clear_sandboxie_cache(self.box_id)
-        except Exception: pass
 
-        start_exe = self._sandboxie_path()
-        cmd = [start_exe, f"/box:{self.box_id}", self._steam_path, "-applaunch", str(self._app_id)]
+        cmd = [self._steam_path, "-applaunch", str(self._app_id)]
         cmd.extend(DOTA_LAUNCH_OPTS)
         try:
-            subprocess.Popen(cmd); self.logger.info(f"{self.username}: перезапуск Steam+Dota в боксе {self.box_id}")
+            proc = subprocess.Popen(cmd)
+            self._root_pid = int(proc.pid)
+            self.logger.info(f"{self.username}: перезапуск Steam+Dota (PID={self._root_pid})")
         except Exception as e:
             self.logger.error(f"{self.username}: ошибка перезапуска → {e}")
             time.sleep(RELAUNCH_DELAY_SEC); return None
 
-        hwnd = self._find_login_hwnd_in_box(self.box_id, timeout_s=WAIT_LOGIN_WIN_TIMEOUT)
+        hwnd = self._find_login_hwnd_in_box(self.box_id or -1, timeout_s=WAIT_LOGIN_WIN_TIMEOUT)
         if not hwnd:
             self.logger.error(f"{self.username}: после рестарта окно входа не найдено"); return None
 
-        x,y,_,_=self.placer.rect_for(self.box_id); _reposition_window_keep_size(hwnd,x,y)
+        x,y,_,_=self.placer.rect_for(self.box_id or 0); _reposition_window_keep_size(hwnd,x,y)
         self.login_hwnd = hwnd; self.set_status("ready")
         self.logger.info(f"{self.username}: новое окно входа после рестарта: HWND={hex(hwnd)}")
         return hwnd
 
-    # ---------- окна steamwebhelper в боксе ----------
+    # ================== окна steamwebhelper в нашем дереве ==================
     def _steamwebhelper_hwnds_in_box(self, only_title_steam: bool = True) -> List[int]:
         """
-        Возвращает видимые окна, принадлежащие процессам steamwebhelper.exe в текущем боксе.
-        Если only_title_steam=True — берём только окна, у которых в заголовке строка 'Steam'
-        (это как раз тот блокирующий диалог).
+        Видимые окна steamwebhelper.exe только из нашего процессного дерева.
         """
-        if self.box_id is None: return []
-        pids = set(self.get_box_pids(self.box_id))
+        pids = set(self._proc_tree_pids())
+        if not pids: return []
         hwnds: List[int] = []
 
         def cb(hwnd,_):
@@ -364,7 +367,7 @@ class Account:
             return []
         return hwnds
 
-    # ---------- клик по «Всё равно продолжить» в данном окне + закрыть окно ----------
+    # ================== клик по «Всё равно продолжить» в steamwebhelper-окне ==================
     def _click_continue_anyway_in_hwnd(
         self,
         hwnd: int,
@@ -396,7 +399,6 @@ class Account:
                     self.logger.info(f"{self.username}: клик по '{os.path.basename(img)}' в окне Steam (steamwebhelper).")
                     if close_after:
                         try:
-                            # аккуратно закрываем только окно
                             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
                         except Exception:
                             try: win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
@@ -406,11 +408,10 @@ class Account:
             pass
         return False
 
-    # ---------- стадия 2: QR-скан ----------
+    # ================== стадия 2: QR-скан ==================
     def run_qr_scanner(self, stop_event: threading.Event) -> int:
         """
-        1) Если HWND пропал — только переобнаруживаем/ждём устойчивого исчезновения (успех). Рестарт НЕ делаем.
-        2) Если qrLoger завершился с ошибкой (rc!=0) — ПОЛНЫЙ РЕСТАРТ Steam/Dota и новая попытка.
+        Логика сохранена, только наблюдение за окном идёт через наше дерево, а не box_id.
         """
         if self.box_id is None:
             self.set_status("error"); return 1
@@ -493,7 +494,6 @@ class Account:
                 self.logger.info(f"{self.username}: HWND невалиден — переобнаруживаю окно логина (без рестарта)…")
                 hwnd = self._find_login_hwnd_in_box(self.box_id, timeout_s=20)
 
-
             rc = _spawn_once(hwnd)
             if rc == 0:
                 self.set_status("success"); return 0
@@ -503,10 +503,9 @@ class Account:
             self.logger.info(f"{self.username}: неудачный скан — перезапуск Steam/Dota (#{restarts_used}/{max_restarts})…")
             hwnd = self._full_restart_to_login()
 
-
         self.set_status("error"); return 1
 
-    # ---------- CPU limit ----------
+    # ================== CPU limit ==================
     def _apply_cpu_limit(self, pid:int, percent:int):
         if percent<=0: return
         try:
@@ -517,16 +516,13 @@ class Account:
         except Exception as e:
             self.logger.debug(f"{self.username}: не удалось применить мягкий лимит CPU: {e}")
 
-    # ---------- стадия 3: Dota, раскладка, лимит ----------
+    # ================== стадия 3: Dota, раскладка, лимит ==================
     def wait_dota_and_arrange(self, index_for_layout:int, cpu_limit_percent:int, max_wait:int=180)->bool:
-        if self.box_id is None: return False
-
-        # Главный цикл: ждём dota2.exe; ПОКА её нет — ищем окна steamwebhelper с заголовком "Steam",
-        # кликаем по "Всё равно продолжить" и закрываем именно окно (не процесс).
+        # Главный цикл: ждём dota2.exe; ПОКА её нет — обрабатываем блокирующие окна steamwebhelper
         deadline = time.time() + max_wait
         while time.time() < deadline and not self.dota_pid:
             # 1) Dota появилась?
-            proc = self.wait_for_process_in_box(self.box_id, ["dota2.exe"], max_attempts=1, interval=0.2)
+            proc = self.wait_for_process_in_box(self.box_id or 0, ["dota2.exe"], max_attempts=1, interval=0.2)
             if proc:
                 self.dota_pid = proc.pid
                 self.logger.info(f"{self.username}: Dota2 PID {self.dota_pid}")
@@ -539,7 +535,6 @@ class Account:
                 if ok:
                     self.logger.info(f"{self.username}: клик выполнен, окно Steam закрыто.")
 
-            # Немного подождать и снова круг
             time.sleep(0.5)
 
         if not self.dota_pid:
@@ -573,9 +568,8 @@ class Account:
             if self._qr_proc and self._qr_proc.poll() is None:
                 self._qr_proc.terminate()
         except Exception: pass
-        if self.box_id is not None:
-            try:
-                self.kill_box_processes(self.box_id)
-                self.clear_sandboxie_cache(self.box_id)
-            except Exception: pass
+        try:
+            self.kill_box_processes(self.box_id or -1)
+            self.clear_sandboxie_cache(self.box_id or -1)  # no-op в Avast-режиме
+        except Exception: pass
         self.set_status("idle")
