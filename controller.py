@@ -22,6 +22,7 @@ from account import Account
 from CONSTANTS import *
 from windowPlacer import WindowPlacer
 from image_automation import ImageAutomation  # <-- новый модуль
+from threadRegistry import ThreadRegistry
 
 user32 = ctypes.windll.user32
 
@@ -65,14 +66,15 @@ def _reposition_window_keep_size(hwnd: int, x: int, y: int):
 
 
 class Controller:
-    def __init__(self, logger: logging.Logger, placer: WindowPlacer, status_cb: Callable[[str, str], None]):
+    def __init__(self, logger: logging.Logger, placer: WindowPlacer, status_cb: Callable[[str, str], None], *, thread_registry: Optional[ThreadRegistry] = None):
         self.logger = logger
         self.placer = placer
         self.status_cb = status_cb
 
+        self.thread_registry = thread_registry or ThreadRegistry()
+
         self.accounts: List[Account] = []
         self.mafile_index: Dict[str, Tuple[str, dict]] = {}
-        self.farm_threads: List[threading.Thread] = []
         self.stop_event = threading.Event()
 
         self.state_file = "state.json"
@@ -85,8 +87,6 @@ class Controller:
         self.session_started_at: Optional[float] = None
         self.cpu_limit_percent: int = 5
 
-        self._cpu_watch_thread: Optional[threading.Thread] = None
-        self._cpu_watch_stop = threading.Event()
         self.per_proc_cpu: Dict[str, float] = {}
         self.per_box_cpu: Dict[str, float] = {}
 
@@ -94,7 +94,6 @@ class Controller:
         self.farming_accounts : List[Account] = []
         # автоматика по картинкам
         self._auto_started = False
-        self._auto_thread: Optional[threading.Thread] = None
         self._arranged_lock = threading.Lock()
         self._arranged_hwnds: List[int] = []  # hwnd'ы Dota, которые уже выстроены
 
@@ -129,15 +128,13 @@ class Controller:
         return total_norm
 
     def start_cpu_watch(self):
-        self._cpu_watch_stop.clear()
-
-        def loop():
+        def loop(stop_event: threading.Event):
             try:
                 psutil.cpu_percent(interval=None)
             except Exception:
                 pass
             dota_proc: Dict[str, Optional[psutil.Process]] = {}
-            while not self._cpu_watch_stop.is_set():
+            while not stop_event.is_set():
                 for acc in self.accounts:
                     if acc.dota_pid:
                         proc = dota_proc.get(acc.username)
@@ -166,11 +163,10 @@ class Controller:
                     self.per_box_cpu[acc.username] = self._box_cpu_percent_once(procs)
                 time.sleep(2.0)
 
-        self._cpu_watch_thread = threading.Thread(target=loop, daemon=True)
-        self._cpu_watch_thread.start()
+        self.thread_registry.add("cpu_watch", loop)
 
     def stop_cpu_watch(self):
-        self._cpu_watch_stop.set()
+        self.thread_registry.remove("cpu_watch", signal_stop=True)
 
     # -------- аккаунты / mafiles / состояние (как было) --------
     def load_accounts_from_txt(self, path: str, append=False):
@@ -185,7 +181,7 @@ class Controller:
                 login, password = line.split(":", 1)
                 if any(a.username == login for a in self.accounts):
                     continue
-                acc = Account(login, password, self.logger, self.placer, self.status_cb)
+                acc = Account(login, password, self.logger, self.placer, self.status_cb, thread_registry=self.thread_registry)
                 self.accounts.append(acc)
                 count += 1
                 self.logger.info(f"Добавлен аккаунт: {login}")
@@ -248,7 +244,7 @@ class Controller:
         self.accounts.clear()
         self.steam_path = data.get("steam_path", r"C:\Program Files (x86)\Steam\steam.exe")
         for accd in data.get("accounts", []):
-            acc = Account(accd["username"], accd["password"], self.logger, WindowPlacer(), self.status_cb)
+            acc = Account(accd["username"], accd["password"], self.logger, WindowPlacer(), self.status_cb, thread_registry=self.thread_registry)
             acc.mafile_path = accd.get("mafile_path")
             acc.mafile_data = accd.get("mafile_data")
             if acc.mafile_path and not acc.mafile_data:
@@ -282,10 +278,6 @@ class Controller:
             self.logger.warning("Не все успели — начинаю скан имеющихся.")
         time.sleep(DELAY_BEFORE_SCANNING_ALL_READY)
 
-    def _prune_finished_threads(self):
-        if self.farm_threads:
-            self.farm_threads = [t for t in self.farm_threads if t.is_alive()]
-
     # --------- запуск image-automation один раз, когда готово нужное число окон ---------
     def _try_start_image_automation(self, total_planned: int, make_party: bool):
         """
@@ -309,21 +301,24 @@ class Controller:
 
         self.logger.info(f"[IMG] Запускаю автоматизацию по картинкам для {len(hwnds)} окон (need={need})")
 
-        def _runner():
+        def _runner(stop_event: threading.Event):
             try:
                 steamids = []
                 for acc in self.farming_accounts:
                     steamids.append(acc.steam_id)
                 ia = ImageAutomation(self.logger, images_root="images", confidence=0.87)
-                ia.run_with_hwnds(hwnds, make_party=make_party,
-                                  stop_flag=lambda: self.stop_event.is_set() or (not self.farm_running),steamids64=steamids)
+                ia.run_with_hwnds(
+                    hwnds,
+                    make_party=make_party,
+                    stop_flag=lambda: stop_event.is_set() or self.stop_event.is_set() or (not self.farm_running),
+                    steamids64=steamids,
+                )
             except Exception as e:
                 self.logger.error(f"[IMG] Ошибка автоматики: {e}")
             finally:
                 self.logger.info("[IMG] Автоматика завершилась")
 
-        self._auto_thread = threading.Thread(target=_runner, daemon=True)
-        self._auto_thread.start()
+        self.thread_registry.add("image_auto", _runner)
 
     # --------- главный конвейер ---------
     def start_farming(self, steam_path: str, app_id: int, selected_accounts: List[Account], max_parallel: int,
@@ -333,10 +328,7 @@ class Controller:
         • воркеры до max_parallel: Steam → окно логина → QR → Dota/раскладка/лимит
         • как только собрались нужные окна — стартуем image-automation (один раз)
         """
-        self._prune_finished_threads()
-        if self.farm_threads and any(t.is_alive() for t in self.farm_threads):
-            self.logger.warning("Фарм уже запущен")
-            return
+        self.thread_registry.exit()
         if self.farm_running:
             self.logger.warning("Фарм уже активен")
             return
@@ -347,14 +339,12 @@ class Controller:
         # init
         self.farm_running = True
         self.stop_event.clear()
-        self.farm_threads = []
         self.session_started_at = time.time()
         self.start_cpu_watch()
         self.steam_path = steam_path
         self.farming_accounts = selected_accounts
         # сброс автоматики
         self._auto_started = False
-        self._auto_thread = None
         with self._arranged_lock:
             self._arranged_hwnds = []
 
@@ -362,6 +352,23 @@ class Controller:
         tasks: Queue[Tuple[Account, int]] = Queue()
         for idx, acc in enumerate(selected_accounts):
             tasks.put((acc, idx))
+
+        # резервные аккаунты, которые не были изначально выбраны
+        reserve: Queue[Account] = Queue()
+        for acc in self.accounts:
+            if acc not in selected_accounts:
+                reserve.put(acc)
+
+        def _schedule_replacement(box_id: int):
+            """Подставить следующий аккаунт из резерва вместо ошибочного."""
+            if not self.farm_running or self.stop_event.is_set():
+                return
+            try:
+                next_acc = reserve.get_nowait()
+            except Empty:
+                return
+            self.farming_accounts.append(next_acc)
+            tasks.put((next_acc, box_id))
 
         workers = max(1, int(max_parallel))
         workers = min(workers, tasks.qsize())
@@ -380,9 +387,12 @@ class Controller:
                     # 1) запуск Steam+Dota
                     acc.set_status("launching")
                     self.logger.info(f"{acc.username}: бокс #{box_id}")
-                    hwnd = acc.launch_until_login_window(self.steam_path, app_id, box_id=box_id)
+                    hwnd = acc.launch_until_login_window(
+                        self.steam_path, app_id, box_id=box_id, stop_event=self.stop_event
+                    )
                     if not hwnd:
                         acc.set_status("error")
+                        _schedule_replacement(box_id)
                         continue
 
                     # 2) (опц.) локальный calm
@@ -397,13 +407,19 @@ class Controller:
                     if rc != 0:
                         self.logger.error(f"{acc.username}: QR rc={rc}")
                         acc.set_status("error")
+                        _schedule_replacement(box_id)
                         continue
                     self.logger.info(f"{acc.username}: QR подтверждён")
 
                     # 4) Dota окно/раскладка/лимит
-                    ok = acc.wait_dota_and_arrange(index_for_layout=box_id, cpu_limit_percent=self.cpu_limit_percent)
+                    ok = acc.wait_dota_and_arrange(
+                        index_for_layout=box_id,
+                        cpu_limit_percent=self.cpu_limit_percent,
+                        stop_event=self.stop_event,
+                    )
                     if not ok:
                         acc.set_status("error")
+                        _schedule_replacement(box_id)
                         continue
 
                     # зарегистрируем hwnd для автоматики
@@ -415,6 +431,11 @@ class Controller:
                     # пробуем стартануть image-automation, когда готово достаточно окон
                     self._try_start_image_automation(total_planned=len(selected_accounts), make_party=make_party)
 
+                except Exception as e:
+                    self.logger.error(f"{acc.username}: исключение воркера: {e}")
+                    acc.set_status("error")
+                    _schedule_replacement(box_id)
+
                 finally:
                     try:
                         tasks.task_done()
@@ -425,45 +446,39 @@ class Controller:
 
         for wid in range(workers):
             t = threading.Thread(target=worker, args=(wid,), daemon=True)
-            self.farm_threads.append(t)
+            self.thread_registry.set(f"worker-{wid}", t, stop_event=self.stop_event)
             t.start()
 
         # финишер: ждём, пока развернём все окна; автоматика работает отдельно
         def finisher():
-            tasks.join()
+            while not self.stop_event.is_set():
+                if tasks.unfinished_tasks == 0:
+                    break
+                time.sleep(0.5)
             self.logger.info("Все аккаунты обработаны конвейером (окна подняты/разложены). Автоматика — в отдельном потоке.")
 
         fin = threading.Thread(target=finisher, daemon=True)
-        self.farm_threads.append(fin)
+        self.thread_registry.set("finisher", fin, stop_event=self.stop_event)
         fin.start()
 
     def stop_farming(self):
-        def _stop():
-            self.stop_event.set()
-            for acc in self.accounts:
-                try:
-                    acc.stop_and_cleanup_box()
-                except Exception:
-                    pass
-            for t in self.farm_threads:
-                try:
-                    t.join(timeout=1.0)
-                except Exception:
-                    pass
-            self.farm_threads.clear()
-            self.stop_cpu_watch()
-            self.session_started_at = None
-            self.farm_running = False
+        self.stop_event.set()
+        for acc in self.accounts:
+            try:
+                acc.stop_and_cleanup_box()
+            except Exception:
+                pass
+        self.stop_cpu_watch()
+        self.thread_registry.exit()
+        self.session_started_at = None
+        self.farm_running = False
 
-            # автоматика
-            self._auto_started = False
-            self._auto_thread = None
-            with self._arranged_lock:
-                self._arranged_hwnds = []
+        # автоматика
+        self._auto_started = False
+        with self._arranged_lock:
+            self._arranged_hwnds = []
 
-            self.logger.info("Фарм остановлен")
-
-        threading.Thread(target=_stop, daemon=True).start()
+        self.logger.info("Фарм остановлен")
 
     # --- вспомогательное (после calm — переобнаружение логин-окон/перестановка) ---
     def _refresh_login_windows_after_calm(self, accounts: List["Account"]):

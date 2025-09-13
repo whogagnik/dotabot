@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import sys, time, logging, threading
+import sys, time, logging, threading, uuid
 
 from typing import Optional, List, Dict
 
@@ -12,6 +12,7 @@ import win32gui, win32process
 from GuiHandler import GuiHandler
 from windowPlacer import WindowPlacer
 from controller import Controller
+from threadRegistry import ThreadRegistry
 
 
 def make_logger(gui_text: tk.Text) -> logging.Logger:
@@ -80,6 +81,9 @@ class App(tk.Tk):
         self.log_text.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
         self.log_text.configure(state="disabled")
         self.logger = make_logger(self.log_text)
+
+        # реестр потоков
+        self.thread_reg = ThreadRegistry()
 
         # ===== ВЕРХНЯЯ ПАНЕЛЬ =====
         top = tk.Frame(self, bg="#2c2f33")
@@ -189,7 +193,7 @@ class App(tk.Tk):
 
         # ===== Контроллер / данные =====
         self.placer=WindowPlacer(mode=TILE_MODE,columns=TILE_COLUMNS,gap=TILE_GAP,bottom_h=TILE_BOTTOM_HEIGHT,wrap_at=GRID_WRAP_AT)
-        self.controller=Controller(self.logger,self.placer,self.set_status)
+        self.controller=Controller(self.logger,self.placer,self.set_status, thread_registry=self.thread_reg)
 
         self._selected: Dict[str,bool] = {a.username:False for a in self.controller.accounts}
         self._row_status: Dict[str,str] = {}
@@ -318,19 +322,24 @@ class App(tk.Tk):
         app_id=APP_ID_DOTA
         max_parallel=max(1,int(self.parallel_var.get()))
 
-        def bg(): self.controller.start_farming(self.controller.steam_path, app_id, accounts, max_parallel)
-        threading.Thread(target=bg,daemon=True).start()
+        name = f"start_farm-{uuid.uuid4().hex}"
+        def bg(_):
+            try:
+                self.controller.start_farming(self.controller.steam_path, app_id, accounts, max_parallel)
+            finally:
+                self.thread_reg.remove(name, join=False, signal_stop=False)
+        self.thread_reg.add(name, bg)
 
     def stop_farm(self):
         self.stop_btn.config(state="disabled")
-        def after_stop():
+        def after_stop(_):
             self.controller.stop_farming()
             time.sleep(2.0)
             self._session_frozen = False
             self._session_snapshot_names = []
             self._rebuild_session_tree_from_selection()
             self.start_btn.config(state="normal"); self.stop_btn.config(state="normal")
-        threading.Thread(target=after_stop,daemon=True).start()
+        self.thread_reg.add(f"after_stop-{uuid.uuid4().hex}", after_stop)
 
     # ===== Панель сессии — обновление =====
     def _tick_session_panel(self):
@@ -416,7 +425,10 @@ class App(tk.Tk):
         self._selected={a.username:False for a in self.controller.accounts}; self.refresh_table()
 
     def on_close(self):
-        self.controller.stop_farming(); self.controller.save_state(); self.destroy()
+        self.controller.stop_farming()
+        self.thread_reg.exit()
+        self.controller.save_state()
+        self.destroy()
 
 
 if __name__=="__main__":
