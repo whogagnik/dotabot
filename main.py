@@ -426,7 +426,7 @@ class App(tk.Tk):
 
     def on_close(self):
         self.controller.stop_farming()
-        self.thread_reg.exit()
+        #self.thread_reg.exit()
         self.controller.save_state()
         self.destroy()
 
