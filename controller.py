@@ -17,11 +17,11 @@ import win32con
 import win32api
 import win32process
 
-import image_automation
+import game_automation
 from account import Account
 from CONSTANTS import *
 from windowPlacer import WindowPlacer
-from image_automation import ImageAutomation  # <-- новый модуль
+from game_automation import GameAutomation  # <-- новый модуль
 from threadRegistry import ThreadRegistry
 
 user32 = ctypes.windll.user32
@@ -303,18 +303,48 @@ class Controller:
 
         def _runner(stop_event: threading.Event):
             try:
-                steamids = []
-                for acc in self.farming_accounts:
-                    steamids.append(acc.steam_id)
-                ia = ImageAutomation(self.logger, images_root="images", confidence=0.87)
-                ia.run_with_hwnds(
-                    hwnds,
-                    make_party=make_party,
-                    stop_flag=lambda: stop_event.is_set() or self.stop_event.is_set() or (not self.farm_running),
-                    steamids64=steamids,
-                )
+                # какие аккаунты задействованы в этой автоматики (по hwnd'ам)
+                accounts_for_ga = [acc for acc in self.farming_accounts
+                                   if getattr(acc, "dota_hwnd", None) in hwnds]
+
+                steamids = [acc.steam_id for acc in accounts_for_ga if getattr(acc, "steam_id", None)]
+
+                game = GameAutomation(self.logger, images_root="images", confidence=0.87)
+
+                ga_done = threading.Event()
+
+                def _ga():
+                    try:
+                        game.run_with_hwnds(
+                            hwnds,
+                            make_party=make_party,
+                            stop_flag=lambda: stop_event.is_set() or self.stop_event.is_set() or (
+                                not self.farm_running),
+                            steamids64=steamids,
+                        )
+                    finally:
+                        ga_done.set()
+
+                t = threading.Thread(target=_ga, daemon=True)
+                t.start()
+
+                # PULL: опрашиваем локальный статус и транслируем в UI аккаунтов
+                last = None
+                while not ga_done.is_set() and not stop_event.is_set() and self.farm_running:
+                    s = game.get_status()
+                    if s and s != last:
+                        last = s
+                        for acc in accounts_for_ga:
+                            try:
+                                acc.set_status(s)
+                            except Exception:
+                                pass
+                    time.sleep(0.5)
+
             except Exception as e:
                 self.logger.error(f"[IMG] Ошибка автоматики: {e}")
+                for acc in self.farming_accounts:
+                    acc.set_status("error")
             finally:
                 self.logger.info("[IMG] Автоматика завершилась")
 

@@ -24,7 +24,7 @@ from CONSTANTS import *
 from windowPlacer import WindowPlacer
 try:
     from threadRegistry import ThreadRegistry  # опционально
-except Exception:  # fallback, если модуля нет
+except Exception:
     ThreadRegistry = None  # type: ignore[assignment]
 
 # ---------------- Win32 helpers ----------------
@@ -68,7 +68,6 @@ def _find_main_window_for_pid(pid: int) -> Optional[int]:
         if not win32gui.IsWindowVisible(hwnd):
             return
         if _window_pid(hwnd) == pid:
-            # предпочтём окно с ненулевым заголовком
             title = (win32gui.GetWindowText(hwnd) or "").strip()
             if title:
                 result = hwnd
@@ -159,11 +158,11 @@ def _click_point(pt, delay: float = 0.0):
 
 class Account:
     """
-    «Авто-песочница» сценарий:
-      • Запуск steam.exe напрямую (пользователь настроил автосэндбокс/Avast и т.п.)
-      • Ждём окно логина ИЛИ блокирующие окна (webhelper с “Steam” или безымянный диалог).
-        В безымянном диалоге жмём «Отмена» (cancel), в webhelper — «Продолжить» (continue anyway).
-      • QR-скан → Dota сама запускается → раскладка/лимит.
+    Авто-песочница:
+      • Запуск steam.exe напрямую (автосэндбокс/Avast и т.п.)
+      • До логина: обрабатываем «сервисное» окно грубым кликом по координатам (Отмена).
+      • После логина: возвращаем «старую» обработку блокера — ищем кнопку «Продолжить всё равно»
+        в окнах Steam(steamwebhelper) по шаблонам и нажимаем, затем закрываем окно.
     """
     def __init__(
         self,
@@ -278,7 +277,6 @@ class Account:
             self.logger.warning(f"Очистка реального Steam не удалась: {e}")
 
     def clear_sandboxie_cache(self, box_id: int):
-        # в «авто-песочнице» ничего не делаем
         self.logger.debug(f"{self.username}: clear_sandboxie_cache — пропуск (автосэндбокс).")
 
     # ---------- window scans ----------
@@ -311,13 +309,16 @@ class Account:
             found = _any_login_hwnd_for_pids(pids)
             if found:
                 return found
-            # обработка возможных блокирующих окон (см. ниже)
-            self._handle_blockers_once()
+            # до логина — «новая» грубая обработка (координатами)
+            self._handle_blockers_prelogin_once()
             time.sleep(0.4)
         return None
 
-    # ---------- steam(webhelper)/service blockers ----------
+    # ---------- blockers ----------
     def _steamwebhelper_hwnds_in_tree(self, only_title_steam: bool = True) -> List[int]:
+        """
+        Возвращает окна steamwebhelper.exe из нашего дерева.
+        """
         pids = set(self._proc_tree_pids())
         if not pids:
             return []
@@ -333,7 +334,7 @@ class Account:
                 pname = (psutil.Process(pid).name() or "").lower()
             except Exception:
                 return
-            if pname != "steam.exe":
+            if pname != "steamwebhelper.exe":
                 return
             if only_title_steam:
                 try:
@@ -350,12 +351,74 @@ class Account:
             return []
         return hwnds
 
-    def _nameless_steam_dialogs_in_tree(self) -> List[int]:
-        """Безымянные диалоги (пустой заголовок) у steam.exe/steamwebhelper.exe в нашем дереве."""
+    # --- старая (шаблонная) обработка: Continue Anyway ---
+    def _click_continue_anyway_in_hwnd(
+        self,
+        hwnd: int,
+        images_root: str = "images/steam",
+        confidence: float = 0.88,
+        close_after: bool = True,
+    ) -> bool:
+        patterns = [
+            "continue_anyway_ru.png",
+            "continue_anyway_en.png",
+            "continue_ru.png",
+            "ok.png",
+        ]
+        paths = [os.path.join(images_root, f) for f in patterns]
+        paths = [ph for ph in paths if os.path.exists(ph)]
+        if not paths:
+            return False
+
+        try:
+            _force_foreground(hwnd)
+            region = _client_region(hwnd)
+            for img in paths:
+                try:
+                    pt = _loc_center(img, confidence=confidence, region=region)
+                except Exception:
+                    pt = None
+                if pt:
+                    _click_point(pt, delay=0.05)
+                    self.logger.info(
+                        f"{self.username}: клик по '{os.path.basename(img)}' в окне {hex(hwnd)}."
+                    )
+                    p.sleep(0.25)
+                    if close_after:
+                        try:
+                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                        except Exception:
+                            try:
+                                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                            except Exception:
+                                pass
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # --- новая (грубая) обработка до логина: «Отмена» по координатам ---
+    def _click_cancel_by_coords(self, hwnd: int) -> bool:
+        try:
+            _force_foreground(hwnd)
+            time.sleep(0.5)
+            L, T, R, B = win32gui.GetWindowRect(hwnd)
+            p.moveTo(L + (R-L)/2 + 70, B - 40)
+            time.sleep(0.1)
+            p.leftClick()
+            self.logger.info(f"{self.username}: нажал «Отмена» в окне {hex(hwnd)} (по координатам).")
+            return True
+        except Exception:
+            return False
+
+    # --- предлогин: грубая обработка сервисных/безымянных окон ---
+    def _handle_blockers_prelogin_once(self):
+        """
+        До логина: кликаем «Отмена» на безымянных/сервисных окнах по координатам.
+        """
         pids = set(self._proc_tree_pids())
         if not pids:
-            return []
-        hwnds: List[int] = []
+            return
 
         def cb(hwnd, _):
             if not win32gui.IsWindowVisible(hwnd):
@@ -363,60 +426,22 @@ class Account:
             pid = _window_pid(hwnd)
             if not pid or pid not in pids:
                 return
-            title = (win32gui.GetWindowText(hwnd) or "").strip()
-            if title:
-                return  # ищем именно без заголовка
-            try:
-                pname = (psutil.Process(pid).name() or "").lower()
-            except Exception:
-                pname = ""
-            if pname in ("steam.exe", "steamwebhelper.exe"):
-                hwnds.append(hwnd)
+            title = (win32gui.GetWindowText(hwnd) or "").strip().lower()
+            # безымянные диалоги или текст про сервис
+            if not title or "service" in title or "служб" in title or "ошибка службы" in title:
+                self._click_cancel_by_coords(hwnd)
 
         try:
             win32gui.EnumWindows(cb, None)
         except Exception:
-            return []
-        return hwnds
-
-    def _click_image_in_hwnd(
-        self,
-        hwnd: int,
-        patterns: List[str],
-        images_root: str,
-        *,
-        confidence: float = 0.88,
-        close_after: bool = False,
-        min_delay_after: float = 0.2,
-    ) -> bool:
-        paths = [os.path.join(images_root, f) for f in patterns]
-        paths = [ph for ph in paths if os.path.exists(ph)]
-
-        if not paths:
-            return False
-        try:
-
-            _force_foreground(hwnd)
-            region = _client_region(hwnd)
-            L, T, R, B = win32gui.GetWindowRect(hwnd)
-            time.sleep(0.1)
-            p.leftClick(L + (R-L)/2 + 70, B-40)
-        except Exception:
             pass
-        return False
 
-    def _handle_blockers_once(self):
 
-        # 2) WebHelper окно с заголовком "Steam" → «Продолжить всё равно»
-        blockers = self._steamwebhelper_hwnds_in_tree(only_title_steam=False)
+    def _handle_blockers_postlogin_once(self):
+        blockers = self._steamwebhelper_hwnds_in_tree(only_title_steam=True)
         for hwnd in blockers:
-            if self._click_image_in_hwnd(
-                hwnd,
-                patterns=["cancel-ru.png"],
-                images_root=os.path.join("images", "steam"),
-                confidence=0.3,
-                close_after=True,
-                min_delay_after=0.3,
+            if self._click_continue_anyway_in_hwnd(
+                hwnd, images_root="images/steam", confidence=0.88, close_after=True
             ):
                 self.logger.info(f"{self.username}: подтвердил 'Продолжить' и закрыл окно Steam.")
 
@@ -444,7 +469,7 @@ class Account:
             time.sleep(interval)
         return None
 
-    # ---------- Stage 1: Launch → Login window or blockers ----------
+    # ---------- Stage 1: Launch → Login window ----------
     def launch_until_login_window(
         self,
         steam_path: str,
@@ -455,13 +480,12 @@ class Account:
     ) -> Optional[int]:
         """
         Запуск steam.exe напрямую (автосэндбокс настроен снаружи).
-        Ждём окно входа ИЛИ блокирующие «сервис/Steam» окна, где жмём «Отмена» / «Продолжить».
+        До логина снимаем сервисные блокеры грубо (координаты «Отмена»).
         """
         self.box_id = box_id
         self._steam_path = steam_path
         self._app_id = app_id
 
-        # полный сброс предыдущего дерева
         try:
             self.kill_box_processes(box_id)
         except Exception:
@@ -474,7 +498,6 @@ class Account:
         if stop_event and stop_event.is_set():
             return None
 
-        # старт
         cmd = [steam_path, "-applaunch", str(app_id)]
         cmd.extend(DOTA_LAUNCH_OPTS)
         try:
@@ -485,25 +508,21 @@ class Account:
             self.logger.error(f"{self.username}: ошибка запуска → {e}")
             return None
 
-        # дождаться steam.exe в нашем дереве
         steam_proc = self.wait_for_process_in_box(box_id, ["steam.exe"], stop_event=stop_event)
         if not steam_proc or (stop_event and stop_event.is_set()):
             self.logger.error(f"{self.username}: steam.exe не появился")
             return None
 
-        # ждём окно входа, попутно снимая блокеры
         self.logger.info(f"{self.username}: жду окно входа Steam…")
         end = time.time() + WAIT_LOGIN_WIN_TIMEOUT
         hwnd = None
         while time.time() < end and not hwnd:
             if stop_event and stop_event.is_set():
                 return None
-            # 1) попробовать найти логин-окно
             hwnd = self._find_login_hwnd_in_box(box_id, timeout_s=1, stop_event=stop_event)
             if hwnd:
                 break
-            # 2) обработать блокирующие окна
-            self._handle_blockers_once()
+            self._handle_blockers_prelogin_once()
             time.sleep(0.4)
 
         if not hwnd:
@@ -544,7 +563,6 @@ class Account:
             time.sleep(RELAUNCH_DELAY_SEC)
             return None
 
-        # После рестарта также ждем логин-окно, обрабатывая блокеры
         end = time.time() + WAIT_LOGIN_WIN_TIMEOUT
         hwnd = None
         while time.time() < end and not hwnd:
@@ -553,7 +571,7 @@ class Account:
             hwnd = self._find_login_hwnd_in_box(self.box_id or -1, timeout_s=1, stop_event=stop_event)
             if hwnd:
                 break
-            self._handle_blockers_once()
+            self._handle_blockers_prelogin_once()
             time.sleep(0.4)
 
         if not hwnd:
@@ -567,12 +585,8 @@ class Account:
         self.logger.info(f"{self.username}: новое окно входа после рестарта: HWND={hex(hwnd)}")
         return hwnd
 
-    # ---------- Stage 2: QR scan ----------
+    # ---------- Stage 2: QR scan (ПОСЛЕ ЛОГИНА — старая обработка блокера) ----------
     def run_qr_scanner(self, stop_event: threading.Event) -> int:
-        """
-        Если qrLoger.py завершился с ошибкой — полный рестарт Steam и повтор.
-        Если логин-окно исчезло устойчиво — считаем успехом (ранний success).
-        """
         if self.box_id is None:
             self.set_status("error")
             return 1
@@ -638,7 +652,6 @@ class Account:
             grace = max(LOGIN_GONE_GRACE_SEC, 6)
             early_success = False
             try:
-                # параллельно продолжаем щёлкать блокеры (если всплывут во время скана)
                 while self._qr_proc and self._qr_proc.poll() is None and not stop_event.is_set():
                     if self._any_login_hwnd_now(self.box_id) is None:
                         if absent_since is None:
@@ -652,7 +665,8 @@ class Account:
                             break
                     else:
                         absent_since = None
-                        self._handle_blockers_once()
+                        # ПОСЛЕ ЛОГИНА: старая обработка блокера
+                        self._handle_blockers_postlogin_once()
                     time.sleep(0.25)
             finally:
                 if self._qr_proc and self._qr_proc.poll() is None:
@@ -676,7 +690,6 @@ class Account:
 
         hwnd = self.login_hwnd
         while not stop_event.is_set():
-            # если HWND пропал — проверим устойчивость (успех) или переобнаружим
             if not hwnd or not _hwnd_exists(hwnd):
                 self.logger.info(f"{self.username}: HWND невалиден — переобнаруживаю окно логина…")
                 hwnd = self._find_login_hwnd_in_box(self.box_id, timeout_s=20, stop_event=stop_event)
@@ -726,7 +739,7 @@ class Account:
         *,
         stop_event: Optional[threading.Event] = None,
     ) -> bool:
-        # ждём dota2.exe; пока её нет — обрабатываем блокеры (Cancel/Continue)
+        # ждём dota2.exe; ПОСЛЕ ЛОГИНА используем старую обработку блокера
         deadline = time.time() + max_wait
         while time.time() < deadline and not self.dota_pid:
             if stop_event and stop_event.is_set():
@@ -740,7 +753,7 @@ class Account:
                 self.logger.info(f"{self.username}: Dota2 PID {self.dota_pid}")
                 break
 
-            self._handle_blockers_once()
+            self._handle_blockers_postlogin_once()
             time.sleep(0.5)
 
         if not self.dota_pid:
@@ -750,7 +763,6 @@ class Account:
         if stop_event and stop_event.is_set():
             return False
 
-        # главное окно Dota
         t1 = time.time()
         hwnd = None
         while time.time() - t1 < 30:
@@ -765,7 +777,6 @@ class Account:
             return False
         self.dota_hwnd = hwnd
 
-        # раскладка
         x, y, _, _ = self.placer.rect_for(index_for_layout)
         _reposition_window_keep_size(hwnd, x, y)
         try:

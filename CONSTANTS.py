@@ -44,17 +44,31 @@ DOTA_LAUNCH_OPTS = [
     "-silent",
 
 ]
-
+heroes = ['aa', 'abaddon', 'alchemist', 'axe', 'bara', 'brist', 'cent', 'chaos', 'clockwerk', 'crystal', 'disruptor', 'dk', 'doom', 'dp', 'elder', 'huskar', 'kunka', 'legion', 'lifestealer', 'ns', 'od', 'ogre', 'omni', 'primal', 'pudge', 'shaker', 'slardar', 'sven', 'tide', 'timber', 'tiny', 'treant', 'tusk', 'underlord', 'undying', 'wk',]
 STATUS_LABELS = {
     "idle":"Ожидание","launching":"Запуск…","ready":"Окно готово","scanning":"Сканирую QR",
     "success":"Логин ок","ingame":"Dota в игре","gc_ready":"GC готов","queueing":"Поиск игры",
     "error":"Ошибка","skipped":"Пропущен","stopping":"Остановка…",
+
+    # игровые состояния (без STATE)
+    "waiting": "Ожидание",
+    "playing": "Dota в игре",
+    "start_buy": "Стартовый закуп",
+    "did_not_run_mid": "Не побежал мид",
 }
+
 STATUS_COLORS = {
     "idle":"#737373","launching":"#60a5fa","ready":"#22d3ee","scanning":"#fbbf24",
     "success":"#22c55e","ingame":"#10b981","gc_ready":"#34d399","queueing":"#eab308",
     "error":"#ef4444","skipped":"#a78bfa","stopping":"#f59e0b",
+
+    # игровые состояния (без STATE)
+    "waiting": "#60a5fa",        # как launching
+    "playing": "#10b981",        # как ingame
+    "start_buy": "#fbbf24",      # как scanning
+    "did_not_run_mid": "#ef4444" # как error
 }
+
 
 # ====== Локальные константы для JobObject (pywin32 может их не экспортировать) ======
 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE   = 0x0001
