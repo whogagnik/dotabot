@@ -683,7 +683,7 @@ def do_flow(*,
 
         # ждём request_id до 30с
         request_id = ensure_request_id_after_approve(client_id, token, request_id)
-        logging.info(f"QR poll starts: client_id={client_id}, request_id={(request_id.hex() if request_id else 'none')}")
+        logging.debug(f"QR poll starts: client_id={client_id}, request_id={(request_id.hex() if request_id else 'none')}")
 
         # QR-poll + наблюдение за окном/QR
         start = time.time()
