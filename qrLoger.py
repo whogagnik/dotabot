@@ -110,7 +110,7 @@ def load_mafile_from_path(path: str) -> Tuple[Path, Dict]:
     if not p.exists():
         raise SystemExit(f"maFile не найден: {p}")
     d = json.loads(p.read_text(encoding="utf-8"))
-    logging.info(f"Используем mafile: {p.name}, SteamID: {p.stem}")
+    logging.debug(f"Используем mafile: {p.name}, SteamID: {p.stem}")
     return p, d
 
 
@@ -363,7 +363,7 @@ def poll_auth_status(client_id: int, request_id: Optional[bytes], *, debug_paylo
 
 # ---------- QR / HWND helpers ----------
 def find_qr_url(timeout: int) -> str:
-    logging.info("Ищу QR-код на экране...")
+    logging.debug("Ищу QR-код на экране...")
     t0 = time.time()
     while time.time() - t0 < timeout:
         img = ImageGrab.grab()
@@ -372,7 +372,7 @@ def find_qr_url(timeout: int) -> str:
             qr = codes[0].data.decode("utf-8", errors="ignore")
             logging.info("QR найден: %s", qr)
             return qr
-        logging.info("Пока не нашёл QR на экране... (убедитесь, что окно Steam видно)")
+        logging.debug("Пока не нашёл QR на экране... (убедитесь, что окно Steam видно)")
         time.sleep(2)
     raise TimeoutError("Не удалось найти QR на экране")
 
@@ -410,7 +410,7 @@ def find_qr_in_hwnd(hwnd: int, timeout: int) -> str:
             qr = codes[0].data.decode("utf-8", errors="ignore")
             logging.info("QR найден: %s", qr)
             return qr
-        logging.info("Пока не нашёл QR в окне... (убедитесь, что QR виден в выбранном окне)")
+        logging.debug("Пока не нашёл QR в окне... (убедитесь, что QR виден в выбранном окне)")
         time.sleep(1.5)
     raise TimeoutError("Не удалось найти QR в указанном окне")
 
@@ -458,7 +458,7 @@ def rescan_qr_client_id_if_changed(login_hwnd: Optional[int], cur_client_id: int
                 if m:
                     new_cid = int(m.group(2))
                     if new_cid != cur_client_id:
-                        logging.info(f"QR challenge обновился: {cur_client_id} → {new_cid}")
+                        logging.debug(f"QR challenge обновился: {cur_client_id} → {new_cid}")
                         return new_cid
         except Exception:
             pass
@@ -595,13 +595,13 @@ def do_flow(*,
         if cid: client_id = cid
         if rid:
             request_id_override = rid
-            logging.info(f"Использую request_id из --poll-payload: {rid.hex()} (client_id={client_id})")
+            logging.debug(f"Использую request_id из --poll-payload: {rid.hex()} (client_id={client_id})")
 
     if client_id is None:
         if not qr_url:
             qr_url = find_qr_url(timeout=DEFAULT_QR_TIMEOUT)
         version, client_id = parse_qr(qr_url)
-        logging.info(f"Парсинг challenge: version={version} client_id={client_id}")
+        logging.debug(f"Парсинг challenge: version={version} client_id={client_id}")
 
     def approve_with(token: str) -> Tuple[bool, str, int]:
         return update_with_mobile_confirm(steamid, version, client_id, secret, token)
@@ -610,11 +610,11 @@ def do_flow(*,
         mod, exp, ts = _get_password_rsa_key_json(login)
         enc_b64 = _rsa_encrypt_password(password, mod, exp)
         client_id_c, request_id_c = _begin_auth_credentials_json(login, enc_b64, ts)
-        logging.info(f"BeginAuth(JSON): client_id={client_id_c}, request_id={request_id_c.hex()}")
+        logging.debug(f"BeginAuth(JSON): client_id={client_id_c}, request_id={request_id_c.hex()}")
         try:
             code = generate_steam_twofactor_code(get_shared_secret_b64(ma))
             ok_code, dbg_code = update_with_steamguard_code(steamid, client_id_c, code, token=None)
-            logging.info(dbg_code + " | via-credentials")
+            logging.debug(dbg_code + " | via-credentials")
         except Exception:
             pass
 
@@ -656,7 +656,7 @@ def do_flow(*,
 
         if request_id_override:
             request_id = request_id_override
-            logging.info(f"Перезаписал request_id из браузера: {request_id.hex()}")
+            logging.debug(f"Перезаписал request_id из браузера: {request_id.hex()}")
 
         # approve
         ok_upd, dbg_upd, code2 = approve_with(token)
@@ -683,7 +683,7 @@ def do_flow(*,
 
         # ждём request_id до 30с
         request_id = ensure_request_id_after_approve(client_id, token, request_id)
-        logging.debug(f"QR poll starts: client_id={client_id}, request_id={(request_id.hex() if request_id else 'none')}")
+        logging.info(f"QR poll starts: client_id={client_id}, request_id={(request_id.hex() if request_id else 'none')}")
 
         # QR-poll + наблюдение за окном/QR
         start = time.time()
@@ -752,7 +752,7 @@ def do_flow(*,
                 last_snapshot.update(data)
 
             if exit_on_interaction and data.get("had_remote_interaction") is True:
-                logging.info("QR-сессия: had_remote_interaction=True — успех для клиента.")
+                logging.debug("QR-сессия: had_remote_interaction=True — успех для клиента.")
                 return True, {"finish_mode": "qr_interaction", **last_snapshot}
 
             if data.get("access_token") or data.get("refresh_token"):
@@ -870,10 +870,10 @@ def login():
             mafile_path, ma = load_mafile_from_path(args.mafile)
         elif args.mafile_json:
             ma = load_mafile_from_json_arg(args.mafile_json)
-            logging.info("mafile принят как JSON (без чтения файла)")
+            logging.debug("mafile принят как JSON (без чтения файла)")
         else:
             ma = load_mafile_from_stdin()
-            logging.info("mafile принят из STDIN (JSON)")
+            logging.debug("mafile принят из STDIN (JSON)")
 
         # сверка логина
         acc = (ma.get("account_name") or ma.get("accountName") or "").strip()
@@ -896,7 +896,7 @@ def login():
                 try:
                     code = generate_steam_twofactor_code(get_shared_secret_b64(ma))
                     ok_code, dbg_code = update_with_steamguard_code(int(ma.get("steamid") or ma.get("Session", {}).get("SteamID") or 0), cid, code, token=None)
-                    logging.info(dbg_code + " | via-credentials")
+                    logging.debug(dbg_code + " | via-credentials")
                 except Exception:
                     pass
                 t0 = time.time(); last = {}
