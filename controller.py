@@ -398,7 +398,7 @@ class Controller:
                     # 2) (опц.) локальный calm
                     try:
                         self.wait_cpu_calm([acc])
-                        self._refresh_login_windows_after_calm([acc])
+                        self._refresh_login_windows_after_calm([acc], stop_event=self.stop_event)
                     except Exception:
                         pass
 
@@ -481,11 +481,15 @@ class Controller:
         self.logger.info("Фарм остановлен")
 
     # --- вспомогательное (после calm — переобнаружение логин-окон/перестановка) ---
-    def _refresh_login_windows_after_calm(self, accounts: List["Account"]):
+    def _refresh_login_windows_after_calm(
+        self, accounts: List["Account"], *, stop_event: Optional[threading.Event] = None
+    ):
         for acc in accounts:
+            if stop_event and stop_event.is_set():
+                break
             if acc.box_id is None:
                 continue
-            new_hwnd = acc._find_login_hwnd_in_box(acc.box_id, timeout_s=5)
+            new_hwnd = acc._find_login_hwnd_in_box(acc.box_id, timeout_s=5, stop_event=stop_event)
             if new_hwnd and (acc.login_hwnd != new_hwnd):
                 acc.login_hwnd = new_hwnd
                 x, y, _, _ = self.placer.rect_for(acc.box_id)

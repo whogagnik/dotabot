@@ -213,15 +213,24 @@ class Account:
         self.logger.debug(f"{self.username}: Avast режим — clear_sandboxie_cache пропущен.")
 
     # ================== поиск окна логина, привязка к нашему дереву ==================
-    def _find_login_hwnd_in_box(self, box_id:int, timeout_s:int=WAIT_LOGIN_WIN_TIMEOUT) -> Optional[int]:
+    def _find_login_hwnd_in_box(
+            self,
+            box_id: int,
+            timeout_s: int = WAIT_LOGIN_WIN_TIMEOUT,
+            stop_event: Optional[threading.Event] = None,
+    ) -> Optional[int]:
         """Совместимость: ищем логин-окно в ДЕРЕВЕ ПРОЦЕССОВ текущего аккаунта."""
-        end=time.time()+timeout_s
-        while time.time()<end:
-            pids=set(self._proc_tree_pids())
+        end = time.time() + timeout_s
+        while time.time() < end:
+            if stop_event and stop_event.is_set():
+                return None
+            pids = set(self._proc_tree_pids())
             if not pids:
-                time.sleep(0.5); continue
-            found=_any_login_hwnd_for_pids(pids)
-            if found: return found
+                time.sleep(0.5)
+                continue
+            found = _any_login_hwnd_for_pids(pids)
+            if found:
+                return found
             time.sleep(0.5)
         return None
 
@@ -243,13 +252,16 @@ class Account:
             names: List[str],
             max_attempts: int = WAIT_STEAM_PROC_ATTEMPTS,
             interval: float = WAIT_STEAM_PROC_INTERVAL,
-            match_fn: Optional[Callable[[psutil.Process], bool]] = None
+            match_fn: Optional[Callable[[psutil.Process], bool]] = None,
+            stop_event: Optional[threading.Event] = None,
     ) -> Optional[psutil.Process]:
         """
         Совместимостьная обёртка: ищем процесс с заданным именем в нашем дереве.
         """
         target_names = {n.lower() for n in names if n}
         for _ in range(max_attempts):
+            if stop_event and stop_event.is_set():
+                return None
             pids = self._proc_tree_pids()
             for pid in pids:
                 try:
@@ -262,23 +274,37 @@ class Account:
             time.sleep(interval)
         return None
 
-    def launch_until_login_window(self, steam_path:str, app_id:int, box_id:int)->Optional[int]:
+    def launch_until_login_window(
+            self,
+            steam_path: str,
+            app_id: int,
+            box_id: int,
+            *,
+            stop_event: Optional[threading.Event] = None,
+    ) -> Optional[int]:
         """
         Запускаем steam.exe напрямую (пользователь настроил «всегда в песочнице»).
         Дальше — ждём окно входа в пределах НАШЕГО дерева процессов.
         """
-        self.box_id=box_id
+        self.box_id = box_id
         self._steam_path = steam_path
         self._app_id = app_id
 
         # Полная зачистка от предыдущего запуска
-        try: self.kill_box_processes(box_id)
-        except Exception: pass
-        try: self.clear_real_steam_auth(steam_path)
-        except Exception: pass
+        try:
+            self.kill_box_processes(box_id)
+        except Exception:
+            pass
+        try:
+            self.clear_real_steam_auth(steam_path)
+        except Exception:
+            pass
+
+        if stop_event and stop_event.is_set():
+            return None
 
         # Старт
-        cmd=[steam_path, "-applaunch", str(app_id)]
+        cmd = [steam_path, "-applaunch", str(app_id)]
         cmd.extend(DOTA_LAUNCH_OPTS)
         try:
             proc = subprocess.Popen(cmd)
@@ -289,32 +315,44 @@ class Account:
             return None
 
         # Ждём steam.exe (в нашем дереве это обычно уже root)
-        steam_proc=self.wait_for_process_in_box(box_id, ["steam.exe"])
-        if not steam_proc:
+        steam_proc = self.wait_for_process_in_box(box_id, ["steam.exe"], stop_event=stop_event)
+        if not steam_proc or (stop_event and stop_event.is_set()):
             self.logger.error(f"{self.username}: steam.exe не появился")
+            return None
+
+        if stop_event and stop_event.is_set():
             return None
 
         # Ищем окно входа
         self.logger.info(f"{self.username}: жду окно входа Steam…")
-        hwnd=self._find_login_hwnd_in_box(box_id, timeout_s=WAIT_LOGIN_WIN_TIMEOUT)
-        if not hwnd:
+        hwnd = self._find_login_hwnd_in_box(box_id, timeout_s=WAIT_LOGIN_WIN_TIMEOUT, stop_event=stop_event)
+        if not hwnd or (stop_event and stop_event.is_set()):
             self.logger.error(f"{self.username}: окно входа не найдено")
             return None
 
         # Раскладка окна логина
-        x,y,_,_=self.placer.rect_for(box_id); _reposition_window_keep_size(hwnd,x,y)
-        self.login_hwnd=hwnd; self.set_status("ready")
+        x, y, _, _ = self.placer.rect_for(box_id)
+        _reposition_window_keep_size(hwnd, x, y)
+        self.login_hwnd = hwnd
+        self.set_status("ready")
         self.logger.info(f"{self.username}: окно входа найдено: HWND={hex(hwnd)} — готов к скану.")
         return hwnd
 
     # ================== полный рестарт и ожидание окна входа ==================
-    def _full_restart_to_login(self) -> Optional[int]:
+    def _full_restart_to_login(self, stop_event: Optional[threading.Event] = None) -> Optional[int]:
         if self._steam_path is None or self._app_id is None:
             return None
-        try: self.kill_box_processes(self.box_id or -1)
-        except Exception: pass
-        try: self.clear_real_steam_auth(self._steam_path)
-        except Exception: pass
+        try:
+            self.kill_box_processes(self.box_id or -1)
+        except Exception:
+            pass
+        try:
+            self.clear_real_steam_auth(self._steam_path)
+        except Exception:
+            pass
+
+        if stop_event and stop_event.is_set():
+            return None
 
         cmd = [self._steam_path, "-applaunch", str(self._app_id)]
         cmd.extend(DOTA_LAUNCH_OPTS)
@@ -324,11 +362,15 @@ class Account:
             self.logger.info(f"{self.username}: перезапуск Steam+Dota (PID={self._root_pid})")
         except Exception as e:
             self.logger.error(f"{self.username}: ошибка перезапуска → {e}")
-            time.sleep(RELAUNCH_DELAY_SEC); return None
+            time.sleep(RELAUNCH_DELAY_SEC)
+            return None
 
-        hwnd = self._find_login_hwnd_in_box(self.box_id or -1, timeout_s=WAIT_LOGIN_WIN_TIMEOUT)
+        hwnd = self._find_login_hwnd_in_box(
+            self.box_id or -1, timeout_s=WAIT_LOGIN_WIN_TIMEOUT, stop_event=stop_event
+        )
         if not hwnd:
-            self.logger.error(f"{self.username}: после рестарта окно входа не найдено"); return None
+            self.logger.error(f"{self.username}: после рестарта окно входа не найдено")
+            return None
 
         x,y,_,_=self.placer.rect_for(self.box_id or 0); _reposition_window_keep_size(hwnd,x,y)
         self.login_hwnd = hwnd; self.set_status("ready")
@@ -499,7 +541,7 @@ class Account:
         while not stop_event.is_set():
             if not hwnd or not _hwnd_exists(hwnd):
                 self.logger.info(f"{self.username}: HWND невалиден — переобнаруживаю окно логина (без рестарта)…")
-                hwnd = self._find_login_hwnd_in_box(self.box_id, timeout_s=20)
+                hwnd = self._find_login_hwnd_in_box(self.box_id, timeout_s=20, stop_event=stop_event)
 
             rc = _spawn_once(hwnd)
             if rc == 0:
@@ -508,7 +550,7 @@ class Account:
             if restarts_used >= max_restarts: break
             restarts_used += 1
             self.logger.info(f"{self.username}: неудачный скан — перезапуск Steam/Dota (#{restarts_used}/{max_restarts})…")
-            hwnd = self._full_restart_to_login()
+            hwnd = self._full_restart_to_login(stop_event)
 
         self.set_status("error"); return 1
 
@@ -524,12 +566,23 @@ class Account:
             self.logger.debug(f"{self.username}: не удалось применить мягкий лимит CPU: {e}")
 
     # ================== стадия 3: Dota, раскладка, лимит ==================
-    def wait_dota_and_arrange(self, index_for_layout:int, cpu_limit_percent:int, max_wait:int=180)->bool:
+    def wait_dota_and_arrange(
+            self,
+            index_for_layout: int,
+            cpu_limit_percent: int,
+            max_wait: int = 180,
+            *,
+            stop_event: Optional[threading.Event] = None,
+    ) -> bool:
         # Главный цикл: ждём dota2.exe; ПОКА её нет — обрабатываем блокирующие окна steamwebhelper
         deadline = time.time() + max_wait
         while time.time() < deadline and not self.dota_pid:
+            if stop_event and stop_event.is_set():
+                return False
             # 1) Dota появилась?
-            proc = self.wait_for_process_in_box(self.box_id or 0, ["dota2.exe"], max_attempts=1, interval=0.2)
+            proc = self.wait_for_process_in_box(
+                self.box_id or 0, ["dota2.exe"], max_attempts=1, interval=0.2, stop_event=stop_event
+            )
             if proc:
                 self.dota_pid = proc.pid
                 self.logger.info(f"{self.username}: Dota2 PID {self.dota_pid}")
@@ -538,7 +591,11 @@ class Account:
             # 2) Обработать блокирующие окна steamwebhelper с заголовком "Steam"
             blockers = self._steamwebhelper_hwnds_in_box(only_title_steam=True)
             for hwnd in blockers:
-                ok = self._click_continue_anyway_in_hwnd(hwnd, images_root="images/steam", confidence=0.88, close_after=True)
+                if stop_event and stop_event.is_set():
+                    return False
+                ok = self._click_continue_anyway_in_hwnd(
+                    hwnd, images_root="images/steam", confidence=0.88, close_after=True
+                )
                 if ok:
                     self.logger.info(f"{self.username}: клик выполнен, окно Steam закрыто.")
 
@@ -548,26 +605,37 @@ class Account:
             self.logger.warning(f"{self.username}: не дождался dota2.exe")
             return False
 
+        if stop_event and stop_event.is_set():
+            return False
+
         # Главное окно Dota
-        t1=time.time(); hwnd=None
-        while time.time()-t1<30:
-            hwnd=_find_main_window_for_pid(self.dota_pid)
-            if hwnd: break
+        t1 = time.time()
+        hwnd = None
+        while time.time() - t1 < 30:
+            if stop_event and stop_event.is_set():
+                return False
+            hwnd = _find_main_window_for_pid(self.dota_pid)
+            if hwnd:
+                break
             time.sleep(0.5)
         if not hwnd:
             self.logger.warning(f"{self.username}: не нашёл главное окно Dota2")
             return False
-        self.dota_hwnd=hwnd
+        self.dota_hwnd = hwnd
 
         # Раскладка + заголовок
-        x,y,_,_=self.placer.rect_for(index_for_layout); _reposition_window_keep_size(hwnd,x,y)
-        try: win32gui.SetWindowText(hwnd, self.username)
-        except Exception: pass
+        x, y, _, _ = self.placer.rect_for(index_for_layout)
+        _reposition_window_keep_size(hwnd, x, y)
+        try:
+            win32gui.SetWindowText(hwnd, self.username)
+        except Exception:
+            pass
 
         # CPU
         self._apply_cpu_limit(self.dota_pid, cpu_limit_percent)
 
-        self.set_status("ingame"); return True
+        self.set_status("ingame")
+        return True
 
     def stop_and_cleanup_box(self):
         self.set_status("stopping")
