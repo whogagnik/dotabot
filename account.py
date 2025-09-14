@@ -399,6 +399,7 @@ class Account:
             _force_foreground(hwnd)
             region = _client_region(hwnd)
             L, T, R, B = win32gui.GetWindowRect(hwnd)
+            time.sleep(0.1)
             p.leftClick(L + (R-L)/2 + 70, B-40)
         except Exception:
             pass
@@ -489,7 +490,7 @@ class Account:
         if not steam_proc or (stop_event and stop_event.is_set()):
             self.logger.error(f"{self.username}: steam.exe не появился")
             return None
-        print(123)
+
         # ждём окно входа, попутно снимая блокеры
         self.logger.info(f"{self.username}: жду окно входа Steam…")
         end = time.time() + WAIT_LOGIN_WIN_TIMEOUT

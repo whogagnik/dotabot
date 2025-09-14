@@ -888,6 +888,7 @@ def main():
     )
 
 if __name__ == "__main__":
-    _focus_window
+    hwnd = find_main_hwnd_for_pid(16244)
+    print(hwnd)
     #main()
 

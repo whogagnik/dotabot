@@ -416,7 +416,8 @@ class App(tk.Tk):
         self._selected={a.username:False for a in self.controller.accounts}; self.refresh_table()
 
     def on_close(self):
-        self.controller.stop_farming()
+        #self.controller.stop_farming()
+        #self.controller.thread_registry.exit()
         self.controller.save_state()
         self.destroy()
 
