@@ -290,6 +290,8 @@ class GameAutomation:
         self._status_lock = threading.Lock()
         self._status_value = "idle"
 
+        self._game_time_from = 0
+
         # image assets
         self.PNG = {
             # lobby / search
@@ -319,6 +321,7 @@ class GameAutomation:
             # pick phase
             "lock_in_eng": os.path.join(self.images, "game", "lock-in-eng.png"),
             "lock_in_ru": os.path.join(self.images, "game", "lock-in-ru.png"),
+            "lock_in_disabled_ru": os.path.join(self.images, "game", "lock-in-disabled-ru.png"),
             "inventory": os.path.join(self.images, "game", "inventory.png"),
             "shop_search": os.path.join(self.images, "game", "shop-search.png"),
             "random_draft": os.path.join(self.images, "game", "random-draft.png"),
@@ -331,6 +334,10 @@ class GameAutomation:
         }
 
     # ---------- status helpers ----------
+    def _start_timer(self):
+        self._game_time_from = time.time()
+    def get_timer(self):
+        return time.time() - self._game_time_from
     def _set_status(self, value: str):
         try:
             with self._status_lock:
@@ -667,32 +674,203 @@ class GameAutomation:
             pass
         return None
 
-    def pick_hero(self, hwnd: int, heroes: List[str], i: int) -> Optional[str]:
-        region = self.region_for(hwnd)
-        _force_foreground(hwnd)
-        if len(heroes) == 0:
-            self.log.info("No heroes left. Pick by yourself please")
+
+    # ---------- ожидание начала игры (появление инвентаря) ----------
+    def wait_game_start(
+            self,
+            hwnd: int,
+            timeout_s: float = 240.0,
+            poll_s: float = 0.5,
+            stop_flag: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        """
+        Ждём появления PNG инвентаря в окне hwnd.
+        Возвращает True при успехе, False по таймауту/прерыванию.
+        """
+        if not _window_ok(hwnd):
+            return False
+
+        region = _client_region(hwnd)
+        inv_path = self.PNG.get("inventory")
+        if not inv_path or not os.path.exists(inv_path):
+            self.log.warning("[IMG] inventory PNG path is not configured")
+            return False
+
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if stop_flag and stop_flag():
+                return False
+            try:
+                pt = _loc_center_robust(inv_path, self.conf, region)
+                if pt:
+                    # кликать не нужно — просто детект
+                    self._set_status("ingame")
+                    self.log.info(f"[IMG] {hex(hwnd)}: inventory detected → game started")
+                    return True
+            except Exception:
+                pass
+            time.sleep(poll_s)
+
+        self.log.warning(f"[IMG] {hex(hwnd)}: wait_game_start timeout (no inventory)")
+        return False
+
+    # ---------- улучшенный пик героя с учётом стадий/блокировки/отката ----------
+    def pick_hero(
+            self,
+            hwnd: int,
+            heroes: List[str],
+            i: int,
+            *,
+            stage_timeout_s: float = 180.0,
+            poll_s: float = 0.25,
+            rollback_watch_s: float = 25.0,
+            stop_flag: Optional[Callable[[], bool]] = None,
+    ) -> Optional[str]:
+        """
+        Выбирает героя в окне hwnd:
+          • ждёт нашу стадию, когда lock-in активна;
+          • кликает по иконке героя и жмёт lock-in;
+          • отслеживает «откат» пика (если обе команды хотели одного героя);
+          • скипает героя, если иконка не найдена (бан/занят).
+        Возвращает имя зафиксированного героя или None.
+        """
+        if not _window_ok(hwnd):
             return None
 
-        hero = heroes.pop(0)
-        hero_icon_path = os.path.join(self.images, "heroes", f"{hero}.png")
+        region = _client_region(hwnd)
 
-        try:
-            hero_icon = _loc_center_robust(hero_icon_path, self.conf, region)
-            if hero_icon:
-                self._click(hwnd, hero_icon)
-                time.sleep(0.12)
-                try:
-                    lock_in = _loc_center_robust(self.PNG["lock_in_ru"], self.conf, region)
-                    if lock_in:
-                        self._click(hwnd, lock_in)
-                        self.log.info(f"Player {i+1} hero: {hero}")
-                        return hero
-                except Exception:
-                    self.log.info(f"Player {i+1} failed to lock {hero}")
-        except Exception:
-            self.log.info(f'Hero "{hero}" is banned or not found')
-            return self.pick_hero(hwnd, heroes, i)
+        # возможные ключи для активной/неактивной кнопки
+
+
+        def _find_from_keys(keys: List[str]) -> Optional[Tuple[int, int]]:
+            for k in keys:
+                path = self.PNG.get(k)
+                if path and os.path.exists(path):
+                    pt = _loc_center_robust(path, self.conf, region)
+                    if pt:
+                        return pt
+            return None
+
+        def _find_enabled_lock() -> Optional[Tuple[int, int]]:
+            path = self.PNG['lock_in_disabled_ru']
+            if path and os.path.exists(path):
+                pt = _loc_center_robust(path, self.conf, region)
+                if pt:
+                    return pt
+            return None
+
+        def _find_disabled_lock() -> Optional[Tuple[int, int]]:
+            path = self.PNG['lock_in_ru']
+            if path and os.path.exists(path):
+                pt = _loc_center_robust(path, self.conf, region)
+                if pt:
+                    return pt
+            return None
+
+        def _wait_my_turn(timeout_s: float) -> bool:
+            """
+            Ждём, когда кнопка станет активной (наш ход).
+            Если видим disabled — ждём исчезновения disabled/появления enabled.
+            """
+            t0 = time.time()
+            while time.time() - t0 < timeout_s:
+                if stop_flag and stop_flag():
+                    return False
+                if _find_disabled_lock():
+                    time.sleep(poll_s)
+                    continue
+                if _find_enabled_lock():
+                    return True
+                time.sleep(poll_s)
+            return False
+
+        def _click_lock_enabled(retries: int = 3) -> bool:
+            for _ in range(retries):
+                if stop_flag and stop_flag():
+                    return False
+                pt = _find_enabled_lock()
+                if pt:
+                    _click_hwnd_point_win32(hwnd, pt, delay=0.06)
+                    time.sleep(0.25)
+                    # после клика enabled должен исчезнуть или стать disabled
+                    if _find_disabled_lock() or (not _find_enabled_lock()):
+                        return True
+                time.sleep(0.2)
+            return False
+
+        def _watch_rollback(window_s: float) -> bool:
+            """
+            Наблюдаем окно на предмет возврата активной lock-in.
+            True -> откат (lock снова активна), False -> всё стабильно.
+            """
+            t0 = time.time()
+            while time.time() - t0 < window_s:
+                if stop_flag and stop_flag():
+                    return True
+                if _find_enabled_lock():
+                    return True
+                # disabled или отсутствие кнопки — это норм
+                time.sleep(0.3)
+            return False
+
+        if not heroes:
+            self.log.info(f"[IMG] {hex(hwnd)}: no heroes left")
+            return None
+
+        # 1) ждём свою стадию
+        if not _wait_my_turn(stage_timeout_s):
+            self.log.warning(f"[IMG] {hex(hwnd)}: pick_hero timeout waiting for our turn")
+            return None
+
+        pool = list(heroes)  # работаем с копией
+        while pool:
+            if stop_flag and stop_flag():
+                return None
+
+            hero = pool.pop(0)
+            icon_path = os.path.join(self.images, "heroes", f"{hero}.png")
+            pt_icon = None
+            try:
+                if os.path.exists(icon_path):
+                    pt_icon = _loc_center_robust(icon_path, self.conf, region)
+            except Exception:
+                pt_icon = None
+
+            if not pt_icon:
+                self.log.info(f'[IMG] {hex(hwnd)}: hero "{hero}" unavailable (banned/picked). Next…')
+                continue
+
+            lock_path = self.PNG['lock_in_ru']
+            lock_icon = None
+            try:
+                if os.path.exists(lock_path):
+                    lock_icon = _loc_center_robust(lock_path, self.conf, region)
+            except Exception:
+                lock_icon = None
+
+            # кликаем и пытаемся залочить
+            _click_hwnd_point_win32(hwnd, pt_icon, delay=0.05)
+            time.sleep(0.12)
+            _click_hwnd_point_win32(hwnd, lock_icon, delay=0.05)
+            # если всё ещё не наш ход — коротко подождём
+            if _find_disabled_lock() and not _find_enabled_lock():
+                if not _wait_my_turn(10.0):
+                    # стадия сменилась — пробуем другого
+                    continue
+
+            if not _click_lock_enabled(retries=4):
+                self.log.info(f'[IMG] {hex(hwnd)}: failed to lock "{hero}" (lock not enabled?). Next…')
+                continue
+
+            # следим за откатом
+            if _watch_rollback(rollback_watch_s):
+                self.log.info(f'[IMG] {hex(hwnd)}: pick rollback for "{hero}". Next…')
+                continue
+
+            self.log.info(f'[IMG] {hex(hwnd)}: hero locked: {hero}')
+            return hero
+
+        self.log.warning(f"[IMG] {hex(hwnd)}: no hero could be locked")
         return None
 
     def start_buy(self, hwnd: int):
@@ -825,9 +1003,12 @@ if __name__ == "__main__":
     log.info(f"DPI scale hint: {_SCALE_HINT:.3f}")
 
     # Example usage:
-    pid = 15684
+    pid = 11132
     hwnd = find_main_hwnd_for_pid(pid)
     if hwnd:
-         game = GameAutomation(log, click_backend="auto")  # "auto" | "win32" | "pyautogui"
-         game.detect_side(hwnd, i=0, heroes=heroes)
+        game = GameAutomation(log, click_backend="auto")  # "auto" | "win32" | "pyautogui"
+        game.detect_side(hwnd, i=0, heroes=heroes)
+        game.wait_game_start(hwnd)
+        game._start_timer()
+        print(game.get_timer())
     pass
