@@ -23,6 +23,8 @@ MAX_SCAN_RETRIES = 2
 STARTUP_SYNC_TIMEOUT = 300
 DELAY_BEFORE_SCANNING_ALL_READY = 5
 
+
+
 # --- CPU calm thresholds ---
 CPU_CALM_THRESHOLD = 45         # % системной загрузки, ниже которого считаем «спокойно»
 CPU_CALM_STABLE_SEC = 2        # секунд подряд ниже порога

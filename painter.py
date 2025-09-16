@@ -1,27 +1,16 @@
-# overlay_text_lib.py
-# Windows 10/11, Python 3.x, чистый WinAPI (ctypes)
-# API:
-#   init_overlay()
-#   paint_with_coords(x, y, text, color_hex="#ffffff", font_name="Segoe UI", font_px=24)
-#   paint_wtih_coords(... )  # алиас
-#   hide_overlay()
-#   close_overlay()
-
+# overlay_text_lib.py (v2) — keep-on-top таймер
 import ctypes, threading, sys, atexit
 from ctypes import wintypes
 
-# ========= Проверка ОС =========
 if sys.platform != "win32":
-    raise OSError("overlay_text_lib: поддерживается только Windows")
+    raise OSError("overlay_text_lib: Windows only")
 
-# ========= Настройки по умолчанию =========
 DEFAULT_FONT_NAME = "Segoe UI"
-DEFAULT_FONT_PX   = 24
+DEFAULT_FONT_PX   = 12
 DEFAULT_COLOR_HEX = "#ffffff"
 PADDING           = 8
-MAGENTA_BGR0      = 0x00FF00FF  # фон, который станет прозрачным (colorkey)
+MAGENTA_BGR0      = 0x00FF00FF
 
-# ========= Шимы типов =========
 HANDLE    = wintypes.HANDLE
 HINSTANCE = getattr(wintypes, "HINSTANCE", HANDLE)
 HCURSOR   = getattr(wintypes, "HCURSOR",   HANDLE)
@@ -36,14 +25,12 @@ try:
 except AttributeError:
     LRESULT = wintypes.LPARAM
 
-# ========= WinAPI =========
 user32 = ctypes.windll.user32
 gdi32  = ctypes.windll.gdi32
 kernel32 = ctypes.windll.kernel32
 
-# DPI-aware
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor v2
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     try:
         user32.SetProcessDPIAware()
@@ -52,7 +39,6 @@ except Exception:
 
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
-# ---- Константы ----
 WS_POPUP          = 0x80000000
 WS_EX_LAYERED     = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
@@ -75,10 +61,15 @@ WM_ERASEBKGND   = 0x0014
 WM_PAINT        = 0x000F
 WM_NCHITTEST    = 0x0084
 WM_HOTKEY       = 0x0312
+WM_TIMER        = 0x0113
 HTTRANSPARENT   = -1
 WM_APP          = 0x8000
 WM_APP_UPDATE   = WM_APP + 1
 WM_APP_HIDE     = WM_APP + 2
+WM_APP_SETKEEP  = WM_APP + 3
+
+# таймер поддержания TOPMOST
+KEEP_TIMER_ID = 1001
 
 # GDI / DrawText
 BI_RGB = 0
@@ -97,7 +88,6 @@ DT_NOPREFIX = 0x0800
 DT_WORDBREAK = 0x0010
 DT_CALCRECT = 0x0400
 
-# ---- Структуры ----
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [
         ("cbSize",        wintypes.UINT),
@@ -128,7 +118,7 @@ class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
         ("biSize",        wintypes.DWORD),
         ("biWidth",       wintypes.LONG),
-        ("biHeight",      wintypes.LONG),  # отрицательная -> top-down
+        ("biHeight",      wintypes.LONG),
         ("biPlanes",      wintypes.WORD),
         ("biBitCount",    wintypes.WORD),
         ("biCompression", wintypes.DWORD),
@@ -143,7 +133,7 @@ class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER),
                 ("bmiColors", wintypes.DWORD * 3)]
 
-# ---- Прототипы (64-bit safe) ----
+# --- prototypes (64-bit safe) ---
 DefWindowProcW = user32.DefWindowProcW
 DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 DefWindowProcW.restype  = LRESULT
@@ -215,6 +205,10 @@ SelectObject = gdi32.SelectObject
 SelectObject.argtypes = [HDC, HANDLE]
 SelectObject.restype  = HANDLE
 
+PostQuitMessage = user32.PostQuitMessage
+PostQuitMessage.argtypes = [ctypes.c_int]
+PostQuitMessage.restype  = None
+
 DeleteDC = gdi32.DeleteDC
 DeleteDC.argtypes = [HDC]
 DeleteDC.restype  = wintypes.BOOL
@@ -241,37 +235,44 @@ CreateFontW.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                         ctypes.c_int, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
                         wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
                         wintypes.DWORD, wintypes.LPCWSTR]
-CreateFontW.restype  = HANDLE  # HFONT
+CreateFontW.restype  = HANDLE
 
 DrawTextW = user32.DrawTextW
 DrawTextW.argtypes = [HDC, wintypes.LPCWSTR, ctypes.c_int,
                       ctypes.POINTER(wintypes.RECT), wintypes.UINT]
 DrawTextW.restype  = ctypes.c_int
 
-# ========= Глобальные (управляет поток-окно) =========
+# таймеры
+SetTimer = user32.SetTimer
+UINT_PTR = getattr(wintypes, "UINT_PTR", wintypes.UINT)
+SetTimer.argtypes = [wintypes.HWND, UINT_PTR, wintypes.UINT, LPVOID]
+SetTimer.restype  = UINT_PTR
+KillTimer = user32.KillTimer
+KillTimer.argtypes = [wintypes.HWND, UINT_PTR]
+KillTimer.restype  = wintypes.BOOL
+
+# ========= Глобальное состояние =========
 _g_thread = None
 _g_ready_evt = threading.Event()
 _g_stop_evt  = threading.Event()
 _g_hwnd = wintypes.HWND(0)
+_g_wndproc = None
 
-# Буфер состояния (читается в оконном потоке при WM_APP_UPDATE)
 _state_lock = threading.Lock()
 _state_text = ""
 _state_color_bgr0 = 0x00FFFFFF
 _state_font_name = DEFAULT_FONT_NAME
 _state_font_px = DEFAULT_FONT_PX
-_state_size = (1, 1)
 _state_pos = (0, 0)
 
-# Графика в оконном потоке
 _g_hbm = HBITMAP(0)
 _g_memDC = HDC(0)
 _g_pBits = LPVOID(0)
 _g_width = 1
 _g_height = 1
-_g_wndproc = None  # держим ссылку на callback
 
-# ========= Утилиты =========
+_keep_ms = 500  # интервал поднятия TOPMOST (0 = выкл)
+
 def _hex_to_BGR0(hex_color: str) -> int:
     s = hex_color.lstrip("#")
     if len(s) != 6:
@@ -287,11 +288,9 @@ def _free_surface():
         DeleteObject(_g_hbm); _g_hbm = HBITMAP(0)
 
 def _create_surface(w, h):
-    """Создаёт top-down 32bpp DIB + memDC, заливает магентой."""
     global _g_hbm, _g_memDC, _g_pBits, _g_width, _g_height
     _free_surface()
     _g_width, _g_height = w, h
-
     bmi = BITMAPINFO()
     bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     bmi.bmiHeader.biWidth = w
@@ -299,38 +298,30 @@ def _create_surface(w, h):
     bmi.bmiHeader.biPlanes = 1
     bmi.bmiHeader.biBitCount = 32
     bmi.bmiHeader.biCompression = BI_RGB
-
     hbm = CreateDIBSection(HDC(0), ctypes.byref(bmi), DIB_RGB_COLORS,
                            ctypes.byref(_g_pBits), HANDLE(0), 0)
     if not hbm:
         raise OSError("CreateDIBSection failed")
-
     dc = CreateCompatibleDC(HDC(0))
     SelectObject(dc, hbm)
-
-    # Заливаем фон магентой
     arr_t = ctypes.c_uint32 * (w * h)
     pixels = arr_t.from_address(ctypes.cast(_g_pBits, ctypes.c_void_p).value)
     for i in range(w * h):
         pixels[i] = MAGENTA_BGR0
-
     _g_hbm, _g_memDC = hbm, dc
 
-def _measure_text(text: str, font_name: str, font_px: int) -> tuple[int,int,HANDLE]:
-    """Возвращает (w,h,hfont) для текста/шрифта."""
+def _measure_text(text: str, font_name: str, font_px: int):
     hfont = CreateFontW(-font_px, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                         ANTIALIASED_QUALITY, DEFAULT_PITCH, font_name)
     tmpDC = CreateCompatibleDC(HDC(0))
     old = SelectObject(tmpDC, hfont)
     SetBkMode(tmpDC, TRANSPARENT)
-
     rc = wintypes.RECT(0, 0, 10000, 10000)
     DrawTextW(tmpDC, text, len(text), ctypes.byref(rc),
               DT_LEFT | DT_TOP | DT_NOPREFIX | DT_WORDBREAK | DT_CALCRECT)
     w = rc.right - rc.left
     h = rc.bottom - rc.top
-
     SelectObject(tmpDC, old)
     DeleteDC(tmpDC)
     return w, h, hfont
@@ -345,12 +336,11 @@ def _draw_text(text: str, color_bgr0: int, hfont: HANDLE, w: int, h: int):
     SelectObject(_g_memDC, old)
     DeleteObject(hfont)
 
-# ========= Оконная процедура (только в оконном потоке) =========
 def _make_wndproc():
     def wndproc(hWnd, msg, wParam, lParam):
         try:
             if msg == WM_NCHITTEST:
-                return HTTRANSPARENT  # прокликивается насквозь
+                return HTTRANSPARENT
             elif msg == WM_ERASEBKGND:
                 return 1
             elif msg == WM_PAINT:
@@ -361,9 +351,8 @@ def _make_wndproc():
                     EndPaint(hWnd, ctypes.byref(ps))
                     return 0
             elif msg == WM_APP_UPDATE:
-                # читаем состояние и рисуем
                 with _state_lock:
-                    text = _state_text
+                    text = _state_text or " "
                     color = _state_color_bgr0
                     font_name = _state_font_name
                     font_px = _state_font_px
@@ -380,7 +369,19 @@ def _make_wndproc():
             elif msg == WM_APP_HIDE:
                 ShowWindow(hWnd, SW_HIDE)
                 return 0
+            elif msg == WM_APP_SETKEEP:
+                # wParam = новый интервал в мс (0 = выключить)
+                KillTimer(hWnd, KEEP_TIMER_ID)
+                if int(wParam) > 0:
+                    SetTimer(hWnd, UINT_PTR(KEEP_TIMER_ID), int(wParam), LPVOID(0))
+                return 0
+            elif msg == WM_TIMER and int(wParam) == KEEP_TIMER_ID:
+                # мягко поднимаем в TOPMOST-полосе
+                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                return 0
             elif msg == WM_DESTROY:
+                KillTimer(hWnd, KEEP_TIMER_ID)
                 _free_surface()
                 PostQuitMessage(0)
                 return 0
@@ -389,50 +390,35 @@ def _make_wndproc():
             return DefWindowProcW(hWnd, msg, wParam, lParam)
     return WNDPROC(wndproc)
 
-# ========= Оконный поток =========
 def _overlay_thread():
     global _g_hwnd, _g_wndproc
-    # Регистрируем класс
     hInstance = kernel32.GetModuleHandleW(None)
-    className = "OverlayTextLibClass"
-
-    _g_wndproc = _make_wndproc()  # держим ссылку, чтобы GC не собрал
+    className = "OverlayTextLibClassV2"
+    _g_wndproc = _make_wndproc()
     wc = WNDCLASSEXW()
     wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-    wc.style = 0
     wc.lpfnWndProc = _g_wndproc
-    wc.cbClsExtra = 0
-    wc.cbWndExtra = 0
     wc.hInstance = hInstance
     wc.hIcon = HICON(0)
     wc.hCursor = HCURSOR(0)
     wc.hbrBackground = HBRUSH(0)
-    wc.lpszMenuName = None
     wc.lpszClassName = className
-    wc.hIconSm = HICON(0)
     if not RegisterClassExW(ctypes.byref(wc)):
-        _g_ready_evt.set()
-        return
-
+        _g_ready_evt.set(); return
     exstyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
     style   = WS_POPUP
-    hWnd = CreateWindowExW(
-        exstyle, className, "overlay_text_lib",
-        style, 0, 0, 1, 1,
-        wintypes.HWND(0), HMENU(0), hInstance, LPVOID(0)
-    )
+    hWnd = CreateWindowExW(exstyle, className, "overlay_text_lib_v2", style,
+                           0, 0, 1, 1, wintypes.HWND(0), HMENU(0), hInstance, LPVOID(0))
     if not hWnd:
-        _g_ready_evt.set()
-        return
-
+        _g_ready_evt.set(); return
     SetLayeredWindowAttributes(hWnd, MAGENTA_BGR0, 0, LWA_COLORKEY)
     ShowWindow(hWnd, SW_SHOWNOACTIVATE)
     UpdateWindow(hWnd)
-
     _g_hwnd = hWnd
+    # стартуем таймер keep-on-top, если задан
+    if _keep_ms and _keep_ms > 0:
+        SetTimer(hWnd, UINT_PTR(KEEP_TIMER_ID), int(_keep_ms), LPVOID(0))
     _g_ready_evt.set()
-
-    # Цикл сообщений
     msg = wintypes.MSG()
     while not _g_stop_evt.is_set():
         r = GetMessageW(ctypes.byref(msg), wintypes.HWND(0), 0, 0)
@@ -441,15 +427,18 @@ def _overlay_thread():
         TranslateMessage(ctypes.byref(msg))
         DispatchMessageW(ctypes.byref(msg))
 
-# ========= Публичный API =========
-def init_overlay(timeout_sec: float = 3.0) -> bool:
-    """Инициализирует фоновой оконный поток (без фокуса, topmost, click-through)."""
-    global _g_thread
+# ---------- Публичный API ----------
+def init_overlay(keep_on_top_ms: int = 500, timeout_sec: float = 3.0) -> bool:
+    """Стартует фоновой оконный поток. keep_on_top_ms=0 отключает периодическое поднятие."""
+    global _g_thread, _keep_ms
+    _keep_ms = int(keep_on_top_ms)
     if _g_thread and _g_thread.is_alive() and _g_hwnd:
+        # если окно уже живёт — просто обновим интервал
+        set_keep_on_top_interval(_keep_ms)
         return True
     _g_stop_evt.clear()
     _g_ready_evt.clear()
-    _g_thread = threading.Thread(target=_overlay_thread, name="overlay_text_thread", daemon=True)
+    _g_thread = threading.Thread(target=_overlay_thread, name="overlay_text_thread_v2", daemon=True)
     _g_thread.start()
     ok = _g_ready_evt.wait(timeout=timeout_sec)
     atexit.register(close_overlay)
@@ -459,11 +448,8 @@ def paint_with_coords(x: int, y: int, text: str,
                       color_hex: str = DEFAULT_COLOR_HEX,
                       font_name: str = DEFAULT_FONT_NAME,
                       font_px: int = DEFAULT_FONT_PX) -> bool:
-    """
-    Рисует текст поверх всех окон в экранных координатах (x,y).
-    Инициализация будет выполнена автоматически при первом вызове.
-    """
-    if not init_overlay():
+    """Рисует текст по экранным координатам (x,y). Инициализируется автоматически."""
+    if not init_overlay(_keep_ms):
         return False
     if not text:
         text = " "
@@ -477,24 +463,33 @@ def paint_with_coords(x: int, y: int, text: str,
     PostMessageW(_g_hwnd, WM_APP_UPDATE, 0, 0)
     return True
 
-# алиас на опечатку
 def paint_wtih_coords(x, y, text, color_hex=DEFAULT_COLOR_HEX, font_name=DEFAULT_FONT_NAME, font_px=DEFAULT_FONT_PX):
     return paint_with_coords(x, y, text, color_hex, font_name, font_px)
 
+def set_keep_on_top_interval(ms: int) -> bool:
+    """Меняет интервал «поднятия» оверлея (мс). 0 — выключить. Работает на лету."""
+    global _keep_ms
+    _keep_ms = int(ms)
+    if not _g_hwnd:
+        return False
+    PostMessageW(_g_hwnd, WM_APP_SETKEEP, _keep_ms, 0)
+    return True
+
 def hide_overlay() -> bool:
-    """Скрывает окно оверлея (его можно снова показать вызовом paint_*)."""
+    """Скрывает окно; следующая paint_* снова покажет."""
     if not _g_hwnd:
         return False
     PostMessageW(_g_hwnd, WM_APP_HIDE, 0, 0)
     return True
 
 def close_overlay() -> None:
-    """Останавливает оконный поток и освобождает ресурсы."""
+    """Останавливает оконный поток и очищает ресурсы."""
     global _g_thread, _g_hwnd
     if _g_hwnd:
-        # отправим стандартное закрытие
         PostMessageW(_g_hwnd, WM_DESTROY, 0, 0)
         _g_hwnd = wintypes.HWND(0)
     if _g_thread:
         _g_stop_evt.set()
         _g_thread = None
+
+
