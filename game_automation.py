@@ -4,21 +4,17 @@ from __future__ import annotations
 
 import os
 import time
-import math
 import logging
-import ctypes
 from ctypes import wintypes
-from typing import List, Tuple, Optional, Callable, Union, Sequence
+from typing import List, Tuple, Optional, Callable, Union
 
 import threading
 
 from CONSTANTS import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
-from painter import paint_wtih_coords  # ваша отрисовка поверх игры
 
 # === External deps ===
 import pyautogui as p
 import win32gui
-import win32con
 import win32api
 import win32process
 
@@ -37,35 +33,8 @@ user32 = ctypes.windll.user32
 SMTO_ABORTIFHUNG = 0x0002
 WM_NULL = 0x0000
 _UI_REF_W, _UI_REF_H = 1920, 1080  # эталон под который сняты PNG
-def _enable_dpi_awareness():
-    """Make process DPI-aware so coordinates/screenshots match at 125/150/...% scale."""
-    try:
-        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
-    except Exception:
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
-            try:
-                user32.SetProcessDPIAware()
-            except Exception:
-                pass
 
-def _dpi_scale_hint() -> float:
-    """Approximate system scale (1.0 = 100%). Used as anchor for template scales."""
-    try:
-        return float(user32.GetDpiForSystem()) / 96.0
-    except Exception:
-        try:
-            hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)
-            LOGPIXELSX = 88
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
-            ctypes.windll.gdi32.DeleteDC(hdc)
-            return float(dpi) / 96.0
-        except Exception:
-            return 1.0
 
-_enable_dpi_awareness()
-_SCALE_HINT = _dpi_scale_hint()
 
 # --- Steam ID utils ---
 STEAMID64_OFFSET = 76561197960265728
@@ -166,182 +135,39 @@ def _click_pyautogui(pt_screen: Tuple[int, int], delay: float = 0.02) -> bool:
     except Exception:
         return False
 
-# ----------------------------- ROBUST LOCATE -----------------------------
-def _default_scales(anchor: float) -> List[float]:
-    # теперь включаем мелкие масштабы сразу
-    base = [0.30, 0.33, 0.36, 0.40, 0.45, 0.50, 0.60, 0.70,
-            0.80, 0.90, 1.00, 1.10, 1.25, 1.50, 1.75, 2.00]
-    extra = [anchor, anchor * 0.9, anchor * 1.1, anchor * 1.25]
-    uniq = sorted({round(x, 3) for x in base + extra})
-    uniq.sort(key=lambda s: abs(math.log(s / max(anchor, 1e-6))))
-    return uniq
-
-
-def _pyautogui_locate_center(img_path: str, confidence: float, region: Optional[Region]):
+def _dpi_scale_hint() -> float:
+    """Approximate system scale (1.0 = 100%). Used as anchor for template scales."""
     try:
-        return p.locateCenterOnScreen(img_path, confidence=confidence, region=region, grayscale=True)
+        return float(user32.GetDpiForSystem()) / 96.0
     except Exception:
-        return None
-# ✅ БАЗОВЫЕ КОНСТАНТЫ ДЛЯ ОЦЕНКИ МАСШТАБА UI (вставь рядом с _SCALE_HINT)
-
-
-def _scales_for_region(region: Tuple[int,int,int,int],
-                       templ_wh: Tuple[int,int],
-                       *,
-                       dpi_anchor: float,
-                       min_px: int = 8) -> List[float]:
-    """
-    Динамический набор масштабов:
-      • якорь ≈ (region_w / UI_REF_W) * dpi_anchor
-      • гарантируем «мелкие» шкалы для 640x480 (0.30…0.70)
-      • выкидываем масштабы, где шаблон < min_px или > окна
-    """
-    _, _, rw, rh = region
-    tw, th = templ_wh
-    # якорь от соотношения окна к эталону * DPI
-    anchor = max(0.3, min(2.0, min(rw / _UI_REF_W, rh / _UI_REF_H) * dpi_anchor))
-
-    # база + мелкие масштабы для маленьких окон
-    base = [0.30, 0.33, 0.36, 0.40, 0.45, 0.50, 0.60, 0.70,
-            0.80, 0.90, 1.00, 1.10, 1.25, 1.50, 1.75, 2.00]
-    # плотнее вокруг якоря
-    around = [anchor * f for f in (0.80, 0.90, 1.00, 1.10, 1.25)]
-    # итоговый набор
-    cand = sorted({round(s, 3) for s in (base + around)})
-
-    # фильтруем по допустимому размеру шаблона
-    out = []
-    for s in cand:
-        w = int(tw * s)
-        h = int(th * s)
-        if w < min_px or h < min_px:
-            continue
-        if w >= rw or h >= rh:
-            continue
-        out.append(s)
-
-    # сортируем по близости к anchor, чтобы быстрее находить
-    out.sort(key=lambda s: abs(math.log(max(s, 1e-6) / anchor)))
-    return out or [0.50, 0.60, 0.70, 0.80, 0.90]  # safety
-
-# Цветной OpenCV + поддержка альфа-маски, ТОЛЬКО при достижении порога.
-def _opencv_locate_center_multiscale(
-    img_path: str,
-    confidence: float,
-    region: Optional[Region],
-    scales: Optional[Sequence[float]] = None,
-):
-    """Цветной multiscale с динамическими масштабами (включая мелкие)."""
-    if cv2 is None or np is None:
-        return None
-    if not os.path.exists(img_path):
-        return None
-
-    # 1) скрин ROI (цвет)
-    try:
-        shot = p.screenshot(region=region)  # PIL
-        hay = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
-    except Exception:
-        return None
-
-    # 2) шаблон (+маска из альфы, если есть)
-    templ_rgba = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-    if templ_rgba is None:
-        return None
-    if templ_rgba.ndim == 3 and templ_rgba.shape[2] == 4:
-        templ = templ_rgba[:, :, :3]
-        mask  = templ_rgba[:, :, 3]
-    else:
-        templ = templ_rgba if templ_rgba.ndim == 3 else cv2.cvtColor(templ_rgba, cv2.COLOR_GRAY2BGR)
-        mask  = None
-
-    H, W = hay.shape[:2]
-    # 3) динамические масштабы: для маленьких окон дадут 0.30…0.70 и т.п.
-    if scales is None:
-        # region гарантированно есть (его всегда даём из вызывающих)
-        scales = _scales_for_region(region or (0,0,W,H),
-                                    templ_wh=(templ.shape[1], templ.shape[0]),
-                                    dpi_anchor=_SCALE_HINT,
-                                    min_px=8)
-
-    best_val, best_center = -1.0, None
-
-    for s in scales:
-        h = int(templ.shape[0] * s)
-        w = int(templ.shape[1] * s)
-        if h < 8 or w < 8 or h >= H or w >= W:
-            continue
-
-        templ_s = cv2.resize(templ, (w, h), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR)
-        mask_s  = None
-        if mask is not None:
-            mask_s = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-        # лёгкий блюр при сильном даунскейле → стабильнее корреляция мелочи
-        if s < 0.7:
-            hay_use   = cv2.GaussianBlur(hay,   (3,3), 0)
-            templ_use = cv2.GaussianBlur(templ_s, (3,3), 0)
-        else:
-            hay_use, templ_use = hay, templ_s
-
         try:
-            if mask_s is not None:
-                res = cv2.matchTemplate(hay_use, templ_use, cv2.TM_CCOEFF_NORMED, mask=mask_s)
-            else:
-                res = cv2.matchTemplate(hay_use, templ_use, cv2.TM_CCOEFF_NORMED)
+            hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)
+            LOGPIXELSX = 88
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
+            ctypes.windll.gdi32.DeleteDC(hdc)
+            return float(dpi) / 96.0
         except Exception:
-            res = cv2.matchTemplate(hay_use, templ_use, cv2.TM_CCOEFF_NORMED)
+            return 1.0
 
-        _minV, maxV, _minL, maxL = cv2.minMaxLoc(res)
-        if maxV > best_val:
-            cx = maxL[0] + w // 2
-            cy = maxL[1] + h // 2
-            best_val, best_center = maxV, (cx, cy)
-
-        if maxV >= confidence:
-            best_center = (maxL[0] + w // 2, maxL[1] + h // 2)
-            break
-
-    if best_center is None:
-        return None
-
-    if region:
-        return (region[0] + best_center[0], region[1] + best_center[1])
-    return best_center
-
-
-def _loc_center_robust(img_path: str, confidence: float = 0.87, region: Optional[Region] = None):
-    pt = _pyautogui_locate_center(img_path, confidence, region)
-    if pt:
-        return pt
-    return _opencv_locate_center_multiscale(img_path, confidence, region)
-
-def _loc_count_robust_one(img_path: str, confidence: float = 0.87, region: Optional[Region] = None) -> int:
-    return 1 if _loc_center_robust(img_path, confidence, region) else 0
-
-def _loc_count_any(paths: Sequence[str], confidence: float = 0.87, region: Optional[Region] = None) -> int:
-    total = 0
-    for ph in paths:
-        if os.path.exists(ph):
-            total += _loc_count_robust_one(ph, confidence, region)
-    return total
-
+_SCALE_HINT = _dpi_scale_hint()
 # ------------------------------------------------------------------------
 class GameAutomation:
     """High-level lobby/search/party automation + picking/macros. Все публичные методы принимают hwnd."""
 
     def __init__(self, logger: logging.Logger, images_root: str = "images", confidence: float = 0.87, click_backend: str = "auto"):
+        from opencv import OCVMatcher  # или если вставил в тот же файл — просто используй класс
+
         self.log = logger
         self.images = images_root
         self.conf = confidence
         self.click_backend = (click_backend or "auto").lower()  # 'auto' | 'win32' | 'pyautogui'
+        self.cv = OCVMatcher(self.log, base_wh=(640, 480), dpi_anchor=_SCALE_HINT)
 
-        # status (pull-based for Controller polling)
         self._status_lock = threading.Lock()
         self._status_value = "idle"
-        # в __init__ класса GameAutomation:
+
         self._templ_cache: dict[str, tuple[np.ndarray, Optional[np.ndarray], tuple[int, int]]] = {}
-        self._scales: List[float] = _default_scales(_SCALE_HINT)
+
 
         # image assets
         self.PNG = {
@@ -401,160 +227,6 @@ class GameAutomation:
                 pass
             time.sleep(poll)
         return False
-    # ---------- status helpers ----------
-    def _load_template(self, path: str) -> Optional[tuple[np.ndarray, Optional[np.ndarray], tuple[int, int]]]:
-        """
-        Кэшируем шаблон.
-        Возвращает (templ_bgr, mask_or_None, (w,h)).
-        Маска берётся из альфа-канала если он есть.
-        """
-        if cv2 is None or np is None:
-            return None
-        if path in self._templ_cache:
-            return self._templ_cache[path]
-        if not os.path.exists(path):
-            return None
-        templ_rgba = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if templ_rgba is None:
-            return None
-        mask = None
-        if templ_rgba.ndim == 3 and templ_rgba.shape[2] == 4:
-            mask = templ_rgba[:, :, 3]
-            templ = templ_rgba[:, :, :3]  # BGR
-        else:
-            templ = templ_rgba if templ_rgba.ndim == 3 else cv2.cvtColor(templ_rgba, cv2.COLOR_GRAY2BGR)
-        wh = (templ.shape[1], templ.shape[0])
-        self._templ_cache[path] = (templ, mask, wh)
-        return self._templ_cache[path]
-
-    def _loc_center_strict(
-            self,
-            hwnd: int,
-            img_path: str,
-            *,
-            confidence: float = 0.92,
-            region: Optional[Tuple[int, int, int, int]] = None,  # экранные координаты ROI
-            scales: Optional[Sequence[float]] = None,
-            coarse_step: int = 2,  # шаг coarse-поиска по массиву масштабов
-            refine: bool = True,  # включить второй (точный) проход
-            stop_flag: Optional[Callable[[], bool]] = None,
-            return_score: bool = False,  # если True → вернуть (pt, score); иначе только pt
-    ):
-        """
-        Быстрый и строгий локатор:
-          - Только OpenCV (никакого PyAutoGUI locate).
-          - Coarse→Refine: сначала быстрый проход по масштабам с шагом,
-            потом локальная донастройка вокруг лучшего кандидата (если надо).
-          - Возврат только если score >= confidence.
-          - Работает строго в пределах окна hwnd/region.
-        """
-        if cv2 is None or np is None:
-            return (None, float("nan")) if return_score else None
-        if not os.path.exists(img_path):
-            return (None, float("nan")) if return_score else None
-
-        reg = region or _client_region(hwnd)
-        if reg[2] <= 1 or reg[3] <= 1:
-            return (None, float("nan")) if return_score else None
-
-        # Снимок ROI
-        try:
-            shot = p.screenshot(region=reg)  # PIL.Image
-            hay = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)  # BGR
-        except Exception:
-            return (None, float("nan")) if return_score else None
-
-        # Шаблон из кэша
-        tpl_pack = self._load_template(img_path)
-        if tpl_pack is None:
-            return (None, float("nan")) if return_score else None
-        templ, mask, _ = tpl_pack
-
-        H, W = hay.shape[:2]
-        scale_list = list(scales or self._scales)
-
-        best_val = -1.0
-        best_loc = None
-        best_wh = None
-        best_s = 1.0
-
-        # --- 1) COARSE PASS: быстрый проход по масштабам с шагом ---
-        for idx in range(0, len(scale_list), max(1, int(coarse_step))):
-            if stop_flag and stop_flag():
-                return (None, float("nan")) if return_score else None
-
-            s = scale_list[idx]
-            h = int(templ.shape[0] * s)
-            w = int(templ.shape[1] * s)
-            if h < 12 or w < 12 or h >= H or w >= W:
-                continue
-
-            templ_s = cv2.resize(templ, (w, h), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR)
-            if mask is not None:
-                mask_s = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            else:
-                mask_s = None
-
-            # Пытаемся с маской; если не поддерживается — без маски
-            try:
-                if mask_s is not None:
-                    res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED, mask=mask_s)
-                else:
-                    res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED)
-            except Exception:
-                res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED)
-
-            _minV, maxV, _minL, maxL = cv2.minMaxLoc(res)
-            if maxV > best_val:
-                best_val, best_loc, best_wh, best_s = maxV, maxL, (w, h), s
-
-            # Ранний выход: достигли порога — возвращаем
-            if maxV >= confidence:
-                cx = reg[0] + maxL[0] + w // 2
-                cy = reg[1] + maxL[1] + h // 2
-                return ((cx, cy), float(maxV)) if return_score else (cx, cy)
-
-        # --- 2) REFINE PASS: уточняем окрестность лучшего кандидата ---
-        if refine and best_loc is not None and best_wh is not None:
-            # если уже почти порог — пробуем более плотные масштабы вокруг best_s
-            if best_val >= (confidence - 0.06):
-                dense_scales = sorted({best_s * f for f in (0.9, 0.95, 1.0, 1.05, 1.1)})
-            else:
-                dense_scales = sorted({best_s * f for f in (0.85, 0.92, 1.0, 1.08, 1.15)})
-
-            for s in dense_scales:
-                if stop_flag and stop_flag():
-                    return (None, float("nan")) if return_score else None
-                h = int(templ.shape[0] * s)
-                w = int(templ.shape[1] * s)
-                if h < 12 or w < 12 or h >= H or w >= W:
-                    continue
-
-                templ_s = cv2.resize(templ, (w, h), interpolation=cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR)
-                if mask is not None:
-                    mask_s = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-                else:
-                    mask_s = None
-
-                try:
-                    if mask_s is not None:
-                        res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED, mask=mask_s)
-                    else:
-                        res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED)
-                except Exception:
-                    res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED)
-
-                _minV, maxV, _minL, maxL = cv2.minMaxLoc(res)
-                if maxV > best_val:
-                    best_val, best_loc, best_wh, best_s = maxV, maxL, (w, h), s
-                if maxV >= confidence:
-                    cx = reg[0] + maxL[0] + w // 2
-                    cy = reg[1] + maxL[1] + h // 2
-                    return ((cx, cy), float(maxV)) if return_score else (cx, cy)
-
-        # Порог так и не достигнут — считаем, что совпадения нет
-        return ((None, float(best_val)) if return_score else None)
-
     def _set_status(self, value: str):
         try:
             with self._status_lock:
@@ -601,7 +273,7 @@ class GameAutomation:
                 return False
             for k in anchors:
                 path = self.PNG.get(k)
-                if path and os.path.exists(path) and _loc_center_robust(path, self.conf, region):
+                if path and os.path.exists(path) and self.cv.loc(hwnd, path):
                     return True
             return True
 
@@ -632,7 +304,7 @@ class GameAutomation:
                 path = self.PNG.get(key)
                 if not path or not os.path.exists(path):
                     continue
-                pt = _loc_center_robust(path, self.conf, region)
+                pt = self.cv.loc(hwnd,path)
                 if pt:
                     self._click(hwnd, pt, delay=0.05)
                     self.log.info(f"[IMG] Welcome dismissed by '{key}'.")
@@ -647,12 +319,12 @@ class GameAutomation:
         if not _window_ok(hwnd):
             return
         region = _client_region(hwnd)
-        pt = _loc_center_robust(self.PNG["play"], self.conf, region)
+        pt = self.cv.loc(hwnd, self.PNG["play"])
         if pt:
             self._click(hwnd, pt); time.sleep(0.20)
             self._click(hwnd, pt)  # double tap
             time.sleep(0.30)
-            cont = _loc_center_robust(self.PNG["continue"], self.conf, region)
+            cont = self.cv.loc(hwnd, self.PNG["continue"])
             if cont:
                 self._click(hwnd, cont)
 
@@ -660,7 +332,7 @@ class GameAutomation:
         if not _window_ok(hwnd):
             return
         region = _client_region(hwnd)
-        pt = _loc_center_robust(self.PNG["queue_again"], self.conf, region)
+        pt = self.cv.loc(hwnd, self.PNG["queue_again"])
         if pt:
             self._click(hwnd, pt, delay=0.06)
 
@@ -672,7 +344,7 @@ class GameAutomation:
             path = self.PNG.get(key)
             if not path:
                 continue
-            pt = _loc_center_robust(path, self.conf, region)
+            pt = self.cv.loc(hwnd, path)
             if pt:
                 self._click(hwnd, pt); time.sleep(0.12)
 
@@ -698,12 +370,12 @@ class GameAutomation:
 
         add_party = self.PNG.get("add_party")
         if add_party:
-            pt = _loc_center_robust(add_party, self.conf, region)
+            pt = self.cv.loc(hwnd, add_party)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.08)
 
         id_field = self.PNG.get("id_field_ru") or self.PNG.get("id_field_eng")
         if id_field:
-            pt = _loc_center_robust(id_field, self.conf, region)
+            pt = self.cv.loc(hwnd, id_field)
             if pt:
                 self._click(leader_hwnd, pt); time.sleep(0.06)
                 try:
@@ -714,17 +386,17 @@ class GameAutomation:
 
         search_btn = self.PNG.get("search_ru") or self.PNG.get("search_eng")
         if search_btn:
-            pt = _loc_center_robust(search_btn, self.conf, region)
+            pt = self.cv.loc(hwnd, search_btn)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.20)
 
         add = self.PNG.get("add")
         if add:
-            pt = _loc_center_robust(add, self.conf, region)
+            pt = self.cv.loc(hwnd, add)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.20)
 
         dota = self.PNG.get("dota")
         if dota:
-            pt = _loc_center_robust(dota, self.conf, region)
+            pt = self.cv.loc(hwnd, dota)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.35)
 
     def make_parties(self, hwnds: List[int],
@@ -772,10 +444,43 @@ class GameAutomation:
             region = _client_region(hwnd)
             paths = [self.PNG.get("accept_invite_ru", ""), self.PNG.get("accept_invite_eng", "")]
             paths = [p for p in paths if p]
-            if _loc_count_any(paths, self.conf, region) > 0:
-                for ph in paths:
-                    pt = _loc_center_robust(ph, self.conf, region)
+
+            for ph in paths:
+                    pt = self.cv.loc(hwnd, ph)
                     if pt: self._click(hwnd, pt); time.sleep(0.18); break
+
+    def _count_in_hwnds(
+            self,
+            hwnds: List[int],
+            png_keys: List[str],
+            *,
+            confidence: Optional[float] = None,
+    ) -> int:
+        """
+        Считает, в скольких окнах из hwnds найден ХОТЯ БЫ ОДИН ключ из png_keys.
+        Поиск выполняется строго в границах окна (client region) и через self.cv.loc.
+        Никаких _loc_center_robust и cv2.
+        """
+        conf = self.conf if confidence is None else confidence
+        key_paths: List[str] = []
+        for k in png_keys:
+            path = self.PNG.get(k)
+            if path and os.path.exists(path):
+                key_paths.append(path)
+        if not key_paths:
+            return 0
+
+        total = 0
+        for hwnd in hwnds:
+            if not _window_ok(hwnd):
+                continue
+            region = _client_region(hwnd)
+            for path in key_paths:
+                pt = self.cv.loc(hwnd, path, confidence=conf, region=region)
+                if pt:
+                    total += 1
+                    break
+        return total
 
     # ---------- main search scenario ----------
     def search_games(self, hwnds: List[int],
@@ -798,17 +503,20 @@ class GameAutomation:
         accept_paths = [ph for ph in accept_paths if ph]
 
         while True:
-            if stop_flag and stop_flag(): return
+            if stop_flag and stop_flag():
+                return
             time.sleep(0.6)
-            founded_games = _loc_count_any(accept_paths, self.conf)  # global scan
+
+            founded_games = self._count_in_hwnds(hwnds, self.PNG['accept'])
 
             if founded_games == 5:
                 self.log.info("[IMG] 5 players found; waiting for another 5…")
                 time.sleep(1.0)
-                if _loc_count_any(accept_paths, self.conf) == 5:
+                if self._count_in_hwnds(hwnds, self.PNG['accept']) == 5:
                     self.log.info("[IMG] Another 5 didn't find — requeue")
                     if len(hwnds) >= 10:
-                        self.queue_again(hwnds[0]); self.queue_again(hwnds[5])
+                        self.queue_again(hwnds[0])
+                        self.queue_again(hwnds[5])
                     else:
                         self.queue_again(hwnds[0])
                     self._set_status("queueing")
@@ -826,7 +534,7 @@ class GameAutomation:
             if not _window_ok(hwnd): continue
             region = _client_region(hwnd)
             for ph in accept_paths:
-                pt = _loc_center_robust(ph, self.conf, region)
+                pt = self.cv.loc(hwnd, ph)
                 if pt: self._click(hwnd, pt, delay=0.04); break
 
         self.log.info("[IMG] Games accepted")
@@ -834,14 +542,15 @@ class GameAutomation:
 
         # wait until both sides 5/5
         while True:
-            if stop_flag and stop_flag(): return
+            if stop_flag and stop_flag():
+                return
             time.sleep(0.6)
-            try:
-                radiant_count = _loc_count_robust_one(self.PNG["detect_radiant"], self.conf)
-                dire_count    = _loc_count_robust_one(self.PNG["detect_dire"], self.conf)
-                if radiant_count >= 5 and dire_count >= 5: break
-            except Exception:
-                pass
+
+            radiant_count = self._count_in_hwnds(hwnds, ["detect_radiant"])
+            dire_count = self._count_in_hwnds(hwnds, ["detect_dire"])
+
+            if radiant_count >= 5 and dire_count >= 5:
+                break
 
         self._set_status("ingame")
         self.log.info("[IMG] All players are loaded")
@@ -922,9 +631,9 @@ class GameAutomation:
         t0 = time.time()
         while (time.time() - t0) < timeout_s:
             if stop_flag and stop_flag(): return None
-            pt_r = self._loc_center_strict(hwnd, self.PNG["detect_radiant"], confidence=confidence, region=reg)
+            pt_r = self.cv.loc(hwnd, self.PNG["detect_radiant"], confidence=confidence, region=reg)
             if pt_r: self.log.info(f"[IMG] {hex(hwnd)} side: Radiant"); return "radiant"
-            pt_d = self._loc_center_strict(hwnd, self.PNG["detect_dire"], confidence=confidence, region=reg)
+            pt_d = self.cv.loc(hwnd, self.PNG["detect_dire"], confidence=confidence, region=reg)
             if pt_d: self.log.info(f"[IMG] {hex(hwnd)} side: Dire");    return "dire"
             time.sleep(poll)
         self.log.info(f"[IMG] {hex(hwnd)} side: not detected")
@@ -943,14 +652,14 @@ class GameAutomation:
         """Ждёт, пока кнопка Lock станет активной. Работает с PNG lock_in / lock_disabled (если есть)."""
         reg = _client_region(hwnd)
         t0 = time.time()
-        key_enabled  = self.PNG.get("lock_in")
-        key_disabled = self.PNG.get("lock_disabled")
+        key_enabled  = self.PNG.get("lock_in_ru")
+        key_disabled = self.PNG.get("lock_disabled_ru")
         while time.time() - t0 < timeout_s:
             if key_enabled and os.path.exists(key_enabled):
-                pt_en = self._loc_center_strict(hwnd, key_enabled, confidence=0.90, region=reg)
+                pt_en = self.cv.loc(hwnd, key_enabled, confidence=0.90, region=reg)
                 if pt_en: return True
             if key_disabled and os.path.exists(key_disabled):
-                pt_dis = self._loc_center_strict(hwnd, key_disabled, confidence=0.92, region=reg)
+                pt_dis = self.cv.loc(hwnd, key_disabled, confidence=0.92, region=reg)
                 if pt_dis:
                     time.sleep(poll); continue
             time.sleep(poll)
@@ -970,7 +679,7 @@ class GameAutomation:
             t_end = time.time() + per_hero_timeout
             found_icon = None
             while time.time() < t_end:
-                pt = self._loc_center_strict(hwnd, path, confidence=icon_confidence, region=grid)
+                pt = self.cv.loc(hwnd, path, confidence=icon_confidence, region=grid)
                 if pt:
                     found_icon = pt
                     _click_hwnd_point_win32(hwnd, found_icon, delay=0.05)
@@ -986,8 +695,8 @@ class GameAutomation:
                 continue
             # Клик по активному lock
             reg = _client_region(hwnd)
-            pt_lock = _loc_center_robust(self.PNG["lock_in_ru"], confidence=lock_confidence, region=reg)
-            print(pt_lock)
+            pt_lock = self.cv.loc(hwnd, self.PNG["lock_in_ru"])
+
             if pt_lock:
                 _click_hwnd_point_win32(hwnd, pt_lock, delay=0.05)
                 self.log.info(f"[IMG] {hex(hwnd)}: locked \"{hero}\" @ {pt_lock}")
@@ -1008,7 +717,7 @@ class GameAutomation:
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             if stop_flag and stop_flag(): return False
-            pt = _loc_center_robust(inv_path, self.conf, region)
+            pt = self.cv.loc(hwnd, inv_path)
             if pt:
                 self._set_status("ingame")
                 self.log.info(f"[IMG] {hex(hwnd)}: inventory detected → game started")
@@ -1017,94 +726,17 @@ class GameAutomation:
         self.log.warning(f"[IMG] {hex(hwnd)}: wait_game_start timeout (no inventory)")
         return False
 
-    # ——— отладочный прогон всех PNG через OpenCV с отрисовкой ———
-    def _opencv_best_match(self, hwnd: int, img_path: str,
-                           region: Optional[Tuple[int,int,int,int]] = None,
-                           scales: Optional[Sequence[float]] = None) -> Tuple[float, Optional[Tuple[int,int]], float]:
-        """Возвращает (best_score, (x,y)|None, used_scale), без порога — для диагностики."""
-        if cv2 is None or np is None or not os.path.exists(img_path):
-            return (float("nan"), None, 1.0)
-        reg = region or _client_region(hwnd)
-        if reg[2] <= 1 or reg[3] <= 1: return (float("nan"), None, 1.0)
-        try:
-            shot = p.screenshot(region=reg); hay = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
-        except Exception:
-            return (float("nan"), None, 1.0)
-        templ_rgba = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-        if templ_rgba is None: return (float("nan"), None, 1.0)
-        if templ_rgba.ndim == 3 and templ_rgba.shape[2] == 4:
-            templ = templ_rgba[:, :, :3]; mask = templ_rgba[:, :, 3]
-        else:
-            templ = templ_rgba if templ_rgba.ndim == 3 else cv2.cvtColor(templ_rgba, cv2.COLOR_GRAY2BGR)
-            mask = None
-        H, W = hay.shape[:2]
-        scales = list(scales or _default_scales(_SCALE_HINT))
-        best_val = -1.0; best_loc = None; best_wh = None; best_s = 1.0
-        for s in scales:
-            h = int(templ.shape[0]*s); w = int(templ.shape[1]*s)
-            if h < 12 or w < 12 or h >= H or w >= W: continue
-            templ_s = cv2.resize(templ, (w,h), interpolation=cv2.INTER_AREA if s<1.0 else cv2.INTER_LINEAR)
-            mask_s  = cv2.resize(mask, (w,h), interpolation=cv2.INTER_NEAREST) if mask is not None else None
-            try:
-                res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED, mask=mask_s) if mask_s is not None \
-                      else cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED)
-            except Exception:
-                res = cv2.matchTemplate(hay, templ_s, cv2.TM_CCOEFF_NORMED)
-            _, maxVal, _, maxLoc = cv2.minMaxLoc(res)
-            if maxVal > best_val:
-                best_val, best_loc, best_wh, best_s = maxVal, maxLoc, (w,h), s
-        if best_loc is None or best_wh is None:
-            return (float("nan"), None, 1.0)
-        w,h = best_wh
-        cx = reg[0] + best_loc[0] + w//2
-        cy = reg[1] + best_loc[1] + h//2
-        return (float(best_val), (cx,cy), float(best_s))
-
-    def debug_scan_all_assets_opencv(self, hwnd: int, *,
-                                     confidence: float = 0.0,
-                                     region: Optional[Tuple[int,int,int,int]] = None,
-                                     annotate_fn: Optional[Callable[[int,int,str], None]] = None,
-                                     sort_by_score: bool = True
-                                     ) -> List[Tuple[str, float, Optional[Tuple[int,int]], float]]:
-        """
-        Прогоняет ВСЕ self.PNG через OpenCV и вызывает paint_wtih_coords(x, y, text).
-        Возвращает список [(key, score, (x,y)|None, scale), ...]
-        """
-        if annotate_fn is None:
-            try:
-                annotate_fn = paint_wtih_coords  # type: ignore[name-defined]
-            except Exception:
-                annotate_fn = None
-        reg = region or _client_region(hwnd)
-        results: List[Tuple[str, float, Optional[Tuple[int,int]], float]] = []
-        for key, path in self.PNG.items():
-            if not path or not os.path.exists(path): continue
-            score, pt, used_scale = self._opencv_best_match(hwnd, path, region=reg)
-            results.append((key, score, pt, used_scale))
-        if sort_by_score:
-            results.sort(key=lambda x: (-(x[1] if (x[1] == x[1]) else -1.0)))
-        for key, score, pt, used_scale in results:
-            if (pt is not None) and (score >= confidence):
-                if annotate_fn:
-                    try: annotate_fn(pt[0], pt[1], f"{key}: {score:.3f} x{used_scale:.2f}")
-                    except Exception: pass
-                try: self.log.info(f"[DBG] {key}: score={score:.3f} scale={used_scale:.2f} pt={pt}")
-                except Exception: pass
-            else:
-                try: self.log.info(f"[DBG] {key}: score={score:.3f} (below {confidence}) pt={pt}")
-                except Exception: pass
-        return results
 
     # ---------- simple macros ----------
     def start_buy(self, hwnd: int):
         region = _client_region(hwnd)
         try:
-            inventory = _loc_center_robust(self.PNG["inventory"], self.conf, region)
+            inventory = self.cv.loc(hwnd, self.PNG["inventory"])
             if not inventory: return
             self._click(hwnd, inventory)
             p.press("f4")
             time.sleep(0.25)
-            shop_search = _loc_center_robust(self.PNG["shop_search"], self.conf, region)
+            shop_search = self.cv.loc(hwnd, self.PNG["shop_search"])
             if not shop_search: return
             self._click(hwnd, shop_search)
             for key in list("maelstrom"): p.press(key)
@@ -1117,7 +749,7 @@ class GameAutomation:
     def run_mid(self, hwnd: int, side: str, i: int) -> bool:
         region = _client_region(hwnd)
         try:
-            inventory = _loc_center_robust(self.PNG["inventory"], self.conf, region)
+            inventory = self.cv.loc(hwnd, self.PNG["inventory"])
             if not inventory: return False
             self._click(hwnd, inventory)
             if side == "radiant":
