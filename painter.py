@@ -1,8 +1,9 @@
-# overlay_text_lib.py (v3) — multi-text overlay (Windows only)
+# overlay_text_lib.py — multi-text overlay + TLWH-rect with TTL (Windows only)
 # API:
 #   init_overlay(keep_on_top_ms=300, max_items=20)
 #   paint_with_coords(x, y, text, color_hex="#ffffff", font_name="Segoe UI", font_px=24)
 #   paint_wtih_coords(...)  # алиас
+#   draw_rect(top, left, width, height, color_hex="#ff69b4", thickness=2, fill=False, ttl_ms=100)
 #   set_keep_on_top_interval(ms)
 #   set_max_items(n)
 #   clear_overlay()
@@ -11,17 +12,19 @@
 
 import ctypes, threading, sys, atexit
 from ctypes import wintypes
-import time
+
 if sys.platform != "win32":
     raise OSError("overlay_text_lib: Windows only")
 
 # ---------- defaults ----------
 DEFAULT_FONT_NAME = "Segoe UI"
-DEFAULT_FONT_PX   = 10
+DEFAULT_FONT_PX   = 24
 DEFAULT_COLOR_HEX = "#ffffff"
 PADDING           = 8
-MAGENTA_BGR0      = 0x00FF00FF  # colorkey
-KEEP_TIMER_ID     = 1001
+MAGENTA_BGR0      = 0x00FF00FF  # colorkey (не используйте #ff00ff для рисования — будет прозрачным)
+KEEP_TIMER_ID     = 1001        # keep-on-top timer
+EXP_TIMER_BASE    = 3000        # base for per-item expiry timers
+EXP_TIMER_MAX     = 3999
 
 # ---------- type shims ----------
 HANDLE    = wintypes.HANDLE
@@ -40,7 +43,7 @@ kernel32 = ctypes.windll.kernel32
 
 # DPI-aware
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-Monitor v2
 except Exception:
     try:
         user32.SetProcessDPIAware()
@@ -77,7 +80,7 @@ WM_APP_HIDE     = WM_APP + 2
 WM_APP_SETKEEP  = WM_APP + 3
 WM_APP_CLEAR    = WM_APP + 4
 
-# GDI / DrawText
+# GDI / DrawText & Shapes
 BI_RGB = 0
 DIB_RGB_COLORS = 0
 SRCCOPY = 0x00CC0020
@@ -92,6 +95,10 @@ DT_LEFT = 0x0000
 DT_TOP = 0x0000
 DT_NOPREFIX = 0x0800
 DT_CALCRECT = 0x0400
+
+# Shapes
+PS_SOLID = 0
+HOLLOW_BRUSH = 5  # stock object id
 
 # GetSystemMetrics
 SM_XVIRTUALSCREEN  = 76
@@ -180,6 +187,10 @@ UpdateWindow = user32.UpdateWindow
 UpdateWindow.argtypes = [wintypes.HWND]
 UpdateWindow.restype  = wintypes.BOOL
 
+InvalidateRect = user32.InvalidateRect
+InvalidateRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.BOOL]
+InvalidateRect.restype  = wintypes.BOOL
+
 SetWindowPos = user32.SetWindowPos
 SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
                          ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -201,6 +212,10 @@ DispatchMessageW.restype  = wintypes.LPARAM
 PostMessageW = user32.PostMessageW
 PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 PostMessageW.restype  = wintypes.BOOL
+
+PostQuitMessage = user32.PostQuitMessage
+PostQuitMessage.argtypes = [ctypes.c_int]
+PostQuitMessage.restype  = None
 
 SetLayeredWindowAttributes = user32.SetLayeredWindowAttributes
 SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD]
@@ -247,10 +262,6 @@ CreateFontW.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                         wintypes.DWORD, wintypes.LPCWSTR]
 CreateFontW.restype  = HANDLE
 
-InvalidateRect = user32.InvalidateRect
-InvalidateRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.BOOL]
-InvalidateRect.restype  = wintypes.BOOL
-
 DrawTextW = user32.DrawTextW
 DrawTextW.argtypes = [HDC, wintypes.LPCWSTR, ctypes.c_int,
                       ctypes.POINTER(wintypes.RECT), wintypes.UINT]
@@ -260,6 +271,24 @@ GetSystemMetrics = user32.GetSystemMetrics
 GetSystemMetrics.argtypes = [ctypes.c_int]
 GetSystemMetrics.restype  = ctypes.c_int
 
+# Shapes
+CreatePen = gdi32.CreatePen
+CreatePen.argtypes = [ctypes.c_int, ctypes.c_int, wintypes.COLORREF]
+CreatePen.restype  = HANDLE
+
+CreateSolidBrush = gdi32.CreateSolidBrush
+CreateSolidBrush.argtypes = [wintypes.COLORREF]
+CreateSolidBrush.restype  = HBRUSH
+
+GetStockObject = gdi32.GetStockObject
+GetStockObject.argtypes = [ctypes.c_int]
+GetStockObject.restype  = HANDLE
+
+Rectangle = gdi32.Rectangle
+Rectangle.argtypes = [HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+Rectangle.restype  = wintypes.BOOL
+
+# timers
 SetTimer = user32.SetTimer
 UINT_PTR = getattr(wintypes, "UINT_PTR", wintypes.UINT)
 SetTimer.argtypes = [wintypes.HWND, UINT_PTR, wintypes.UINT, LPVOID]
@@ -288,9 +317,11 @@ _g_pBits = LPVOID(0)
 
 # items state (read by window thread)
 _state_lock = threading.Lock()
-_items: list[dict] = []   # each: {x,y,text,color,font,font_px}
+_items = []   # each: dict with kind: 'text'|'rect', fields…
+
 _max_items = 20
 _keep_ms   = 300
+_timer_next = EXP_TIMER_BASE
 
 # ---------- helpers ----------
 def _hex_to_BGR0(hex_color: str) -> int:
@@ -300,6 +331,19 @@ def _hex_to_BGR0(hex_color: str) -> int:
     r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
     return (b << 16) | (g << 8) | r
 
+def _alloc_timer_id_locked():
+    global _timer_next
+    tid = _timer_next
+    _timer_next += 1
+    if _timer_next > EXP_TIMER_MAX:
+        _timer_next = EXP_TIMER_BASE
+    used = {it.get("timer_id") for it in _items if "timer_id" in it}
+    while tid in used:
+        tid += 1
+        if tid > EXP_TIMER_MAX:
+            tid = EXP_TIMER_BASE
+    return tid
+
 def _free_surface():
     global _g_hbm, _g_memDC
     if _g_memDC:
@@ -308,7 +352,7 @@ def _free_surface():
         DeleteObject(_g_hbm); _g_hbm = HBITMAP(0)
 
 def _create_screen_surface():
-    """Create 32bpp top-down DIB for whole virtual screen."""
+    """Create 32bpp top-down DIB for whole virtual screen; fill with colorkey."""
     global _g_hbm, _g_memDC, _g_pBits
     _free_surface()
     bmi = BITMAPINFO()
@@ -328,12 +372,10 @@ def _create_screen_surface():
     _clear_surface()
 
 def _clear_surface():
-    """Fill surface with colorkey."""
     if not _g_pBits:
         return
     arr_t = ctypes.c_uint32 * (_g_scr_w * _g_scr_h)
     pixels = arr_t.from_address(ctypes.cast(_g_pBits, ctypes.c_void_p).value)
-    # bulk fill
     for i in range(_g_scr_w * _g_scr_h):
         pixels[i] = MAGENTA_BGR0
 
@@ -342,39 +384,62 @@ def _draw_items():
     _clear_surface()
     if not _items:
         return
-    for it in _items:
-        text = it["text"]
-        font = it["font"]
-        fpx  = it["font_px"]
-        color= it["color"]
-        x    = it["x"] - _g_scr_left
-        y    = it["y"] - _g_scr_top
-        if x >= _g_scr_w or y >= _g_scr_h:
-            continue
-        # HFONT
-        hfont = CreateFontW(-int(fpx), 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                            ANTIALIASED_QUALITY, DEFAULT_PITCH, font)
-        old = SelectObject(_g_memDC, hfont)
-        SetBkMode(_g_memDC, TRANSPARENT)
-        SetTextColor(_g_memDC, color)
-        # Measure
-        rc_calc = wintypes.RECT(0, 0, 10000, 10000)
-        DrawTextW(_g_memDC, text, len(text), ctypes.byref(rc_calc),
-                  DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT)
-        w = rc_calc.right - rc_calc.left
-        h = rc_calc.bottom - rc_calc.top
-        # Target rect (clamped)
-        left   = max(0, x + PADDING)
-        top    = max(0, y + PADDING)
-        right  = min(_g_scr_w,  left + w)
-        bottom = min(_g_scr_h,  top  + h)
-        if right > left and bottom > top:
-            rc = wintypes.RECT(left, top, right, bottom)
-            DrawTextW(_g_memDC, text, len(text), ctypes.byref(rc),
-                      DT_LEFT | DT_TOP | DT_NOPREFIX)
-        SelectObject(_g_memDC, old)
-        DeleteObject(hfont)
+    for it in list(_items):
+        kind = it.get("kind", "text")
+        color = it.get("color", 0x00FFFFFF)
+        if kind == "text":
+            text = it["text"]
+            font = it["font"]
+            fpx  = it["font_px"]
+            x    = it["x"] - _g_scr_left
+            y    = it["y"] - _g_scr_top
+            hfont = CreateFontW(-int(fpx), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                ANTIALIASED_QUALITY, DEFAULT_PITCH, font)
+            old = SelectObject(_g_memDC, hfont)
+            SetBkMode(_g_memDC, TRANSPARENT)
+            SetTextColor(_g_memDC, color)
+            rc_calc = wintypes.RECT(0, 0, 10000, 10000)
+            DrawTextW(_g_memDC, text, len(text), ctypes.byref(rc_calc),
+                      DT_LEFT | DT_TOP | DT_NOPREFIX | DT_CALCRECT)
+            w = rc_calc.right - rc_calc.left
+            h = rc_calc.bottom - rc_calc.top
+            left   = max(0, x + PADDING)
+            top    = max(0, y + PADDING)
+            right  = min(_g_scr_w,  left + w)
+            bottom = min(_g_scr_h,  top  + h)
+            if right > left and bottom > top:
+                rc = wintypes.RECT(left, top, right, bottom)
+                DrawTextW(_g_memDC, text, len(text), ctypes.byref(rc), DT_LEFT | DT_TOP | DT_NOPREFIX)
+            SelectObject(_g_memDC, old)
+            DeleteObject(hfont)
+        elif kind == "rect":
+            # TLWH уже в item как x(left), y(top), w, h
+            x = it["x"] - _g_scr_left
+            y = it["y"] - _g_scr_top
+            w = int(it["w"]); h = int(it["h"])
+            th = max(1, int(it.get("thickness", 2)))
+            fill = bool(it.get("fill", False))
+            # pen/brush
+            hpen = CreatePen(PS_SOLID, th, color)
+            if fill:
+                hbrush = CreateSolidBrush(color)
+            else:
+                hbrush = GetStockObject(HOLLOW_BRUSH)
+            old_pen = SelectObject(_g_memDC, hpen)
+            old_br  = SelectObject(_g_memDC, hbrush)
+            left   = max(0, int(x))
+            top    = max(0, int(y))
+            right  = min(_g_scr_w,  left + w)
+            bottom = min(_g_scr_h,  top  + h)
+            if right > left and bottom > top:
+                Rectangle(_g_memDC, left, top, right, bottom)
+            # restore & free
+            SelectObject(_g_memDC, old_pen)
+            SelectObject(_g_memDC, old_br)
+            DeleteObject(hpen)
+            if fill:
+                DeleteObject(hbrush)
 
 # ---------- window proc ----------
 def _make_wndproc():
@@ -394,12 +459,9 @@ def _make_wndproc():
             elif msg == WM_APP_REBUILD:
                 with _state_lock:
                     _draw_items()
-                # keep topmost & show (no activate)
                 SetWindowPos(hWnd, HWND_TOPMOST, _g_scr_left, _g_scr_top, _g_scr_w, _g_scr_h,
                              SWP_NOACTIVATE | SWP_SHOWWINDOW)
                 InvalidateRect(hWnd, None, False)
-                UpdateWindow(hWnd)
-
                 UpdateWindow(hWnd)
                 return 0
             elif msg == WM_APP_HIDE:
@@ -418,16 +480,30 @@ def _make_wndproc():
                              SWP_NOACTIVATE | SWP_SHOWWINDOW)
                 InvalidateRect(hWnd, None, False)
                 UpdateWindow(hWnd)
-
-                UpdateWindow(hWnd)
                 return 0
-            elif msg == WM_TIMER and int(wParam) == KEEP_TIMER_ID:
-                SetWindowPos(hWnd, HWND_TOPMOST, _g_scr_left, _g_scr_top, _g_scr_w, _g_scr_h,
-                             SWP_NOACTIVATE | SWP_SHOWWINDOW)
-                return 0
+            elif msg == WM_TIMER:
+                tid = int(wParam)
+                if tid == KEEP_TIMER_ID:
+                    SetWindowPos(hWnd, HWND_TOPMOST, _g_scr_left, _g_scr_top, _g_scr_w, _g_scr_h,
+                                 SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                    return 0
+                # expiry timers
+                if EXP_TIMER_BASE <= tid <= EXP_TIMER_MAX:
+                    KillTimer(hWnd, tid)
+                    changed = False
+                    with _state_lock:
+                        for i in range(len(_items)-1, -1, -1):
+                            if _items[i].get("timer_id") == tid:
+                                del _items[i]
+                                changed = True
+                                break
+                    if changed:
+                        PostMessageW(hWnd, WM_APP_REBUILD, 0, 0)
+                    return 0
             elif msg == WM_DESTROY:
                 KillTimer(hWnd, KEEP_TIMER_ID)
                 _free_surface()
+                PostQuitMessage(0)
                 return 0
             return DefWindowProcW(hWnd, msg, wParam, lParam)
         except Exception:
@@ -445,7 +521,7 @@ def _overlay_thread():
 
     _g_wndproc = _make_wndproc()
     hInstance = kernel32.GetModuleHandleW(None)
-    className = "OverlayTextLibV3"
+    className = "OverlayTextLib_TLWH"
 
     wc = WNDCLASSEXW()
     wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
@@ -460,7 +536,7 @@ def _overlay_thread():
 
     exstyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
     style   = WS_POPUP
-    hWnd = CreateWindowExW(exstyle, className, "overlay_text_lib_v3", style,
+    hWnd = CreateWindowExW(exstyle, className, "overlay_text_lib", style,
                            _g_scr_left, _g_scr_top, _g_scr_w, _g_scr_h,
                            wintypes.HWND(0), HMENU(0), hInstance, LPVOID(0))
     if not hWnd:
@@ -470,7 +546,6 @@ def _overlay_thread():
     _g_hwnd = hWnd
     _create_screen_surface()
 
-    # show & keep-on-top timer
     SetWindowPos(hWnd, HWND_TOPMOST, _g_scr_left, _g_scr_top, _g_scr_w, _g_scr_h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW)
     if _keep_ms and _keep_ms > 0:
@@ -478,7 +553,6 @@ def _overlay_thread():
 
     _g_ready_evt.set()
 
-    # message loop
     msg = wintypes.MSG()
     while not _g_stop_evt.is_set():
         r = GetMessageW(ctypes.byref(msg), wintypes.HWND(0), 0, 0)
@@ -489,7 +563,7 @@ def _overlay_thread():
 
 # ---------- public API ----------
 def init_overlay(keep_on_top_ms: int = 300, max_items: int = 20, timeout_sec: float = 3.0) -> bool:
-    """Start overlay thread. keep_on_top_ms=0 disables periodic raise; max_items=capacity of queue."""
+    """Start overlay thread. keep_on_top_ms=0 disables periodic raise; max_items=capacity (FIFO)."""
     global _g_thread, _keep_ms, _max_items
     _keep_ms   = int(keep_on_top_ms)
     _max_items = max(1, int(max_items))
@@ -498,7 +572,7 @@ def init_overlay(keep_on_top_ms: int = 300, max_items: int = 20, timeout_sec: fl
         set_max_items(_max_items)
         return True
     _g_stop_evt.clear(); _g_ready_evt.clear()
-    _g_thread = threading.Thread(target=_overlay_thread, name="overlay_text_v3", daemon=True)
+    _g_thread = threading.Thread(target=_overlay_thread, name="overlay_text_thread", daemon=True)
     _g_thread.start()
     ok = _g_ready_evt.wait(timeout=timeout_sec)
     atexit.register(close_overlay)
@@ -514,6 +588,7 @@ def paint_with_coords(x: int, y: int, text: str,
     if not text:
         text = " "
     item = {
+        "kind": "text",
         "x": int(x), "y": int(y),
         "text": str(text),
         "color": _hex_to_BGR0(color_hex),
@@ -523,13 +598,43 @@ def paint_with_coords(x: int, y: int, text: str,
     with _state_lock:
         _items.append(item)
         if len(_items) > _max_items:
-            # drop oldest
             del _items[0: len(_items) - _max_items]
     PostMessageW(_g_hwnd, WM_APP_REBUILD, 0, 0)
     return True
 
 def paint_wtih_coords(x, y, text, color_hex=DEFAULT_COLOR_HEX, font_name=DEFAULT_FONT_NAME, font_px=DEFAULT_FONT_PX):
     return paint_with_coords(x, y, text, color_hex, font_name, font_px)
+
+def draw_rect(top: int, left: int, width: int, height: int,
+              color_hex: str = "#ff69b4",
+              thickness: int = 2,
+              fill: bool = False,
+              ttl_ms: int = 100) -> bool:
+    """
+    Рисует прямоугольник поверх всех окон.
+    Параметры строго: (top, left, width, height). Если ttl_ms > 0 — автоудаление через ttl_ms мс.
+    """
+    if not init_overlay(_keep_ms, _max_items):
+        return False
+    w = max(1, int(width)); h = max(1, int(height))
+    item = {
+        "kind": "rect",
+        "x": int(left), "y": int(top),
+        "w": w, "h": h,
+        "color": _hex_to_BGR0(color_hex),
+        "thickness": int(thickness),
+        "fill": bool(fill),
+    }
+    with _state_lock:
+        _items.append(item)
+        if len(_items) > _max_items:
+            del _items[0: len(_items) - _max_items]
+        if ttl_ms and ttl_ms > 0 and _g_hwnd:
+            tid = _alloc_timer_id_locked()
+            item["timer_id"] = tid
+            SetTimer(_g_hwnd, UINT_PTR(tid), int(ttl_ms), LPVOID(0))
+    PostMessageW(_g_hwnd, WM_APP_REBUILD, 0, 0)
+    return True
 
 def set_keep_on_top_interval(ms: int) -> bool:
     """Change keep-on-top interval (ms). 0 disables."""
@@ -541,7 +646,7 @@ def set_keep_on_top_interval(ms: int) -> bool:
     return True
 
 def set_max_items(n: int) -> None:
-    """Set new capacity; trims current list if necessary."""
+    """Set new capacity; trims current list if necessary (FIFO)."""
     global _max_items
     n = max(1, int(n))
     _max_items = n
@@ -561,7 +666,7 @@ def clear_overlay() -> bool:
     return True
 
 def hide_overlay() -> bool:
-    """Hide window; next paint_* will show again."""
+    """Hide window; next paint_* / draw_rect will show again."""
     if not _g_hwnd:
         return False
     PostMessageW(_g_hwnd, WM_APP_HIDE, 0, 0)

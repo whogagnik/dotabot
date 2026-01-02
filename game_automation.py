@@ -1,15 +1,16 @@
 # game_automation_merged.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import os
 import time
 import logging
 from ctypes import wintypes
 from typing import List, Tuple, Optional, Callable, Union
-
+import random
 import threading
-
+import dxcam
+import numpy as np
+from PIL import Image
 from CONSTANTS import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
 
 # === External deps ===
@@ -17,14 +18,9 @@ import pyautogui as p
 import win32gui
 import win32api
 import win32process
+import win32con
 
-# Optional OpenCV matcher
-try:
-    import cv2  # type: ignore
-    import numpy as np  # type: ignore
-except Exception:
-    cv2 = None
-    np = None
+
 
 Region = Tuple[int, int, int, int]  # (x, y, w, h)
 
@@ -34,10 +30,16 @@ SMTO_ABORTIFHUNG = 0x0002
 WM_NULL = 0x0000
 _UI_REF_W, _UI_REF_H = 1920, 1080  # эталон под который сняты PNG
 
-
-
 # --- Steam ID utils ---
 STEAMID64_OFFSET = 76561197960265728
+
+# --- Global DXCam singleton (poll-only, без start())
+_DXCAM = {
+    "cam": None,       # объект dxcam
+    "running": False,  # мы не используем .start(), оставляем False
+}
+
+
 def steam64_to_friend_id_local(steamid64: Union[int, str, None]) -> Optional[str]:
     try:
         if steamid64 is None:
@@ -92,10 +94,6 @@ def _window_ok(hwnd: int) -> bool:
     return _is_window_responsive(hwnd)
 
 # --- Win32 click backend (parallelizable) + fallback ---
-WM_MOUSEMOVE   = 0x0200
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP   = 0x0202
-MK_LBUTTON     = 0x0001
 
 def _make_lparam(x: int, y: int) -> int:
     return (y << 16) | (x & 0xFFFF)
@@ -107,67 +105,44 @@ def _screen_to_client(hwnd: int, pt_screen: Tuple[int, int]) -> Tuple[int, int]:
         cx, cy, _, _ = _client_region(hwnd)
         return (max(0, pt_screen[0] - cx), max(0, pt_screen[1] - cy))
 
-def _post_click(hwnd: int, x_client: int, y_client: int, delay: float = 0.02) -> bool:
+def _force_foreground(hwnd: int):
     try:
-        lp = _make_lparam(x_client, y_client)
-        win32api.PostMessage(hwnd, WM_MOUSEMOVE, 0, lp)
-        time.sleep(delay)
-        win32api.PostMessage(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lp)
-        time.sleep(0.02)
-        win32api.PostMessage(hwnd, WM_LBUTTONUP, 0, lp)
-        return True
-    except Exception:
-        return False
-
-def _click_hwnd_point_win32(hwnd: int, pt_screen: Tuple[int, int], delay: float = 0.02) -> bool:
-    try:
-        x_client, y_client = _screen_to_client(hwnd, pt_screen)
-        return _post_click(hwnd, x_client, y_client, delay=delay)
-    except Exception:
-        return False
-
-def _click_pyautogui(pt_screen: Tuple[int, int], delay: float = 0.02) -> bool:
-    try:
-        p.moveTo(pt_screen)
-        time.sleep(delay)
-        p.leftClick()
-        return True
-    except Exception:
-        return False
-
-def _dpi_scale_hint() -> float:
-    """Approximate system scale (1.0 = 100%). Used as anchor for template scales."""
-    try:
-        return float(user32.GetDpiForSystem()) / 96.0
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+        fore = win32gui.GetForegroundWindow()
+        ftid = win32process.GetWindowThreadProcessId(fore)[0] if fore else 0
+        ctid = win32api.GetCurrentThreadId()
+        user32.AttachThreadInput(ftid, ctid, True)
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+        win32gui.SetActiveWindow(hwnd)
     except Exception:
         try:
-            hdc = ctypes.windll.gdi32.CreateDCW("DISPLAY", None, None, None)
-            LOGPIXELSX = 88
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
-            ctypes.windll.gdi32.DeleteDC(hdc)
-            return float(dpi) / 96.0
+            win32gui.SetForegroundWindow(hwnd)
         except Exception:
-            return 1.0
+            pass
+    finally:
+        try:
+            user32.AttachThreadInput(ftid, ctid, False)  # type: ignore[name-defined]
+        except Exception:
+            pass
 
-_SCALE_HINT = _dpi_scale_hint()
+
+
+
 # ------------------------------------------------------------------------
 class GameAutomation:
     """High-level lobby/search/party automation + picking/macros. Все публичные методы принимают hwnd."""
 
-    def __init__(self, logger: logging.Logger, images_root: str = "images", confidence: float = 0.87, click_backend: str = "auto"):
-        from opencv import OCVMatcher  # или если вставил в тот же файл — просто используй класс
+    def __init__(self, logger: logging.Logger, images_root: str = "images", confidence: float = 0.87):
 
+        self.cam = dxcam.create(output_idx=0, output_color="RGB")
         self.log = logger
         self.images = images_root
         self.conf = confidence
-        self.click_backend = (click_backend or "auto").lower()  # 'auto' | 'win32' | 'pyautogui'
-        self.cv = OCVMatcher(self.log, base_wh=(640, 480), dpi_anchor=_SCALE_HINT)
+
 
         self._status_lock = threading.Lock()
         self._status_value = "idle"
-
-        self._templ_cache: dict[str, tuple[np.ndarray, Optional[np.ndarray], tuple[int, int]]] = {}
-
 
         # image assets
         self.PNG = {
@@ -208,6 +183,155 @@ class GameAutomation:
             "welcome_ok": os.path.join(self.images, "welcome", "ok.png"),
             "welcome_got_it": os.path.join(self.images, "welcome", "got_it.png"),
         }
+        self.last_full_rgb = None  # последний полный кадр (RGB, numpy)
+        self.last_full_ts = 0.0
+        self.full_frame_min_dt = 1.0 / 30  # не чаще ~30 FPS
+
+        # ---- кэши/тайминги для pyautogui locate ----
+        self.hwnd_last_grab_ts = {}  # hwnd -> ts последнего обновления кропа
+        self.hwnd_haystack_pil = {}  # hwnd -> PIL.Image (кроп окна в RGB)
+        self.needle_cache = {}  # img_path -> PIL.Image (RGB)
+
+    def _ensure_dxcam(self):
+        """Создаём глобальную dxcam-камеру один раз. Без .start()!"""
+        global _DXCAM
+        if _DXCAM["cam"] is not None:
+            return
+        try:
+
+            cam = dxcam.create(output_idx=0, output_color="RGB")  # RGB удобнее дальше
+            _DXCAM["cam"] = cam
+            _DXCAM["running"] = False  # принципиально не вызываем .start()
+            if self.log:
+                self.log.info("[DX] created poll-only camera (no background thread)")
+        except Exception as e:
+            if self.log:
+                self.log.error(f"[DX] create failed: {e}", exc_info=True)
+            raise
+
+    def _grab_fullscreen_rgb(self, force: bool = False):
+        """
+        Берём кадр в poll-режиме: сначала пытаемся get_latest_frame() (вдруг кто-то запустил),
+        иначе синхронно grab(). Частотный лимит через self.full_frame_min_dt.
+        """
+        self._ensure_dxcam()
+        cam = _DXCAM["cam"]
+        now = time.time()
+        if (not force) and self.last_full_rgb is not None and (now - self.last_full_ts) < self.full_frame_min_dt:
+            return self.last_full_rgb
+        frame = cam.grab()
+
+        if frame is None or not hasattr(frame, "shape"):
+            if self.log:
+                self.log.warning("[DX] grab returned empty frame")
+            return None
+
+        self.last_full_rgb = frame
+        self.last_full_ts = now
+        if self.log:
+            h, w = frame.shape[:2]
+            self.log.debug(f"[DX] fullscreen RGB grabbed: {w}x{h} ts={now:.3f}")
+        return self.last_full_rgb
+
+    @staticmethod
+    def _safe_crop(full_rgb: np.ndarray, x: int, y: int, w: int, h: int) -> Optional[np.ndarray]:
+        """Обрезает full_rgb до указанного прямоугольника с учётом границ экрана."""
+        H, W = full_rgb.shape[:2]
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(x + w, W)
+        y1 = min(y + h, H)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return full_rgb[y0:y1, x0:x1].copy()
+
+    @staticmethod
+    def _np_rgb_to_pil(img_rgb: np.ndarray):
+        """RGB numpy -> PIL.Image"""
+        return Image.fromarray(img_rgb, mode="RGB")
+
+    def _loc_center(self, hwnd, img_path, confidence: float = 0.87, delta: float = 0.01):
+        """
+        dxcam → один полный кадр (RGB numpy), кроп client-области hwnd,
+        конверт в PIL и матчинг через pyautogui/pyscreeze.locate().
+
+        Возвращает экранные координаты центра (cx, cy) или None.
+        """
+        try:
+            # 1) client-область окна (в экранных коорд.)
+            L, T, W, H = _client_region(hwnd)
+            if W <= 0 or H <= 0:
+                if self.log:
+                    self.log.debug(f"[LOC] hwnd={hex(hwnd)} invalid client rect: {(L, T, W, H)}")
+                return None
+
+            # 2) лимит частоты обновления кропа на окно
+            now = time.time()
+            last_ts = self.hwnd_last_grab_ts.get(hwnd, 0.0)
+            need_new = (now - last_ts) > max(0.0, delta)
+
+            haystack_pil = None
+            if (not need_new) and (hwnd in self.hwnd_haystack_pil):
+                haystack_pil = self.hwnd_haystack_pil[hwnd]
+                if self.log:
+                    self.log.debug(f"[LOC] hwnd={hex(hwnd)} haystack CACHED {W}x{H} @ {L},{T}")
+            else:
+                # 3) берём полный кадр и вырезаем client-область
+
+                full = self._grab_fullscreen_rgb(force=False)
+
+                if full is None:
+                    return None
+                crop_rgb = self._safe_crop(full, L, T, W, H)
+
+                if crop_rgb is None:
+                    if self.log:
+                        self.log.debug(f"[LOC] hwnd={hex(hwnd)} crop out-of-bounds win=({L},{T},{W},{H})")
+                    return None
+                haystack_pil = self._np_rgb_to_pil(crop_rgb)
+                self.hwnd_haystack_pil[hwnd] = haystack_pil
+                self.hwnd_last_grab_ts[hwnd] = now
+                if self.log:
+                    cw, ch = haystack_pil.size
+                    self.log.debug(f"[LOC] hwnd={hex(hwnd)} haystack NEW {cw}x{ch} @ {L},{T} (delta={delta:.3f}s)")
+
+            # 4) кэшируем needle (PIL.Image RGB)
+            needle = self.needle_cache.get(img_path)
+            if needle is None:
+                try:
+                    needle = Image.open(img_path).convert("RGB")
+                    self.needle_cache[img_path] = needle
+                    if self.log:
+                        self.log.debug(f"[LOC] needle loaded: '{img_path}' size={needle.size}")
+                except Exception as e:
+                    if self.log:
+                        self.log.warning(f"[LOC] cannot load needle '{img_path}': {e}")
+                    return None
+
+            # 5) locate через pyscreeze (под капотом OpenCV) — работает с PIL-объектами
+            box = p.locate(needle, haystack_pil, confidence=float(confidence), grayscale=True)
+
+            if not box:
+                if self.log:
+                    self.log.debug(f"[LOC] hwnd={hex(hwnd)} NO MATCH conf={confidence}")
+                return None
+
+            cx_local, cy_local = p.center(box)  # координаты внутри haystack (кропа окна)
+            cx_screen = int(L + cx_local)
+            cy_screen = int(T + cy_local)
+
+            if self.log:
+                self.log.debug(
+                    f"[LOC] hwnd={hex(hwnd)} HIT local=({cx_local},{cy_local}) "
+                    f"screen=({cx_screen},{cy_screen}) box={box} conf={confidence}"
+                )
+
+            return (cx_screen, cy_screen)
+
+        except Exception as e:
+            if self.log:
+                self.log.error(f"[LOC] _loc_center failed hwnd={hex(hwnd)}: {e}", exc_info=True)
+            return None
 
     @staticmethod
     def _wait_until(
@@ -227,6 +351,17 @@ class GameAutomation:
                 pass
             time.sleep(poll)
         return False
+
+    def _click(self, hwnd: int, pt_screen, delay: float = 0.02) :
+        try:
+            _force_foreground(hwnd)
+            p.moveTo(x = pt_screen[0], y= pt_screen[1])
+            if delay > 0:
+                time.sleep(delay)
+            p.leftClick()
+        except Exception:
+            pass
+
     def _set_status(self, value: str):
         try:
             with self._status_lock:
@@ -249,16 +384,8 @@ class GameAutomation:
         s = self.get_status()
         return STATUS_COLORS.get(s, STATUS_COLORS["idle"])
 
-    # central click router
-    def _click(self, hwnd: int, pt_screen: Tuple[int, int], delay: float = 0.02) -> bool:
-        if self.click_backend == "win32":
-            return _click_hwnd_point_win32(hwnd, pt_screen, delay=delay)
-        if self.click_backend == "pyautogui":
-            return _click_pyautogui(pt_screen, delay=delay)
-        # auto
-        if not _click_hwnd_point_win32(hwnd, pt_screen, delay=delay):
-            return _click_pyautogui(pt_screen, delay=delay)
-        return True
+
+
 
     # ---------- readiness / welcome ----------
     def wait_window_ready(self, hwnd: int, timeout: float = 25.0,
@@ -273,7 +400,7 @@ class GameAutomation:
                 return False
             for k in anchors:
                 path = self.PNG.get(k)
-                if path and os.path.exists(path) and self.cv.loc(hwnd, path):
+                if path and os.path.exists(path) and self._loc_center(hwnd, path):
                     return True
             return True
 
@@ -304,7 +431,7 @@ class GameAutomation:
                 path = self.PNG.get(key)
                 if not path or not os.path.exists(path):
                     continue
-                pt = self.cv.loc(hwnd,path)
+                pt = self._loc_center(hwnd,path)
                 if pt:
                     self._click(hwnd, pt, delay=0.05)
                     self.log.info(f"[IMG] Welcome dismissed by '{key}'.")
@@ -319,32 +446,32 @@ class GameAutomation:
         if not _window_ok(hwnd):
             return
         region = _client_region(hwnd)
-        pt = self.cv.loc(hwnd, self.PNG["play"])
+        pt = self._loc_center(hwnd, self.PNG["play"])
         if pt:
             self._click(hwnd, pt); time.sleep(0.20)
             self._click(hwnd, pt)  # double tap
             time.sleep(0.30)
-            cont = self.cv.loc(hwnd, self.PNG["continue"])
+            cont = self._loc_center(hwnd, self.PNG["continue"])
             if cont:
                 self._click(hwnd, cont)
 
     def queue_again(self, hwnd: int):
         if not _window_ok(hwnd):
             return
-        region = _client_region(hwnd)
-        pt = self.cv.loc(hwnd, self.PNG["queue_again"])
+
+        pt = self._loc_center(hwnd, self.PNG["queue_again"])
         if pt:
             self._click(hwnd, pt, delay=0.06)
 
     def accept_rewards_once(self, hwnd: int):
         if not _window_ok(hwnd):
             return
-        region = _client_region(hwnd)
+
         for key in ("accept_reward", "ok"):
             path = self.PNG.get(key)
             if not path:
                 continue
-            pt = self.cv.loc(hwnd, path)
+            pt = self._loc_center(hwnd, path)
             if pt:
                 self._click(hwnd, pt); time.sleep(0.12)
 
@@ -356,13 +483,15 @@ class GameAutomation:
             time.sleep(0.4)
         self.log.info("[IMG] Rewards accepted")
 
+
+
+
     # ---------- party/invites by friend_id ----------
     def invite_to_party(self, leader_hwnd: int,
                         friend_id: Optional[str] = None,
                         steamid64: Optional[Union[int, str]] = None):
         if not _window_ok(leader_hwnd):
             return
-        region = _client_region(leader_hwnd)
         fid = friend_id or steam64_to_friend_id_local(steamid64)
         if not fid:
             self.log.warning("[IMG] invite_to_party: friend_id missing — skip.")
@@ -370,12 +499,14 @@ class GameAutomation:
 
         add_party = self.PNG.get("add_party")
         if add_party:
-            pt = self.cv.loc(hwnd, add_party)
-            if pt: self._click(leader_hwnd, pt); time.sleep(0.08)
+            pt = self._loc_center(hwnd, add_party)
+            if pt:
+
+                self._click(leader_hwnd, pt); time.sleep(0.08)
 
         id_field = self.PNG.get("id_field_ru") or self.PNG.get("id_field_eng")
         if id_field:
-            pt = self.cv.loc(hwnd, id_field)
+            pt = self._loc_center(hwnd, id_field)
             if pt:
                 self._click(leader_hwnd, pt); time.sleep(0.06)
                 try:
@@ -386,17 +517,17 @@ class GameAutomation:
 
         search_btn = self.PNG.get("search_ru") or self.PNG.get("search_eng")
         if search_btn:
-            pt = self.cv.loc(hwnd, search_btn)
+            pt = self._loc_center(hwnd, search_btn)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.20)
 
         add = self.PNG.get("add")
         if add:
-            pt = self.cv.loc(hwnd, add)
+            pt = self._loc_center(hwnd, add)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.20)
 
         dota = self.PNG.get("dota")
         if dota:
-            pt = self.cv.loc(hwnd, dota)
+            pt = self._loc_center(hwnd, dota)
             if pt: self._click(leader_hwnd, pt); time.sleep(0.35)
 
     def make_parties(self, hwnds: List[int],
@@ -446,7 +577,7 @@ class GameAutomation:
             paths = [p for p in paths if p]
 
             for ph in paths:
-                    pt = self.cv.loc(hwnd, ph)
+                    pt = self._loc_center(hwnd, ph)
                     if pt: self._click(hwnd, pt); time.sleep(0.18); break
 
     def _count_in_hwnds(
@@ -458,8 +589,8 @@ class GameAutomation:
     ) -> int:
         """
         Считает, в скольких окнах из hwnds найден ХОТЯ БЫ ОДИН ключ из png_keys.
-        Поиск выполняется строго в границах окна (client region) и через self.cv.loc.
-        Никаких _loc_center_robust и cv2.
+        Поиск выполняется строго в границах окна (client region) и через self._loc_center().
+        Никаких self._loc_center()_robust и cv2.
         """
         conf = self.conf if confidence is None else confidence
         key_paths: List[str] = []
@@ -476,7 +607,7 @@ class GameAutomation:
                 continue
             region = _client_region(hwnd)
             for path in key_paths:
-                pt = self.cv.loc(hwnd, path, confidence=conf, region=region)
+                pt = self._loc_center(hwnd, path)
                 if pt:
                     total += 1
                     break
@@ -534,7 +665,7 @@ class GameAutomation:
             if not _window_ok(hwnd): continue
             region = _client_region(hwnd)
             for ph in accept_paths:
-                pt = self.cv.loc(hwnd, ph)
+                pt = self._loc_center(hwnd, ph)
                 if pt: self._click(hwnd, pt, delay=0.04); break
 
         self.log.info("[IMG] Games accepted")
@@ -558,69 +689,9 @@ class GameAutomation:
     # ---------- side detection / hero pick / macros / debug ----------
 
 
-    def get_minimap_region(self, hwnd: int, corner: str = "left",
-                           search_frac_w: float = 0.35, search_frac_h: float = 0.45,
-                           fallback_size_h: float = 0.33) -> Optional[Tuple[int,int,int,int]]:
-        """Возвращает (x,y,w,h) миникарты в экранных координатах."""
-        if not _window_ok(hwnd): return None
-        cx, cy, cw, ch = _client_region(hwnd)
-        sw = max(40, int(cw * search_frac_w))
-        sh = max(40, int(ch * search_frac_h))
-        rx0 = 0 if corner == "left" else (cw - sw)
-        ry0 = ch - sh
-        if cv2 is not None and np is not None:
-            try:
-                shot = p.screenshot(region=(cx + rx0, cy + ry0, sw, sh))
-                roi_bgr = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
-                gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-                gray = cv2.GaussianBlur(gray, (3,3), 0)
-                edges = cv2.Canny(gray, 40, 120)
-                edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-                cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                best = None; roi_area = float(sw*sh)
-                for c in cnts:
-                    x,y,w,h = cv2.boundingRect(c)
-                    area = w*h
-                    if area < 0.02*roi_area: continue
-                    ar = w/float(max(1,h))
-                    squareish   = 0.85 <= ar <= 1.15
-                    near_bottom = (y + h) > (sh * 0.60)
-                    near_side   = (x < sw * 0.40) if corner=="left" else ((x+w) > sw*0.60)
-                    if not (squareish and near_bottom and near_side): continue
-                    squareness = 1.0 - abs(1.0 - ar)
-                    score = area * (0.6 + 0.4*squareness)
-                    if (best is None) or (score > best[0]): best = (score, (x,y,w,h))
-                if best is not None:
-                    x,y,w,h = best[1]
-                    pad = int(min(w,h)*0.03)
-                    x = max(0, x-pad); y = max(0, y-pad)
-                    w = min(sw-x, w + pad*2); h = min(sh-y, h + pad*2)
-                    return (cx + rx0 + x, cy + ry0 + y, w, h)
-            except Exception:
-                pass
-        # fallback
-        size = int(ch * fallback_size_h)
-        size = max(80, min(size, int(min(cw, ch) * 0.45)))
-        margin_x = int(cw * 0.015)
-        margin_y = int(ch * 0.05)
-        x = cx + margin_x if corner=="left" else cx + cw - margin_x - size
-        y = cy + ch - margin_y - size
-        return (x, y, size, size)
 
-    def save_minimap_crop(self, hwnd: int, out_path: str, corner: str = "left") -> bool:
-        reg = self.get_minimap_region(hwnd, corner=corner)
-        if not reg:
-            self.log.warning(f"[IMG] {hex(hwnd)}: minimap region not found")
-            return False
-        try:
-            shot = p.screenshot(region=reg)
-            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-            shot.save(out_path)
-            self.log.info(f"[IMG] saved minimap crop → {out_path} ({reg})")
-            return True
-        except Exception as e:
-            self.log.error(f"[IMG] save_minimap_crop failed: {e}")
-            return False
+
+
 
     def detect_side(self, hwnd: int, *, confidence: float = 0.90,
                     timeout_s: float = 6.0, poll: float = 0.25,
@@ -631,22 +702,15 @@ class GameAutomation:
         t0 = time.time()
         while (time.time() - t0) < timeout_s:
             if stop_flag and stop_flag(): return None
-            pt_r = self.cv.loc(hwnd, self.PNG["detect_radiant"], confidence=confidence, region=reg)
+            pt_r = self._loc_center(hwnd, self.PNG["detect_radiant"])
             if pt_r: self.log.info(f"[IMG] {hex(hwnd)} side: Radiant"); return "radiant"
-            pt_d = self.cv.loc(hwnd, self.PNG["detect_dire"], confidence=confidence, region=reg)
+            pt_d = self._loc_center(hwnd, self.PNG["detect_dire"])
             if pt_d: self.log.info(f"[IMG] {hex(hwnd)} side: Dire");    return "dire"
             time.sleep(poll)
         self.log.info(f"[IMG] {hex(hwnd)} side: not detected")
         return None
 
-    def get_hero_grid_region(self, hwnd: int) -> Tuple[int,int,int,int]:
-        """Эвристическая область сетки героев (экранные координаты)."""
-        x, y, w, h = _client_region(hwnd)
-        left   = int(x + w * 0.07)
-        top    = int(y + h * 0.18)
-        width  = int(w * 0.58)
-        height = int(h * 0.55)
-        return (left, top, width, height)
+
 
     def wait_lock_enabled(self, hwnd: int, timeout_s: float = 30.0, poll: float = 0.2) -> bool:
         """Ждёт, пока кнопка Lock станет активной. Работает с PNG lock_in / lock_disabled (если есть)."""
@@ -656,10 +720,10 @@ class GameAutomation:
         key_disabled = self.PNG.get("lock_disabled_ru")
         while time.time() - t0 < timeout_s:
             if key_enabled and os.path.exists(key_enabled):
-                pt_en = self.cv.loc(hwnd, key_enabled, confidence=0.90, region=reg)
+                pt_en = self._loc_center(hwnd, key_enabled  )
                 if pt_en: return True
             if key_disabled and os.path.exists(key_disabled):
-                pt_dis = self.cv.loc(hwnd, key_disabled, confidence=0.92, region=reg)
+                pt_dis = self._loc_center(hwnd, key_disabled)
                 if pt_dis:
                     time.sleep(poll); continue
             time.sleep(poll)
@@ -673,16 +737,16 @@ class GameAutomation:
         Ищет иконку героя ТОЛЬКО внутри сетки, кликает, ждёт разблокировки lock и кликает lock.
         Возвращает имя героя при успехе, иначе None.
         """
-        grid = self.get_hero_grid_region(hwnd)
+
         for hero in list(heroes):
             path = os.path.join(self.images, "heroes", f"{hero}.png")
             t_end = time.time() + per_hero_timeout
             found_icon = None
             while time.time() < t_end:
-                pt = self.cv.loc(hwnd, path, confidence=icon_confidence, region=grid)
+                pt = self._loc_center(hwnd, path)
                 if pt:
                     found_icon = pt
-                    _click_hwnd_point_win32(hwnd, found_icon, delay=0.05)
+                    self._click(hwnd, pt)
                     break
                 time.sleep(0.15)
             if not found_icon:
@@ -694,11 +758,11 @@ class GameAutomation:
                 self.log.info(f"[IMG] {hex(hwnd)}: failed to lock \"{hero}\" (lock not enabled?). Next…")
                 continue
             # Клик по активному lock
-            reg = _client_region(hwnd)
-            pt_lock = self.cv.loc(hwnd, self.PNG["lock_in_ru"])
+            time.sleep(0.12)
+            pt_lock = self._loc_center(hwnd, self.PNG["lock_in_ru"])
 
             if pt_lock:
-                _click_hwnd_point_win32(hwnd, pt_lock, delay=0.05)
+                self._click(hwnd, pt_lock)
                 self.log.info(f"[IMG] {hex(hwnd)}: locked \"{hero}\" @ {pt_lock}")
                 return hero
             self.log.info(f"[IMG] {hex(hwnd)}: failed to lock \"{hero}\" (no button?). Next…")
@@ -717,7 +781,7 @@ class GameAutomation:
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             if stop_flag and stop_flag(): return False
-            pt = self.cv.loc(hwnd, inv_path)
+            pt = self._loc_center(hwnd, inv_path)
             if pt:
                 self._set_status("ingame")
                 self.log.info(f"[IMG] {hex(hwnd)}: inventory detected → game started")
@@ -731,12 +795,12 @@ class GameAutomation:
     def start_buy(self, hwnd: int):
         region = _client_region(hwnd)
         try:
-            inventory = self.cv.loc(hwnd, self.PNG["inventory"])
+            inventory = self._loc_center(hwnd, self.PNG["inventory"])
             if not inventory: return
             self._click(hwnd, inventory)
             p.press("f4")
             time.sleep(0.25)
-            shop_search = self.cv.loc(hwnd, self.PNG["shop_search"])
+            shop_search = self._loc_center(hwnd, self.PNG["shop_search"])
             if not shop_search: return
             self._click(hwnd, shop_search)
             for key in list("maelstrom"): p.press(key)
@@ -749,7 +813,7 @@ class GameAutomation:
     def run_mid(self, hwnd: int, side: str, i: int) -> bool:
         region = _client_region(hwnd)
         try:
-            inventory = self.cv.loc(hwnd, self.PNG["inventory"])
+            inventory = self._loc_center(hwnd, self.PNG["inventory"])
             if not inventory: return False
             self._click(hwnd, inventory)
             if side == "radiant":
@@ -833,12 +897,17 @@ def find_main_hwnd_for_pid(pid: int) -> Optional[int]:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
     log = logging.getLogger("img")
-    log.info(f"DPI scale hint: {_SCALE_HINT:.3f}")
 
-    pid = 19684
+    pid = 19480
     hwnd = find_main_hwnd_for_pid(pid)
+    print(hwnd)
+    _force_foreground(hwnd)
+
     if hwnd:
-        game = GameAutomation(log, click_backend="win32", confidence=0.8)
-        game.pick_hero_grid(hwnd,heroes=heroes)
+        game = GameAutomation(log, confidence=0.8)
+        #game._ensure_dxcam()
+        #game.invite_to_party(hwnd,friend_id='0123')
+
+        #game.pick_hero_grid(hwnd, heroes=heroes)
         #game.debug_scan_all_assets_opencv(hwnd, confidence=0.0)  # покажет все найденные ассеты
     pass

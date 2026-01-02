@@ -46,7 +46,9 @@ DOTA_LAUNCH_OPTS = [
     "-silent",
 
 ]
-heroes = ['aa', 'abaddon', 'alchemist', 'axe', 'bara', 'brist', 'cent', 'chaos', 'clockwerk', 'crystal', 'disruptor', 'dk', 'doom', 'dp', 'elder', 'huskar', 'kunka', 'legion', 'lifestealer', 'ns', 'od', 'ogre', 'omni', 'primal', 'pudge', 'shaker', 'slardar', 'sven', 'tide', 'timber', 'tiny', 'treant', 'tusk', 'underlord', 'undying', 'wk',]
+
+heroes = [x for x in range(0,126)]
+
 STATUS_LABELS = {
     "idle":"Ожидание","launching":"Запуск…","ready":"Окно готово","scanning":"Сканирую QR",
     "success":"Логин ок","ingame":"Dota в игре","gc_ready":"GC готов","queueing":"Поиск игры",
