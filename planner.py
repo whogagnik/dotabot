@@ -86,7 +86,7 @@ def debug_log_result(fn):
         if not logger or not logger.isEnabledFor(logging.DEBUG):
             return fn(*args, **kwargs)
 
-        # аккуратно формируем строку с аргументами (без гигантских дампов)
+        # формируем строку с аргументами (без гигантских дампов)
         def _short_repr(x, max_len=120):
             r = repr(x)
             if len(r) > max_len:
