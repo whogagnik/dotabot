@@ -1,5 +1,9 @@
-from train_hp_seq_all import *
-from train_minimap_heatmap import *
+from scripts.ml.train_hp_seq_all import *
+from scripts.ml.train_minimap_heatmap import *
+
+def to_tensor(img_rgb: np.ndarray) -> torch.Tensor:
+    """RGB HxWx3 uint8 -> float32 tensor 3xHxW 0..1"""
+    return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
 @torch.no_grad()
 def infer_one_hp(path, ckpt="runs/hp_seq/best.pt", bin_thr: Optional[int] = 200, device=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")

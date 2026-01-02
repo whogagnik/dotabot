@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from metrics import find_peaks_per_channel
+from scripts.ml.metrics import find_peaks_per_channel
 
 # ---------------------------
 # Utils
