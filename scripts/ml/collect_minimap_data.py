@@ -1,4 +1,4 @@
-# visualize_minimap.py
+# collect_minimap_data.py
 # -*- coding: utf-8 -*-
 
 """
@@ -32,13 +32,13 @@ import win32gui  # Win32 окно/координаты
 import torch
 # ==== Импорт из тренировочного скрипта ====
 try:
-    from train_minimap_heatmap import load_model, infer_image, find_peaks_per_channel
+    from scripts.ml.train_minimap_heatmap import load_model, infer_image, find_peaks_per_channel
 except Exception as e:
     print("[!] Не удалось импортировать из train_minimap_heatmap.py:", e)
     sys.exit(1)
 
 # ==== Константы ====
-CKPT_PATH = "runs/minimap/best.pt"
+CKPT_PATH = "../../runs/minimap/best.pt"
 
 PATCH_W = 100
 PATCH_H = 100
@@ -48,7 +48,7 @@ THR_DEFAULT = 0.7
 NMS_DEFAULT = 7
 GAUSS_DEFAULT = True
 
-DUMP_DIR_DEFAULT = "data/minimap_hard"
+DUMP_DIR_DEFAULT = "../../data/minimap_hard"
 TASKS_FILENAME = "ls_tasks.json"
 SHADOW_FILENAME = "ls_tasks.shadow.json"
 

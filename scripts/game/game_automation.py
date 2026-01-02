@@ -6,12 +6,11 @@ import time
 import logging
 from ctypes import wintypes
 from typing import List, Tuple, Optional, Callable, Union
-import random
 import threading
 import dxcam
 import numpy as np
 from PIL import Image
-from CONSTANTS import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
+from scripts.core.CONSTANTS import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
 
 # === External deps ===
 import pyautogui as p

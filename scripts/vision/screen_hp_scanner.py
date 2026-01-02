@@ -1,4 +1,4 @@
-# hp_scanner.py
+# screen_hp_scanner.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations

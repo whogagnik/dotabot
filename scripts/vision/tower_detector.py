@@ -35,7 +35,7 @@ import pyautogui as p
 
 # ------------------ Константы ------------------
 
-JSON_PATH = r"data/minimap_landmarks.json"  # ЖЁСТКИЙ путь
+JSON_PATH = r"../../config/minimap_landmarks.json"  # ЖЁСТКИЙ путь
 MINIMAP_W = 100
 MINIMAP_H = 100
 DX = 4  # смещение от правого края внутрь

@@ -6,12 +6,12 @@ from typing import Optional, List, Dict
 import psutil
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from CONSTANTS import *
+from scripts.core.CONSTANTS import *
 # win32
 import win32gui, win32process
-from GuiHandler import GuiHandler
-from windowPlacer import WindowPlacer
-from controller import Controller
+from scripts.app.gui_handler import GuiHandler
+from scripts.app.window_placer import WindowPlacer
+from scripts.app.controller import Controller
 
 
 def make_logger(gui_text: tk.Text) -> logging.Logger:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Optional, List, Callable, Tuple
-from pathlib import Path
 from stat import S_IWRITE
 import os
 import time
@@ -11,7 +10,6 @@ import logging
 import shutil
 import subprocess
 import threading
-import ctypes
 
 import psutil
 import pyautogui as p
@@ -20,10 +18,10 @@ import win32con
 import win32api
 import win32process
 
-from CONSTANTS import *
-from windowPlacer import WindowPlacer
+from scripts.core.CONSTANTS import *
+from window_placer import WindowPlacer
 try:
-    from threadRegistry import ThreadRegistry  # опционально
+    from thread_registry import ThreadRegistry  # опционально
 except Exception:
     ThreadRegistry = None  # type: ignore[assignment]
 
@@ -593,9 +591,9 @@ class Account:
 
         def _spawn_once(hwnd: int) -> int:
             import sys
-            script = os.path.join(os.path.dirname(__file__), "qrLoger.py")
+            script = os.path.join(os.path.dirname(__file__), "qr_loger.py")
             if not os.path.exists(script):
-                self.logger.error(f"{self.username}: нет qrLoger.py")
+                self.logger.error(f"{self.username}: нет qr_loger.py")
                 self.set_status("error")
                 return 1
             if not self.mafile_path:
@@ -619,7 +617,7 @@ class Account:
 
             _force_foreground(hwnd)
             self.set_status("scanning")
-            self.logger.info(f"{self.username}: запускаю qrLoger.py с HWND={hex(hwnd)}…")
+            self.logger.info(f"{self.username}: запускаю qr_loger.py с HWND={hex(hwnd)}…")
 
             self._qr_proc = subprocess.Popen(
                 cmd,
@@ -682,7 +680,7 @@ class Account:
                 self._qr_proc.returncode if self._qr_proc and self._qr_proc.returncode is not None else 1
             )
             self._qr_proc = None
-            self.logger.info(f"{self.username}: qrLoger.py завершился с кодом {rc}.")
+            self.logger.info(f"{self.username}: qr_loger.py завершился с кодом {rc}.")
             return rc
 
         restarts_used = 0

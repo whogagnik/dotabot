@@ -1,8 +1,8 @@
-# hud_ocr.py
+# hud_hp_scanner.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict
 import os
 import time
 import json
@@ -11,8 +11,6 @@ import shutil
 import numpy as np
 import cv2
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from uuid import uuid4
 
@@ -20,7 +18,7 @@ from uuid import uuid4
 import win32gui
 import pyautogui as p
 import easyocr
-from train_hp_seq_all import HudHPSeqNet
+from scripts.ml.train_hp_seq_all import HudHPSeqNet
 
 """
 Модуль OCR для HUD:
@@ -40,7 +38,7 @@ TIME_ROI:  Tuple[int, int, int, int] = (880, 15, 1020, 45)
 # -------------------------
 # Папки и LS интеграция
 # -------------------------
-DUMP_DIR = "data/hud"
+DUMP_DIR = "../../data/hud"
 HP_DIR   = os.path.join(DUMP_DIR, "hp_bar")
 TASKS_JSON = os.path.join(DUMP_DIR, "hp_bar.json")
 TASKS_SHADOW = os.path.join(DUMP_DIR, "hp_bar.shadow.json")
@@ -239,7 +237,7 @@ def load_hp_model(
 # ============================================================
 # 2. HudOCR: HP через свою NN, голда через EasyOCR
 # ============================================================
-class HudOCR:
+class SelfHp:
     """
     OCR для HUD:
       - read_gold(window_rgb) -> Optional[int]  (EasyOCR)
@@ -248,7 +246,7 @@ class HudOCR:
     """
 
     def __init__(self,
-                 hp_ckpt_path: str = "runs/hp_seq/best.pt",
+                 hp_ckpt_path: str,
                  device: Optional[str] = None,
                  gpu_easyocr: bool = False):
         # ---- HP модель ----
@@ -603,7 +601,7 @@ def run_live_capture(interval_sec: float = 1.0, hp_ckpt_path: str = "runs/hp_seq
         return
     print(f"[i] Dota hwnd: {hex(hwnd)} title='{_win_title(hwnd)}'")
 
-    ocr = HudOCR(hp_ckpt_path=hp_ckpt_path)
+    ocr = SelfHp(hp_ckpt_path=hp_ckpt_path)
     tasks = load_or_init_tasks(TASKS_JSON)
     print(f"[i] Using tasks file: {os.path.abspath(TASKS_JSON)}")
 
@@ -673,7 +671,7 @@ if __name__ == "__main__":
         run_live_capture(interval_sec=args.interval, hp_ckpt_path=args.hp_ckpt)
     else:
         # Оффлайн-проверка: прогон по имеющимся hp_bar *.png
-        ocr = HudOCR(hp_ckpt_path=args.hp_ckpt)
+        ocr = SelfHp(hp_ckpt_path=args.hp_ckpt)
         imgs = sorted(glob.glob(os.path.join(args.offline_dir, "*.png")))[:10000]
         print(f"Found {len(imgs)} hp-bar images for test")
         for path in imgs:

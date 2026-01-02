@@ -1,4 +1,4 @@
-from CONSTANTS import *
+from scripts.core.CONSTANTS import *
 import win32api
 from typing import Tuple
 

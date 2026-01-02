@@ -1,7 +1,10 @@
 from pathlib import Path
 import ctypes
 SANDBOXIE_START_EXE = r"C:\Program Files\Sandboxie-Plus\Start.exe"
-DEFAULT_MAFILES_DIR = Path("mafiles")
+DEFAULT_MAFILES_DIR = Path("../../mafiles")
+DEFAULT_ML_MINIMAP_DIR = Path("../../config/minimap.pt")
+DEFAULT_ML_HP_DIR = Path("../../config/hp.pt")
+DEFAULT_LANDMARKS_DIR = Path("config/landmarks.pt")
 user32 = ctypes.windll.user32
 HAS_WIN32JOB = True
 TILE_MODE = "grid"; TILE_COLUMNS = 3; TILE_GAP = 8

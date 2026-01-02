@@ -7,7 +7,6 @@ import json
 import time
 import logging
 import threading
-import ctypes
 from queue import Queue, Empty
 from typing import Optional, List, Dict, Tuple, Callable
 
@@ -17,12 +16,11 @@ import win32con
 import win32api
 import win32process
 
-import game_automation
-from account import Account
-from CONSTANTS import *
-from windowPlacer import WindowPlacer
-from game_automation import GameAutomation  # <-- новый модуль
-from threadRegistry import ThreadRegistry
+from scripts.core.account import Account
+from scripts.core.CONSTANTS import *
+from window_placer import WindowPlacer
+from scripts.game.game_automation import GameAutomation  # <-- новый модуль
+from thread_registry import ThreadRegistry
 
 user32 = ctypes.windll.user32
 
@@ -77,7 +75,7 @@ class Controller:
         self.mafile_index: Dict[str, Tuple[str, dict]] = {}
         self.stop_event = threading.Event()
 
-        self.state_file = "state.json"
+        self.state_file = "../../state.json"
 
         self._ready_lock = threading.Lock()
         self._ready_count = 0

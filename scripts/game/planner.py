@@ -9,38 +9,35 @@ os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Pyth
 
 import win32api
 import win32con
-import win32gui
 import win32process
 import time
 import json
-import ctypes
-import hp_scanner
-from hp_scanner import scan_hp_bars_on_screen
+
+from scripts.vision.screen_hp_scanner import scan_hp_bars_on_screen,HpBarBox
+from scripts.core.CONSTANTS import *
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
-from hud_ocr import HudOCR
+from scripts.vision.hud_hp_scanner import SelfHp
 import numpy as np
 import cv2
 from PIL import Image
 import pyautogui as p
-import logging
 # === системные штуки для окна ===
 
 import win32gui
 
 # === NN и пики ===
-from train_minimap_heatmap import load_model, infer_image, find_peaks_per_channel
-from tower_detector import TowerVisibilityTracker  # type: ignore
+from scripts.ml.train_minimap_heatmap import load_model, infer_image, find_peaks_per_channel
+from scripts.vision.tower_detector import TowerVisibilityTracker  # type: ignore
 
-from brain import Brain
+from scripts.game.client_game_brain import Brain
 
 import logging
 from functools import wraps
 # ---------------------------------------------------------------------
 # Константы путей (жёсткие)
 # ---------------------------------------------------------------------
-LANDMARKS_JSON = "data/minimap_landmarks.json"   # ориентиры/линии/кемпы/башни
-CKPT_PATH      = "runs/minimap/best.pt"          # чекпоинт модели миникарты
+
 
 # ---------------------------------------------------------------------
 # Геометрия миникарты
@@ -372,7 +369,7 @@ class Planner:
         self.hwnds = hwnds
         self.side  = side.lower().strip()  # 'radiant' | 'dire'
         self.log   = logger
-        self.hud_ocr = HudOCR()
+        self.self_hp = SelfHp(hp_ckpt_path=DEFAULT_ML_HP_DIR)
         self.game_start_ts: float = time.time()  # пока просто "момент запуска бота"
 
         # частоты обновления
@@ -393,7 +390,7 @@ class Planner:
 
         # landmarks
         # --- стало: фильтруем towers из landmarks ---
-        with open(LANDMARKS_JSON, "r", encoding="utf-8") as f:
+        with open(DEFAULT_LANDMARKS_DIR, "r", encoding="utf-8") as f:
             _landmarks_raw = json.load(f)
 
         # а это — версия без башен, которую будем отдавать наружу
@@ -408,7 +405,7 @@ class Planner:
         self.tower_tracker = TowerVisibilityTracker(radiant_towers=self.landmarks['data']['tower_radiant'][0], dire_towers=self.landmarks['data']['tower_dire'][0])
 
         # NN
-        self.net, self.classes, self.size = load_model(CKPT_PATH, device='cpu')
+        self.net, self.classes, self.size = load_model(DEFAULT_ML_MINIMAP_DIR, device='cpu')
         self.cls2idx = {c: i for i, c in enumerate(self.classes)}  # {'self','ally','enemy'}
         self.brains: Dict[int, Brain] = {
             hwnd: Brain(hwnd, planner=self, logger=logger)
@@ -656,8 +653,8 @@ class Planner:
     def _stabilize_creeps_for_hwnd(
             self,
             hwnd: int,
-            new_creeps: Dict[str, List[hp_scanner.HpBarBox]],
-    ) -> Dict[str, List[hp_scanner.HpBarBox]]:
+            new_creeps: Dict[str, List[HpBarBox]],
+    ) -> Dict[str, List[HpBarBox]]:
         """
         Нормализует детекты крипов по истории:
           - база: текущий кадр,
@@ -689,13 +686,13 @@ class Planner:
         max_keep = self.max_keep_creep_frames
         roi_margin_px = 80.0  # расширение области вокруг текущей пачки
 
-        stabilized: Dict[str, List[hp_scanner.HpBarBox]] = {
+        stabilized: Dict[str, List[HpBarBox]] = {
             "ally": [],
             "enemy": [],
         }
 
         # helper для центра бокса
-        def _center(box: hp_scanner.HpBarBox):
+        def _center(box: HpBarBox):
             return ((box.x0 + box.x1) * 0.5,
                     (box.y0 + box.y1) * 0.5)
 
@@ -867,8 +864,8 @@ class Planner:
         prob  = infer_image(self.net, mm_rgb, size=self.size, device=device)  # CxHxW
         peaks = find_peaks_per_channel(prob, thr=DEFAULT_THR, nms_kernel=DEFAULT_NMS)
         units = _filter_units_from_peaks(peaks, self.classes)
-        hp_cur, hp_max = self.hud_ocr.get_hp(np.array(hay))  # hp = (cur, max) или (None, None)
-        gold = self.hud_ocr.get_gold(np.array(hay))
+        hp_cur, hp_max = self.self_hp.get_hp(np.array(hay))  # hp = (cur, max) или (None, None)
+        gold = self.self_hp.get_gold(np.array(hay))
         now_s = time.time()
         t_game = now_s - self.game_start_ts
         towers = self.tower_tracker.tick_one(mm_rgb, now=now_s, side=self.side)
@@ -877,7 +874,7 @@ class Planner:
         # вырезаем их белым
         frame_masked = self.mask_rects_white(frame, self.forbidden_ui_rects)
         # отправляем уже очищенный кадр в сканер
-        screen_info = hp_scanner.scan_hp_bars_on_screen(frame_masked)
+        screen_info = scan_hp_bars_on_screen(frame_masked)
 
 
 
