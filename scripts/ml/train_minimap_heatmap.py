@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from metrics import find_peaks_per_channel
 
 # ---------------------------
 # Utils
@@ -592,21 +593,7 @@ def match_peaks_to_gt(peaks_xy: List[Tuple[float, float]],
     return TP, FP, FN
 
 
-def find_peaks_per_channel(prob: np.ndarray, thr: float = 0.4, nms_kernel: int = 5) -> Dict[int, List[Tuple[float, float, float]]]:
-    C, H, W = prob.shape
-    out: Dict[int, List[Tuple[float, float, float]]] = {}
-    for c in range(C):
-        p = prob[c]
-        k = nms_kernel
-        pad = k // 2
-        p_pad = np.pad(p, ((pad, pad), (pad, pad)), mode="edge")
-        pooled = np.maximum.reduce([p_pad[i:i + H, j:j + W] for i in range(k) for j in range(k)])
-        keep = (p >= thr) & (p >= pooled)
-        ys, xs = np.where(keep)
-        pts = [(float(x / W), float(y / H), float(p[y, x])) for (y, x) in zip(ys, xs)]
-        pts.sort(key=lambda t: t[2], reverse=True)
-        out[c] = pts
-    return out
+
 
 
 def eval_peaks_batch(prob: np.ndarray,
@@ -847,14 +834,7 @@ def load_model(ckpt_path: str, device: Optional[str] = None):
         device = "cuda" if torch.cuda.is_available() else "cpu"
     net.to(device).eval()
     return net, classes, size
-@torch.no_grad()
-def infer_image(net: nn.Module, img_rgb: np.ndarray, size: int, device: str = "cpu") -> np.ndarray:
-    """ img_rgb: HxWx3 RGB uint8 return: CxHxW prob heatmaps (float32 0..1) в том же размере size x size """
-    img_resized = cv2.resize(img_rgb, (size, size), interpolation=cv2.INTER_AREA)
-    x = to_tensor(img_resized).unsqueeze(0).to(device)
-    logits = net(x)
-    prob = torch.sigmoid(logits).squeeze(0).cpu().numpy()
-    return prob # CxHxW
+
 # ---------------------------
 # CLI
 # ---------------------------

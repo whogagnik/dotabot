@@ -1,10 +1,21 @@
 from pathlib import Path
 import ctypes
+from typing import Tuple
 SANDBOXIE_START_EXE = r"C:\Program Files\Sandboxie-Plus\Start.exe"
 DEFAULT_MAFILES_DIR = Path("../../mafiles")
 DEFAULT_ML_MINIMAP_DIR = Path("../../config/minimap.pt")
 DEFAULT_ML_HP_DIR = Path("../../config/hp.pt")
 DEFAULT_LANDMARKS_DIR = Path("config/landmarks.pt")
+
+
+
+HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)   # x1, y1, x2, y2
+GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
+LEVEL_ROI: Tuple[int, int, int, int] = (360, 500, 390, 530)
+TIME_ROI:  Tuple[int, int, int, int] = (880, 15, 1020, 45)
+
+
+
 user32 = ctypes.windll.user32
 HAS_WIN32JOB = True
 TILE_MODE = "grid"; TILE_COLUMNS = 3; TILE_GAP = 8

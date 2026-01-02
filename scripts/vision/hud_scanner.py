@@ -1,4 +1,4 @@
-# hud_hp_scanner.py
+# hud_scanner.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 

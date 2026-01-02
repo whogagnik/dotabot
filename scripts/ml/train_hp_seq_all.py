@@ -840,23 +840,7 @@ def train_hp_seq_all(
 # 10. Быстрый инференс одной картинки
 # ============================================================
 
-@torch.no_grad()
-def infer_one(path, ckpt="runs/hp_seq/best.pt", bin_thr: Optional[int] = 200, device=None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    d = torch.load(ckpt, map_location="cpu")
-    vocab = d["vocab"]; pad = d["pad_token"]
-    idx2char = {i:c for i,c in enumerate(vocab)}
-    H, W, T = d["img_h"], d["img_w"], d["max_len"]
-    net = HudHPSeqNet(in_ch=1, img_h=H, img_w=W, max_len=T)
-    net.load_state_dict(d["model"])
-    net.eval().to(device)
 
-    img = load_and_binarize_hp(path, H, W, thr=bin_thr).astype(np.float32)/255.0
-    x = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).to(device)  # 1x1xHxW
-    logits = net(x)                                                # 1 x T x C
-    pred = logits.argmax(-1).squeeze(0).cpu().numpy().tolist()
-    s = "".join(idx2char[i] for i in pred if idx2char[i] != pad)
-    return s
 
 # ============================================================
 # 11. CLI
