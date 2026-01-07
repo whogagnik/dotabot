@@ -3,10 +3,26 @@ import win32api
 import win32con
 import win32process
 import ctypes
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 import logging
 from functools import wraps
+from ctypes import wintypes
+
 user32 = ctypes.WinDLL('user32', use_last_error=True)
+SMTO_ABORTIFHUNG = 0x0002
+WM_NULL = 0x0000
+STEAMID64_OFFSET = 76561197960265728
+
+
+def steam64_to_friend_id_local(steamid64: Union[int, str, None]) -> Optional[str]:
+    try:
+        if steamid64 is None:
+            return None
+        v = int(str(steamid64).strip())
+        acc_id = v - STEAMID64_OFFSET
+        return str(acc_id) if acc_id > 0 else None
+    except Exception:
+        return None
 # ==== Win32 utils ====
 def _get_window_title(hwnd: int) -> str:
     try:
@@ -80,6 +96,36 @@ def client_rect_screen(hwnd:int)->Tuple[int,int,int,int]:
     except:
         L,T,R,B = win32gui.GetWindowRect(hwnd)
         return L,T,max(1,R-L),max(1,B-T)
+
+def _is_window_responsive(hwnd: int, timeout_ms: int = 800) -> bool:
+    try:
+        result = ctypes.c_ulong()
+        ok = user32.SendMessageTimeoutW(
+            wintypes.HWND(hwnd), WM_NULL, 0, 0, SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result)
+        )
+        return bool(ok)
+    except Exception:
+        try:
+            return bool(win32gui.IsWindow(hwnd))
+        except Exception:
+            return False
+
+def _is_hung(hwnd: int) -> bool:
+    try:
+        return bool(user32.IsHungAppWindow(wintypes.HWND(hwnd)))
+    except Exception:
+        return False
+
+
+def _window_ok(hwnd: int) -> bool:
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+    except Exception:
+        return False
+    if _is_hung(hwnd):
+        return False
+    return _is_window_responsive(hwnd)
 
 def debug_log_result(fn):
     """

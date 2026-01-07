@@ -21,6 +21,7 @@ import cv2
 from PIL import Image
 import pyautogui as p
 # === системные штуки для окна ===
+from time import perf_counter
 
 import win32gui
 import win32api
@@ -352,7 +353,7 @@ class Planner:
         self.tower_tracker = TowerVisibilityTracker(radiant_towers=self.landmarks['data']['tower_radiant'][0], dire_towers=self.landmarks['data']['tower_dire'][0])
 
         # NN
-        self.net, self.classes, self.size = load_model(DEFAULT_ML_MINIMAP_DIR, device='cpu')
+        self.net, self.classes, self.size = load_model(DEFAULT_ML_MINIMAP_DIR, device='cuda')
         self.cls2idx = {c: i for i, c in enumerate(self.classes)}  # {'self','ally','enemy'}
         self.brains: Dict[int, Brain] = {
             hwnd: Brain(hwnd, planner=self, logger=logger)
@@ -807,36 +808,88 @@ class Planner:
             return None
 
         # Сбор данных с экрана
+        # Сбор данных с экрана + тайминги
+        t_total0 = perf_counter()
+
+        # --- minimap NN ---
+        t0 = perf_counter()
         device = next(self.net.parameters()).device.type
-        prob  = infer_one_minimap(self.net, mm_rgb, size=self.size, device=device)  # CxHxW
+        t_dev = (perf_counter() - t0) * 1000.0
+
+        t0 = perf_counter()
+        prob = infer_one_minimap(self.net, mm_rgb, size=self.size, device=device)  # CxHxW
+        t_infer_mm = (perf_counter() - t0) * 1000.0
+
+        t0 = perf_counter()
         peaks = find_peaks_per_channel(prob, thr=DEFAULT_THR, nms_kernel=DEFAULT_NMS)
+        t_peaks = (perf_counter() - t0) * 1000.0
+
+        t0 = perf_counter()
         units = _filter_units_from_peaks(peaks, self.classes)
+        t_units = (perf_counter() - t0) * 1000.0
+
+        # --- HP / Gold ---
+        t0 = perf_counter()
         hp_cur, hp_max = self.self_hp.get_hp(np.array(hay))  # hp = (cur, max) или (None, None)
-        gold = self.self_hp.get_gold(np.array(hay))
+        t_hp = (perf_counter() - t0) * 1000.0
+
+        t0 = perf_counter()
+        #gold = self.self_hp.get_gold(np.array(hay))
+        t_gold = (perf_counter() - t0) * 1000.0
+
+        # --- towers tracker ---
         now_s = time.time()
         t_game = now_s - self.game_start_ts
+
+        t0 = perf_counter()
         towers = self.tower_tracker.tick_one(mm_rgb, now=now_s, side=self.side)
+        t_towers = (perf_counter() - t0) * 1000.0
 
+        # --- screen scan (heroes/creeps hp bars) ---
+        t0 = perf_counter()
         frame = np.array(hay)
-        # вырезаем их белым
         frame_masked = self.mask_rects_white(frame, self.forbidden_ui_rects)
-        # отправляем уже очищенный кадр в сканер
+        t_mask = (perf_counter() - t0) * 1000.0
+
+        t0 = perf_counter()
         screen_info = scan_hp_bars_on_screen(frame_masked)
+        t_scan = (perf_counter() - t0) * 1000.0
 
-
-
+        t0 = perf_counter()
         raw_heroes = screen_info["heroes"]
         raw_creeps = screen_info["creeps"]
         stable_creeps = self._stabilize_creeps_for_hwnd(hwnd, raw_creeps)
+        t_stabilize = (perf_counter() - t0) * 1000.0
 
+        # --- alive/hp_ratio ---
+        t0 = perf_counter()
         landmarks_pack = self.landmarks
         if hp_cur is None or hp_max is None:
-            # трактуем как "мы мертвы / HUD не виден"
             alive = False
             hp_ratio = None
         else:
             alive = hp_cur > 0
             hp_ratio = float(hp_cur) / float(hp_max) if hp_max > 0 else None
+        t_alive = (perf_counter() - t0) * 1000.0
+
+        t_total = (perf_counter() - t_total0) * 1000.0
+
+        if self.log:
+            self.log.debug(
+                f"[TIMERS] hwnd={hex(hwnd)} "
+                f"dev={t_dev:.2f}ms "
+                f"mm_infer={t_infer_mm:.2f}ms "
+                f"peaks={t_peaks:.2f}ms "
+                f"units={t_units:.2f}ms "
+                f"hp={t_hp:.2f}ms "
+                f"gold={t_gold:.2f}ms "
+                f"towers={t_towers:.2f}ms "
+                f"mask={t_mask:.2f}ms "
+                f"scan={t_scan:.2f}ms "
+                f"stabilize={t_stabilize:.2f}ms "
+                f"alive={t_alive:.2f}ms "
+                f"TOTAL={t_total:.2f}ms"
+            )
 
         combined = {
             "map": units,
@@ -845,7 +898,7 @@ class Planner:
 
             "hp_pair": (hp_cur, hp_max),
             "hp_ratio": hp_ratio,
-            "gold": gold,
+            "gold": 123,
             "alive": alive,
             "t_game": t_game,
 

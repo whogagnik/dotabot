@@ -874,7 +874,6 @@ def main():
     ap.add_argument("--slash_x_min", type=int, default=250, help="Минимальный X центра '/' (в resized картинке)")
     ap.add_argument("--slash_x_max", type=int, default=290, help="Максимальный X центра '/' (в resized картинке)")
 
-    # ЕДИНСТВЕННЫЙ ФЛАГ для генерации всех комбинаций x/x, x/y, y/y, y/x
     ap.add_argument("--xy_cross", type=int, default=1,
                     help="1=генерить все комбинации X/X, X/Y, Y/Y, Y/X; 0=только оригиналы")
 
@@ -902,5 +901,5 @@ def main():
 
 
 if __name__ == "__main__":
-    print(">>> main() called from", __file__)
+
     main()

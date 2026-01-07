@@ -4,33 +4,22 @@ from __future__ import annotations
 import os
 import time
 import logging
-from ctypes import wintypes
+
 from typing import List, Tuple, Optional, Callable, Union
 import threading
 import dxcam
 import numpy as np
 from PIL import Image
 from scripts.core.CONSTANTS import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
-
+from scripts.core.utils import _force_foreground,_window_area,find_main_hwnd_for_pid, _window_ok, steam64_to_friend_id_local
 # === External deps ===
 import pyautogui as p
-import win32gui
-import win32api
-import win32process
-import win32con
-
-
 
 Region = Tuple[int, int, int, int]  # (x, y, w, h)
 
-# --- Win32 / DPI helpers ---
-user32 = ctypes.windll.user32
-SMTO_ABORTIFHUNG = 0x0002
-WM_NULL = 0x0000
+
 _UI_REF_W, _UI_REF_H = 1920, 1080  # эталон под который сняты PNG
 
-# --- Steam ID utils ---
-STEAMID64_OFFSET = 76561197960265728
 
 # --- Global DXCam singleton (poll-only, без start())
 _DXCAM = {
@@ -39,91 +28,8 @@ _DXCAM = {
 }
 
 
-def steam64_to_friend_id_local(steamid64: Union[int, str, None]) -> Optional[str]:
-    try:
-        if steamid64 is None:
-            return None
-        v = int(str(steamid64).strip())
-        acc_id = v - STEAMID64_OFFSET
-        return str(acc_id) if acc_id > 0 else None
-    except Exception:
-        return None
 
-# --- Geometry / window helpers ---
-def _client_region(hwnd: int) -> Region:
-    try:
-        l, t, r, b = win32gui.GetClientRect(hwnd)
-        sx, sy = win32gui.ClientToScreen(hwnd, (0, 0))
-        w, h = max(1, r - l), max(1, b - t)
-        return sx, sy, w, h
-    except Exception:
-        try:
-            L, T, R, B = win32gui.GetWindowRect(hwnd)
-            return (L, T, max(1, R - L), max(1, B - T))
-        except Exception:
-            return (0, 0, 1, 1)
 
-def _is_window_responsive(hwnd: int, timeout_ms: int = 800) -> bool:
-    try:
-        result = ctypes.c_ulong()
-        ok = user32.SendMessageTimeoutW(
-            wintypes.HWND(hwnd), WM_NULL, 0, 0, SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result)
-        )
-        return bool(ok)
-    except Exception:
-        try:
-            return bool(win32gui.IsWindow(hwnd))
-        except Exception:
-            return False
-
-def _is_hung(hwnd: int) -> bool:
-    try:
-        return bool(user32.IsHungAppWindow(wintypes.HWND(hwnd)))
-    except Exception:
-        return False
-
-def _window_ok(hwnd: int) -> bool:
-    try:
-        if not win32gui.IsWindow(hwnd):
-            return False
-    except Exception:
-        return False
-    if _is_hung(hwnd):
-        return False
-    return _is_window_responsive(hwnd)
-
-# --- Win32 click backend (parallelizable) + fallback ---
-
-def _make_lparam(x: int, y: int) -> int:
-    return (y << 16) | (x & 0xFFFF)
-
-def _screen_to_client(hwnd: int, pt_screen: Tuple[int, int]) -> Tuple[int, int]:
-    try:
-        return win32gui.ScreenToClient(hwnd, pt_screen)
-    except Exception:
-        cx, cy, _, _ = _client_region(hwnd)
-        return (max(0, pt_screen[0] - cx), max(0, pt_screen[1] - cy))
-
-def _force_foreground(hwnd: int):
-    try:
-        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
-        fore = win32gui.GetForegroundWindow()
-        ftid = win32process.GetWindowThreadProcessId(fore)[0] if fore else 0
-        ctid = win32api.GetCurrentThreadId()
-        user32.AttachThreadInput(ftid, ctid, True)
-        win32gui.BringWindowToTop(hwnd)
-        win32gui.SetForegroundWindow(hwnd)
-        win32gui.SetActiveWindow(hwnd)
-    except Exception:
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-    finally:
-        try:
-            user32.AttachThreadInput(ftid, ctid, False)  # type: ignore[name-defined]
-        except Exception:
-            pass
 
 
 
@@ -258,7 +164,7 @@ class GameAutomation:
         """
         try:
             # 1) client-область окна (в экранных коорд.)
-            L, T, W, H = _client_region(hwnd)
+            L, T, W, H = _window_area(hwnd)
             if W <= 0 or H <= 0:
                 if self.log:
                     self.log.debug(f"[LOC] hwnd={hex(hwnd)} invalid client rect: {(L, T, W, H)}")
@@ -390,7 +296,7 @@ class GameAutomation:
     def wait_window_ready(self, hwnd: int, timeout: float = 25.0,
                           anchors: Optional[List[str]] = None,
                           stop_flag: Optional[Callable[[], bool]] = None) -> bool:
-        region = _client_region(hwnd)
+        region = _window_area(hwnd)
         if anchors is None:
             anchors = ["play", "add_party", "rank"]
 
@@ -411,7 +317,7 @@ class GameAutomation:
 
     def dismiss_welcome_if_present(self, hwnd: int, timeout: float = 8.0,
                                    stop_flag: Optional[Callable[[], bool]] = None):
-        region = _client_region(hwnd)
+        region = _window_area(hwnd)
         buttons = [
             "welcome_not_new_ru",
             "welcome_not_new_en",
@@ -444,7 +350,7 @@ class GameAutomation:
     def start_game(self, hwnd: int):
         if not _window_ok(hwnd):
             return
-        region = _client_region(hwnd)
+        region = _window_area(hwnd)
         pt = self._loc_center(hwnd, self.PNG["play"])
         if pt:
             self._click(hwnd, pt); time.sleep(0.20)
@@ -571,7 +477,7 @@ class GameAutomation:
         self.log.info("[IMG] Accepting invitations")
         for hwnd in hwnds:
             if not _window_ok(hwnd): continue
-            region = _client_region(hwnd)
+            region = _window_area(hwnd)
             paths = [self.PNG.get("accept_invite_ru", ""), self.PNG.get("accept_invite_eng", "")]
             paths = [p for p in paths if p]
 
@@ -604,7 +510,7 @@ class GameAutomation:
         for hwnd in hwnds:
             if not _window_ok(hwnd):
                 continue
-            region = _client_region(hwnd)
+            region = _window_area(hwnd)
             for path in key_paths:
                 pt = self._loc_center(hwnd, path)
                 if pt:
@@ -662,7 +568,7 @@ class GameAutomation:
         for hwnd in hwnds:
             if stop_flag and stop_flag(): return
             if not _window_ok(hwnd): continue
-            region = _client_region(hwnd)
+            region = _window_area(hwnd)
             for ph in accept_paths:
                 pt = self._loc_center(hwnd, ph)
                 if pt: self._click(hwnd, pt, delay=0.04); break
@@ -697,7 +603,7 @@ class GameAutomation:
                     stop_flag: Optional[Callable[[], bool]] = None) -> Optional[str]:
         """Ищет индикаторы Radiant/Dire в пределах окна hwnd. Возвращает 'radiant'/'dire' или None."""
         if not _window_ok(hwnd): return None
-        reg = _client_region(hwnd)
+        reg = _window_area(hwnd)
         t0 = time.time()
         while (time.time() - t0) < timeout_s:
             if stop_flag and stop_flag(): return None
@@ -713,7 +619,7 @@ class GameAutomation:
 
     def wait_lock_enabled(self, hwnd: int, timeout_s: float = 30.0, poll: float = 0.2) -> bool:
         """Ждёт, пока кнопка Lock станет активной. Работает с PNG lock_in / lock_disabled (если есть)."""
-        reg = _client_region(hwnd)
+        reg = _window_area(hwnd)
         t0 = time.time()
         key_enabled  = self.PNG.get("lock_in_ru")
         key_disabled = self.PNG.get("lock_disabled_ru")
@@ -772,7 +678,7 @@ class GameAutomation:
                         stop_flag: Optional[Callable[[], bool]] = None) -> bool:
         """Ждём появления PNG инвентаря в окне hwnd."""
         if not _window_ok(hwnd): return False
-        region = _client_region(hwnd)
+
         inv_path = self.PNG.get("inventory")
         if not inv_path or not os.path.exists(inv_path):
             self.log.warning("[IMG] inventory PNG path is not configured")
@@ -792,7 +698,7 @@ class GameAutomation:
 
     # ---------- simple macros ----------
     def start_buy(self, hwnd: int):
-        region = _client_region(hwnd)
+
         try:
             inventory = self._loc_center(hwnd, self.PNG["inventory"])
             if not inventory: return
@@ -810,7 +716,7 @@ class GameAutomation:
             pass
 
     def run_mid(self, hwnd: int, side: str, i: int) -> bool:
-        region = _client_region(hwnd)
+
         try:
             inventory = self._loc_center(hwnd, self.PNG["inventory"])
             if not inventory: return False
@@ -853,45 +759,7 @@ class GameAutomation:
         # search / accept
         self.search_games(hwnds, should_make_party=False, stop_flag=stop_flag)
 
-# --- helper: find main hwnd by PID ---
-def _get_window_title(hwnd: int) -> str:
-    try:
-        return win32gui.GetWindowText(hwnd) or ""
-    except Exception:
-        return ""
 
-def _is_main_candidate(hwnd: int) -> bool:
-    try:
-        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd): return False
-        if win32gui.GetParent(hwnd): return False
-        title = _get_window_title(hwnd).strip()
-        return bool(title)
-    except Exception:
-        return False
-
-def _window_area(hwnd: int) -> int:
-    try:
-        L, T, R, B = win32gui.GetWindowRect(hwnd)
-        return max(0, R - L) * max(0, B - T)
-    except Exception:
-        return 0
-
-def find_main_hwnd_for_pid(pid: int) -> Optional[int]:
-    candidates: List[int] = []
-    def _enum_cb(hwnd, _):
-        try:
-            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
-            if wpid == pid and _is_main_candidate(hwnd):
-                candidates.append(hwnd)
-        except Exception:
-            pass
-    try:
-        win32gui.EnumWindows(_enum_cb, None)
-    except Exception:
-        pass
-    if not candidates: return None
-    candidates.sort(key=_window_area, reverse=True)
-    return candidates[0]
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")

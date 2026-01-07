@@ -13,38 +13,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Set
 
 import requests
-
+from steam import webauth
+from steam.guard import generate_twofactor_code
 # Логгер
 logger = logging.getLogger("dota_ap_hours")
 
 # Попытаемся использовать генератор из valvepython/steam, но оставим резервный вариант
-try:
-    from steam import webauth
-    from steam.guard import generate_twofactor_code  # принимает shared_secret (base64)
-    HAVE_STEAM_LIB = True
-except Exception:
-    HAVE_STEAM_LIB = False
-    webauth = None
-
-    # Резервный генератор 2FA кода для Steam (совместим с shared_secret)
-    _STEAM_CHARS = "23456789BCDFGHJKMNPQRTVWXY"
-    def generate_one_time_code(shared_secret_b64: str, timestamp: int = None) -> str:
-        if timestamp is None:
-            timestamp = int(time.time())
-        try:
-            secret = base64.b64decode(shared_secret_b64)
-        except Exception as e:
-            raise ValueError("Некорректный shared_secret в maFile") from e
-        time_block = struct.pack(">Q", int(timestamp) // 30)
-        hmac_sha1 = hmac.new(secret, time_block, 'sha1').digest()
-        start = hmac_sha1[19] & 0x0F
-        fullcode = struct.unpack(">I", hmac_sha1[start:start + 4])[0] & 0x7FFFFFFF
-
-        out = []
-        for _ in range(5):
-            out.append(_STEAM_CHARS[fullcode % len(_STEAM_CHARS)])
-            fullcode //= len(_STEAM_CHARS)
-        return "".join(out)
 
 
 API_BASE = "https://api.opendota.com/api"
@@ -61,11 +35,9 @@ def read_mafile(path: Path) -> Dict:
 
 
 def login_with_guard(username: str, password: str, shared_secret_b64: str) -> str:
-    if not HAVE_STEAM_LIB:
-        logger.error("Библиотека 'steam' недоступна. Установите: pip install steam")
-        sys.exit(1)
 
-    code = generate_one_time_code(shared_secret_b64)
+
+    code = generate_twofactor_code(shared_secret_b64)
     wa = webauth.WebAuth(username)
     try:
         wa.login(password=password, twofactor_code=code)
