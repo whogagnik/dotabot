@@ -1,0 +1,1676 @@
+[
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231227_001919.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "e766ea6c-e2a3-410b-b06c-7a39bcfeab69",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "110/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231227_991889.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "6e1da6d2-e10b-4c99-8f08-efa61193d085",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "124/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231228_999309.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "c10bbc53-2ec7-4625-b8a5-bfee45338d6f",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "122/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231229_993349.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "d9ee9891-a2e6-47e4-9ed7-d6efaad3497b",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "133/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231231_010397.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "faf4a940-1204-4193-9947-20cced6d30a8",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "141/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231232_009297.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "b9692c1a-fd2b-42db-a84c-6dce45dbb7f8",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "146/4800"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231233_008196.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "2afb9d5b-616b-4b66-8a9d-7d4655f1f802",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "151/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231234_006756.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "4d6895bb-6975-4165-b349-0088bdefa541",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "156/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231235_037530.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "e4617138-5f3b-44ae-8c15-1be5147a00b7",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "162/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231236_053903.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "3663f1aa-03a3-4fe3-812d-308e5c9ef8cf",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "167/423"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231237_029790.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "728efe39-7cb2-4cc7-9730-9e2c8a544656",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "172/470"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231238_024640.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "9dbbc667-5ffa-463a-999c-3dd8a84a6073",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "177/470"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231239_022911.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "9de45250-670e-454d-a720-a4146d9802f9",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "183/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231240_043741.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "42588694-d58f-446d-a05c-52cd71dc2522",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "188/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231241_057450.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "fd529ee0-ae8e-4c60-a655-61617959e25b",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "193/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231242_056637.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "02fabdea-1369-4d4d-86ff-3f7375b9a45a",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "198/480"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231243_056477.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "50b76374-891d-473e-b0bb-da230e9ac6a3",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "204/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231244_075884.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "4bee107b-6d35-4205-82fc-836e0cc6af6a",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "209/448"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231245_072822.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "9b1ab632-8139-4373-9696-e1b55e09e66d",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "214/490"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231246_091646.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "2fee81fc-3fa2-4a63-af80-5cf087572a0c",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "219/448"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231247_089791.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "a8a50a60-976b-47ae-b0c0-c69bb1cec55d",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "225/600"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231248_090439.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "e0a46fa7-90f4-42bc-81e6-731a1972a097",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "230/490"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231249_107458.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "a47acae1-878f-4017-a059-6c143083636a",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "236/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231250_117174.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "7c25331d-fdeb-40d6-8673-aad9a4d0d88d",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "241/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231251_152797.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "de65dfc9-f7dd-433b-b0e9-bdaf7f7c2535",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "246/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231252_125127.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "b4c49756-0f3d-4d15-9f05-7272bf801ee0",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "251/408"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231253_123329.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "f8885ee8-2ca3-4714-9923-ba7b87acece2",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "257/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231254_142012.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "27036a9e-7224-490e-ae6b-476585a71911",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "262/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231255_141602.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "b907454d-0146-497c-a6e9-7eb273a1ee8e",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "267/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231256_142308.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "ec753c8b-6afb-4d53-856d-6e0a9636bbf8",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "272/60"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231257_140848.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "4e5eb6aa-e271-433a-a65d-e8dc5c7b1c96",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "278/474"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231258_139885.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "1e68f017-ad3e-4fe6-a49c-3f8d7122d500",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "283/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231259_142763.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "4152f8ee-06cf-4a93-a12a-f971e06a0bd4",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "228/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231300_157971.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "b3c1b3ce-0b07-47cd-a320-a1bc3f5221c0",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "293/448"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231301_155594.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "2d3aba12-c4eb-47d6-b3d7-4ff2600096a3",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "299/448"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231302_156634.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "cb8c9cf7-6236-42c3-aa7c-084c39c99f31",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "304/444"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231303_155909.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "aa4d624b-3480-47bd-b499-a5d874d9786e",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "309/490"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231304_155354.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "500e7a75-6a9a-41d6-bc68-07585b072f31",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "814/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231305_164181.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "b9eb1e7d-ffca-4e8c-9922-215e152476be",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "320/40"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231306_200600.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "eadeb897-adbb-487c-8ff4-4bf1d862e576",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "325/620"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231307_177934.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "376a16f0-c3aa-4ebe-ad1f-75c5e42eb280",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "330/760"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231308_190036.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "e4e0e430-ce47-4aa7-a66e-4580d0dc0ce8",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "335/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231309_190015.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "138811ad-cd0c-4a06-8f65-cc3c0e5c58e0",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "341/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231310_189896.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "11c14194-fd2e-491a-b4be-0beec21a419c",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "346/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231311_207258.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "ecf51ec7-d54f-4ace-a0ad-6980ff64b04c",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "352/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231312_205860.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "6c1f79b0-beaa-4c53-9042-4e510ebf13ca",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "357/400"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231313_206064.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "56d4ff1b-f086-4d3e-822e-e92b363ecdab",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "362/640"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231314_223052.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "70e57e1b-1977-4c38-8c81-34f918955a08",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "367/600"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231315_223071.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "dbacc89d-6670-4235-ba9d-3c08461e8ca3",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "373/40"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231316_220816.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "15361992-6c04-4f6e-bc16-574183b3eac8",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "378/44"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231317_222927.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "df06c4b1-5e69-459a-b052-f2021aa7b949",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "383/440"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231318_238389.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "38a805ba-db81-46bd-98e2-c1fc76a8bd97",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "388/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231319_239986.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "c3537f45-3f2a-4437-a4b1-0fde876c024f",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "394/690"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231320_249730.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "4e7efcb4-c950-41e5-9e7b-952529077865",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "399/490"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231321_264402.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "e1d852f9-8d0d-44e0-91ad-1fa25ac7b055",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "404/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231322_262618.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "473448a5-47da-4dfe-831c-3cf6bbaa702b",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "409/470"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231323_255409.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "580205ae-0ed1-49e7-a308-7bd101d8fd65",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "415/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231324_254355.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "152aa72e-4ea2-4d6c-8437-bcc2d9cf6445",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "422/620"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231325_271531.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "de18a78c-1487-42a2-a20e-a0a74e39776c",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "425/620"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231326_272428.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "8e2c6c3b-2299-4736-b52b-773f40939e83",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "430/420"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231327_277998.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "8c63b240-2c77-456b-a75e-8d3e5754f60c",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "436/428"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  },
+  {
+    "data": {
+      "image": "/data/local-files/?d=data/hud/hp_bar/hp_20251112_231328_269756.png"
+    },
+    "meta": {
+      "kind": "hp_bar",
+      "format": "mask_0_255"
+    },
+    "predictions": [
+      {
+        "result": [
+          {
+            "id": "b7f6b8d1-bbd4-4586-91d8-28a77e077826",
+            "from_name": "hp_text",
+            "to_name": "image",
+            "type": "textarea",
+            "value": {
+              "text": [
+                "441/448"
+              ]
+            }
+          }
+        ],
+        "model_version": "hud_ocr_v1"
+      }
+    ]
+  }
+]
