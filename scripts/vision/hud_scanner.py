@@ -18,7 +18,7 @@ from uuid import uuid4
 import win32gui
 import pyautogui as p
 import easyocr
-from scripts.ml.train_hp_seq_all import HudHPSeqNet
+from scripts.ml.train_hp_seq import HudHPSeqNet
 
 """
 Модуль OCR для HUD:
@@ -202,7 +202,7 @@ def grab_roi_rgb_from_window(hwnd: int, roi_win: Tuple[int, int, int, int]) -> O
         return None
 
 # ============================================================
-# 1. Загрузка HP-модели (как в train_hp_seq_all.py)
+# 1. Загрузка HP-модели (как в train_hp_seq.py)
 # ============================================================
 def load_hp_model(
     ckpt_path: str = "runs/hp_seq/best.pt",

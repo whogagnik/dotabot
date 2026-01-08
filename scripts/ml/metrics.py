@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from scripts.ml.train_hp_seq_all import HudHPSeqNet, load_and_binarize_hp
+from scripts.ml.train_hp_seq import HudHPSeqNet, load_and_binarize_hp
 from scripts.ml.train_minimap_heatmap import *  # если нужны сущности оттуда
 
 

@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from scripts.ml.metrics import find_peaks_per_channel
-
+from scripts.ml.models import MiniMapNet
 # ---------------------------
 # Utils
 # ---------------------------
@@ -501,40 +501,7 @@ def collate_keep_meta(batch):
 # Model
 # ---------------------------
 
-class MiniMapDet(nn.Module):
-    def __init__(self, in_ch=3, base=32, out_ch=3, dropout: float = 0.0):
-        super().__init__()
 
-        def block(cin, cout, down=False):
-            k, s, p = (3, 2, 1) if down else (3, 1, 1)
-            return nn.Sequential(
-                nn.Conv2d(cin, cout, k, s, p), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
-                nn.Conv2d(cout, cout, 3, 1, 1), nn.ReLU(inplace=True),
-            )
-
-        self.enc1 = block(in_ch, base, down=False)
-        self.enc2 = block(base, base * 2, down=True)
-        self.enc3 = block(base * 2, base * 4, down=True)
-
-        self.dec2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base * 4, base * 2, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-        )
-        self.dec1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base * 2, base, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-        )
-        self.head = nn.Conv2d(base, out_ch, 1)
-
-    def forward(self, x):
-        x1 = self.enc1(x)
-        x2 = self.enc2(x1)
-        x3 = self.enc3(x2)
-        y2 = self.dec2(x3)
-        y1 = self.dec1(y2)
-        return self.head(y1)
 
 
 class MultiHMLoss(nn.Module):
@@ -676,7 +643,7 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"[i] Device: {device}")
 
-    net = MiniMapDet(in_ch=3, base=args.base, out_ch=len(classes), dropout=args.dropout).to(device)
+    net = MiniMapNet(in_ch=3, base=args.base, out_ch=len(classes), dropout=args.dropout).to(device)
     criterion = MultiHMLoss(pos_weight=None, dice_w=args.dice_w).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', patience=3, factor=0.5)
@@ -828,7 +795,7 @@ def load_model(ckpt_path: str, device: Optional[str] = None):
     classes = ckpt.get("classes", ["self", "ally", "enemy"])
     size = ckpt.get("size", 128)
     base = ckpt.get("base", 32)
-    net = MiniMapDet(in_ch=3, base=base, out_ch=len(classes))
+    net = MiniMapNet(in_ch=3, base=base, out_ch=len(classes))
     net.load_state_dict(ckpt["model"])
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
