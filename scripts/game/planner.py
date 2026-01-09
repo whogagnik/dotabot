@@ -14,7 +14,7 @@ from scripts.vision.screen_hp_scanner import scan_hp_bars_on_screen,HpBarBox
 from scripts.core.CONSTANTS import *
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
-from scripts.vision.hud_scanner import SelfHp
+from scripts.vision.hud_scanner import SelfHud
 from scripts.core.utils import _force_foreground,debug_log_result,find_main_hwnd_for_pid
 import numpy as np
 import cv2
@@ -314,7 +314,7 @@ class Planner:
         self.hwnds = hwnds
         self.side  = side.lower().strip()  # 'radiant' | 'dire'
         self.log   = logger
-        self.self_hp = SelfHp(hp_ckpt_path=DEFAULT_ML_HP_DIR)
+        self.self_hp = SelfHud(hp_ckpt_path=DEFAULT_ML_HP_DIR)
         self.game_start_ts: float = time.time()  # пока просто "момент запуска бота"
 
         # частоты обновления
@@ -372,8 +372,47 @@ class Planner:
         # dxcam инициализируем сразу (если упадёт — узнаем сразу)
         _ensure_dxcam(self.log)
 
+        # --- input gate / hotkeys ---
+        self.block_input: bool = True   # True -> brain.update() разрешён, False -> мозг не исполняется
+        self._hk_p_prev_down: bool = False
+        self._hk_last_toggle_ts: float = 0.0
+        self._hk_toggle_cooldown: float = 0.25  # антидребезг (сек)
+
+
     # --- вспомогательные ---
     # ----------------- НОРМАЛИЗАЦИЯ HP-БАРОВ КРИПОВ -----------------
+    @debug_log_result
+    def tick_one(self) -> Dict[int, Snapshot]:
+
+
+        self._poll_hotkeys()
+
+        out: Dict[int, Snapshot] = {}
+        for hwnd in list(self.hwnds):
+            snap = self.collect_for_hwnd(hwnd)
+            if snap is not None:
+                self.last_by_hwnd[hwnd] = snap
+                out[hwnd] = snap
+
+                brain = self.brains.get(hwnd)
+                if brain is None:
+                    brain = Brain(hwnd, planner=self, logger=self.log)
+                    self.brains[hwnd] = brain
+
+                brain_snap = Snapshot(
+                    ts=snap.ts,
+                    hwnd=snap.hwnd,
+                    combined=snap.combined,
+                )
+
+                # <-- вот это ключевое: гейт на мозг
+                if self.block_input:
+                    brain.update(brain_snap)
+                else:
+                    # опционально: можно логировать/ничего не делать
+                    pass
+
+        return out
 
     @staticmethod
     def _box_center(b) -> tuple[float, float]:
@@ -507,21 +546,21 @@ class Planner:
             # A + ЛКМ
             win32api.keybd_event(VK_A, 0, 0, 0)
             time.sleep(0.002)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            time.sleep(0.07)
-            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+            time.sleep(0.02)
+            win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
             time.sleep(0.002)
             win32api.keybd_event(VK_A, 0, win32con.KEYEVENTF_KEYUP, 0)
         else:
             # обычный ПКМ
             win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-            time.sleep(0.07)
+            time.sleep(0.02)
             win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
 
         # возвращаем курсор назад
         if ox is not None and oy is not None:
             win32api.SetCursorPos((ox, oy))
-
+    @debug_log_result
     def click_on_screen(self,
                         hwnd: int,
                         x: int,
@@ -567,7 +606,7 @@ class Planner:
             time.sleep(0.002)
 
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            time.sleep(0.07)
+            time.sleep(0.02)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
             time.sleep(0.002)
@@ -588,7 +627,7 @@ class Planner:
                 up_flag = win32con.MOUSEEVENTF_RIGHTUP
 
             win32api.mouse_event(down_flag, 0, 0, 0, 0)
-            time.sleep(0.07)
+            time.sleep(0.02)
             win32api.mouse_event(up_flag, 0, 0, 0, 0)
 
         # возвращаем курсор назад
@@ -904,32 +943,30 @@ class Planner:
         }
         self._last_roi_by_hwnd[hwnd] = roi
         return Snapshot(ts=now_s, hwnd=hwnd, combined=combined)
+    def _poll_hotkeys(self) -> None:
+        """
+        Хоткей: toggle self.block_input.
+        Работает по фронту нажатия (down transition), чтобы не переключалось при удержании.
+        """
 
-    @debug_log_result
-    def tick_one(self) -> Dict[int, Snapshot]:
+        now = perf_counter()
 
-        out: Dict[int, Snapshot] = {}
-        for hwnd in list(self.hwnds):
-            #_force_foreground(hwnd)
-            snap = self.collect_for_hwnd(hwnd)
-            if snap is not None:
-                self.last_by_hwnd[hwnd] = snap
-                out[hwnd] = snap
+        try:
+            is_down = (win32api.GetAsyncKeyState(PAUSE_BRAINS) & 0x8000) != 0
+        except Exception:
+            return
 
-                # --- дергаем мозг ---
-                brain = self.brains.get(hwnd)
-                if brain is None:
-                    brain = Brain(hwnd, planner=self, logger=self.log)
-                    self.brains[hwnd] = brain
+        # фронт нажатия + небольшой cooldown
+        if is_down and (not self._hk_p_prev_down):
+            if (now - self._hk_last_toggle_ts) >= self._hk_toggle_cooldown:
+                self.block_input = not self.block_input
+                self._hk_last_toggle_ts = now
+                if self.log:
+                    self.log.warning(f"[HOTKEY] Pause pressed -> block_input={self.block_input}")
 
-                brain_snap = Snapshot(
-                    ts=snap.ts,
-                    hwnd=snap.hwnd,
-                    combined=snap.combined,
-                )
-                brain.update(brain_snap)
+        self._hk_p_prev_down = is_down
 
-        return out
+
 
     @debug_log_result
     def goto_nearest_camp(self,
@@ -1396,8 +1433,7 @@ if __name__ == "__main__":
     fps_smooth = 0.0
 
     while True:
-        if win32gui.GetForegroundWindow() != hwnd:
-            continue
+
         t_tick_start = time.time()
         res_by_hwnd = pl.tick_one()
 

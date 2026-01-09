@@ -237,7 +237,7 @@ def load_hp_model(
 # ============================================================
 # 2. HudOCR: HP через свою NN, голда через EasyOCR
 # ============================================================
-class SelfHp:
+class SelfHud:
     """
     OCR для HUD:
       - read_gold(window_rgb) -> Optional[int]  (EasyOCR)

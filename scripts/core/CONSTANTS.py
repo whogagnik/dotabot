@@ -15,6 +15,10 @@ LEVEL_ROI: Tuple[int, int, int, int] = (360, 500, 390, 530)
 TIME_ROI:  Tuple[int, int, int, int] = (880, 15, 1020, 45)
 
 
+#HOTKEYS
+
+PAUSE_BRAINS = 0x50
+
 
 user32 = ctypes.windll.user32
 HAS_WIN32JOB = True

@@ -12,8 +12,9 @@ import win32gui, win32process
 from scripts.app.gui_handler import GuiHandler
 from scripts.app.window_placer import WindowPlacer
 from scripts.app.controller import Controller
-
-
+import os
+os.environ["TCL_LIBRARY"] = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tcl8.6"
+os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tk8.6"
 def make_logger(gui_text: tk.Text) -> logging.Logger:
     logger = logging.getLogger("SteamManager")
     logger.setLevel(logging.INFO)

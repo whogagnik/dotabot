@@ -13,6 +13,9 @@ import win32gui, win32process
 # === Цветовые пороги ===
 ENEMY_RED_HEROES_LOWER = np.array([150,  30,   0], np.uint8)
 ENEMY_RED_HEROES_UPPER = np.array([215, 55,  10], np.uint8)
+# ENEMY HEROES (clicked highlight)
+ENEMY_RED_HEROES_CL_LOWER = np.array([250, 250,  250], np.uint8)
+ENEMY_RED_HEROES_CL_UPPER = np.array([255,255, 255], np.uint8)
 
 ALLY_GREEN_HEROES_LOWER = np.array([ 60, 140,  20], np.uint8)
 ALLY_GREEN_HEROES_UPPER = np.array([ 110, 215,  55], np.uint8)
@@ -25,6 +28,10 @@ ALLY_GREEN_CREEPS_UPPER = np.array([ 90, 160,  65], np.uint8)
 
 ENEMY_RED_CREEPS_LOWER = np.array([ 90, 45,  35], np.uint8)
 ENEMY_RED_CREEPS_UPPER = np.array([ 140, 80,  60], np.uint8)
+
+# ENEMY CREEPS (clicked highlight)
+ENEMY_RED_CREEPS_CL_LOWER = np.array([140, 60,  55], np.uint8)
+ENEMY_RED_CREEPS_CL_UPPER = np.array([220,120,110], np.uint8)
 
 HP_BROWN_HEROES_LOWER = np.array([1, 1, 1],   np.uint8)
 HP_BROWN_HEROES_UPPER = np.array([15, 5, 5], np.uint8)
@@ -128,60 +135,59 @@ def _estimate_hp_ratio_from_roi(
     roi: np.ndarray,
     hp_color_ranges: List[Tuple[np.ndarray, np.ndarray]],
     max_gap: int = 2,
-    min_hp_len_pixels: int = 1,   # <-- ВАЖНО: допускаем совсем маленький HP (1 колонка)
-    bg_mode: str = "black",       # "black" для героев, "brown" для крипов
+    min_hp_len_pixels: int = 1,
+    bg_mode: str = "black",
     bg_color_ranges: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     return_masks: bool = False,
 ) -> Tuple[float, int, int] | Tuple[float, int, int, np.ndarray, np.ndarray]:
-    """
-    КЛЮЧЕВОЙ FIX:
-    - считаем, что hp_color_ranges = [fill, bg] (как ты и передаёшь: красн/зелён + коричн)
-    - mask_hp = ТОЛЬКО заливка (fill)
-    - mask_bg = фон (коричневый/чёрный)
-    - hp_ratio считаем по длине непрерывного участка fill слева внутри прямоугольника бара.
 
-    Это работает идеально, когда ROI — уже "белый прямоугольник" (полный бар).
-    """
     if roi is None or roi.size == 0:
         if return_masks:
             return 0.0, 0, 0, None, None  # type: ignore
         return 0.0, 0, 0
 
     h, w = roi.shape[:2]
-    if h == 0 or w == 0:
+    if h == 0 or w == 0 or not hp_color_ranges:
         if return_masks:
             return 0.0, 0, 0, None, None  # type: ignore
         return 0.0, 0, 0
 
-    if not hp_color_ranges:
-        if return_masks:
-            return 0.0, 0, 0, None, None  # type: ignore
-        return 0.0, 0, 0
+    # ============================================================
+    # НОВОЕ ПРАВИЛО:
+    #   - если диапазонов >= 2:
+    #       fill = все, кроме последнего
+    #       bg   = последний
+    #   - если диапазон один:
+    #       fill = он, bg = пусто (добавится чёрный, если bg_mode="black")
+    # ============================================================
+    if len(hp_color_ranges) >= 2:
+        fill_ranges = hp_color_ranges[:-1]
+        implicit_bg_ranges = [hp_color_ranges[-1]]
+    else:
+        fill_ranges = hp_color_ranges
+        implicit_bg_ranges = []
 
-    # --- 1) fill = ПЕРВЫЙ диапазон (красн/зелён)
-    fill_lo, fill_up = hp_color_ranges[0]
-    mask_fill = (cv2.inRange(roi, fill_lo, fill_up) > 0)  # bool
+    # --- 1) mask_fill = объединение ВСЕХ fill-диапазонов
+    mask_fill = np.zeros((h, w), dtype=bool)
+    for lo, up in fill_ranges:
+        mask_fill |= (cv2.inRange(roi, lo, up) > 0)
 
-    # --- 2) bg = либо второй диапазон (если есть), либо bg_color_ranges, либо black/brown по mode
+    # --- 2) mask_bg = implicit bg (последний диапазон) + bg_color_ranges + чёрный (для героев)
     mask_bg = np.zeros((h, w), dtype=bool)
 
-    # 2.1) если дали второй диапазон в hp_color_ranges — считаем его частью фона
-    if len(hp_color_ranges) >= 2:
-        bg_lo2, bg_up2 = hp_color_ranges[1]
-        mask_bg |= (cv2.inRange(roi, bg_lo2, bg_up2) > 0)
+    for lo, up in implicit_bg_ranges:
+        mask_bg |= (cv2.inRange(roi, lo, up) > 0)
 
-    # 2.2) если отдельно дали bg_color_ranges — тоже добавим
     if bg_color_ranges:
         for lo, up in bg_color_ranges:
             mask_bg |= (cv2.inRange(roi, lo, up) > 0)
 
-    # 2.3) если hero (bg_mode=black) — добавим "чёрный фон"
     if bg_mode == "black":
         gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
         mask_bg |= (gray < 25)
 
     # Итоговые маски
-    mask_hp = mask_fill  # ВАЖНО: HP = только заливка
+    mask_hp = mask_fill
     hp_pixels = int(mask_hp.sum())
     bg_pixels = int(mask_bg.sum())
 
@@ -201,19 +207,17 @@ def _estimate_hp_ratio_from_roi(
             return 0.0, hp_pixels, bg_pixels, mask_hp, mask_bg  # type: ignore
         return 0.0, hp_pixels, bg_pixels
 
-    # --- 4) колонки заливки (любая заливка в колонке) — без доп. фильтров
+    # --- 4) колонки заливки
     fill_cols = mask_hp.any(axis=0)
     xs_fill = np.where(fill_cols & (np.arange(w) >= bar_x0) & (np.arange(w) <= bar_x1))[0]
     if xs_fill.size == 0:
-        # нет заливки => HP=0
         if return_masks:
             return 0.0, hp_pixels, bg_pixels, mask_hp, mask_bg  # type: ignore
         return 0.0, hp_pixels, bg_pixels
 
-    # старт заполнения: первая колонка с заливкой внутри бара
     start = int(xs_fill[0])
 
-    # --- 5) длина HP: идём вправо пока заливка есть, допускаем небольшие дырки
+    # --- 5) длина HP с допускаемыми дырками
     hp_len = 0
     gap = 0
     for x in range(start, bar_x1 + 1):
@@ -230,13 +234,13 @@ def _estimate_hp_ratio_from_roi(
             return 0.0, hp_pixels, bg_pixels, mask_hp, mask_bg  # type: ignore
         return 0.0, hp_pixels, bg_pixels
 
-    # hp_ratio относительно полной ширины бара
     hp_ratio = hp_len / float(bar_w)
     hp_ratio = max(0.0, min(1.0, hp_ratio))
 
     if return_masks:
         return hp_ratio, hp_pixels, bg_pixels, mask_hp, mask_bg  # type: ignore
     return hp_ratio, hp_pixels, bg_pixels
+
 
 
 
@@ -636,6 +640,7 @@ def find_enemy_heroes_hp_bars(
 ) -> List[HpBarBox]:
     hp_ranges = [
         (ENEMY_RED_HEROES_LOWER, ENEMY_RED_HEROES_UPPER),
+        (ENEMY_RED_HEROES_CL_LOWER, ENEMY_RED_HEROES_CL_UPPER),
         (HP_BROWN_HEROES_LOWER,  HP_BROWN_HEROES_UPPER),
     ]
     return find_hp_bars(
@@ -750,6 +755,7 @@ def find_enemy_creeps_hp_bars(
 ) -> List[HpBarBox]:
     hp_ranges = [
         (ENEMY_RED_CREEPS_LOWER, ENEMY_RED_CREEPS_UPPER),
+        (ENEMY_RED_CREEPS_CL_LOWER, ENEMY_RED_CREEPS_CL_UPPER),
         (HP_BROWN_ENEMY_CREEPS_LOWER, HP_BROWN_ENEMY_CREEPS_UPPER)
     ]
     return find_hp_bars(

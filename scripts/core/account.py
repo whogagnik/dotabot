@@ -19,9 +19,9 @@ import win32api
 import win32process
 
 from scripts.core.CONSTANTS import *
-from window_placer import WindowPlacer
+from scripts.app.window_placer import WindowPlacer
 try:
-    from thread_registry import ThreadRegistry  # опционально
+    from scripts.app.thread_registry import ThreadRegistry  # опционально
 except Exception:
     ThreadRegistry = None  # type: ignore[assignment]
 

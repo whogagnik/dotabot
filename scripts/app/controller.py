@@ -18,9 +18,9 @@ import win32process
 
 from scripts.core.account import Account
 from scripts.core.CONSTANTS import *
-from window_placer import WindowPlacer
+from scripts.app.window_placer import WindowPlacer
 from scripts.game.game_automation import GameAutomation  # <-- новый модуль
-from thread_registry import ThreadRegistry
+from scripts.app.thread_registry import ThreadRegistry
 
 user32 = ctypes.windll.user32
 
