@@ -601,7 +601,7 @@ def run_live_capture(interval_sec: float = 1.0, hp_ckpt_path: str = "runs/hp_seq
         return
     print(f"[i] Dota hwnd: {hex(hwnd)} title='{_win_title(hwnd)}'")
 
-    ocr = SelfHp(hp_ckpt_path=hp_ckpt_path)
+    ocr = SelfHud(hp_ckpt_path=hp_ckpt_path)
     tasks = load_or_init_tasks(TASKS_JSON)
     print(f"[i] Using tasks file: {os.path.abspath(TASKS_JSON)}")
 
@@ -671,7 +671,7 @@ if __name__ == "__main__":
         run_live_capture(interval_sec=args.interval, hp_ckpt_path=args.hp_ckpt)
     else:
         # Оффлайн-проверка: прогон по имеющимся hp_bar *.png
-        ocr = SelfHp(hp_ckpt_path=args.hp_ckpt)
+        ocr = SelfHud(hp_ckpt_path=args.hp_ckpt)
         imgs = sorted(glob.glob(os.path.join(args.offline_dir, "*.png")))[:10000]
         print(f"Found {len(imgs)} hp-bar images for test")
         for path in imgs:

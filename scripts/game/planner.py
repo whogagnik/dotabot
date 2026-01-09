@@ -182,73 +182,7 @@ def _merge_close_points_uv(pts: list[tuple[float, float, float]],
             kept.append((u, v, s))
     return kept
 
-def _euclid2(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    dx = a[0] - b[0]; dy = a[1] - b[1]
-    return dx*dx + dy*dy
 
-def _nearest_point(poly: List[Dict[str, float]], pt: Tuple[float, float]) -> Optional[Tuple[float, float]]:
-    """Просто ближайшая вершина из полилинии (достаточно для клика)."""
-    if not poly:
-        return None
-    x, y = pt
-    best = None
-    best_d2 = 1e18
-    for pnt in poly:
-        px, py = float(pnt["x"]), float(pnt["y"])
-        d2 = _euclid2((x, y), (px, py))
-        if d2 < best_d2:
-            best_d2 = d2
-            best = (px, py)
-    return best
-# --- Геометрия: ближайшая точка на отрезке / полилинии (в координатах 0..100) ---
-
-def _closest_point_on_segment(ax: float, ay: float, bx: float, by: float,
-                              px: float, py: float) -> Tuple[float, float, float]:
-    """
-    Ближайшая точка от P(px,py) к отрезку AB(ax,ay)-(bx,by).
-    Возвращает (qx, qy, dist2), где Q — проекция, dist2 — квадрат расстояния.
-    """
-    abx, aby = bx - ax, by - ay
-    apx, apy = px - ax, py - ay
-    ab2 = abx * abx + aby * aby
-    if ab2 <= 1e-9:
-        # вырожденный отрезок — возвращаем A
-        qx, qy = ax, ay
-        dx, dy = px - qx, py - qy
-        return qx, qy, dx * dx + dy * dy
-    t = (apx * abx + apy * aby) / ab2
-    if t < 0.0:   t = 0.0
-    if t > 1.0:   t = 1.0
-    qx, qy = ax + t * abx, ay + t * aby
-    dx, dy = px - qx, py - qy
-    return qx, qy, dx * dx + dy * dy
-
-
-def _closest_point_on_polyline(poly: List[Dict[str, float]],
-                               p: Tuple[float, float]) -> Tuple[float, float, float]:
-    """
-    poly: [{x,y}, ...] — одна ломаная (линия).
-    p: (px,py) — текущая позиция.
-    Возвращает (qx, qy, dist2) — ближайшая точка на всей ломаной.
-    """
-    if not poly or len(poly) == 1:
-        pt = poly[0] if poly else {"x": 50.0, "y": 50.0}
-        dx, dy = p[0] - float(pt["x"]), p[1] - float(pt["y"])
-        return float(pt["x"]), float(pt["y"]), dx * dx + dy * dy
-
-    px, py = p
-    best_q = (float(poly[0]["x"]), float(poly[0]["y"]))
-    best_d2 = 1e18
-
-    for i in range(len(poly) - 1):
-        ax, ay = float(poly[i]["x"]), float(poly[i]["y"])
-        bx, by = float(poly[i + 1]["x"]), float(poly[i + 1]["y"])
-        qx, qy, d2 = _closest_point_on_segment(ax, ay, bx, by, px, py)
-        if d2 < best_d2:
-            best_d2 = d2
-            best_q = (qx, qy)
-
-    return best_q[0], best_q[1], best_d2
 
 def _filter_units_from_peaks(
     peaks: dict[int, list[tuple[float, float, float]]],
@@ -407,7 +341,7 @@ class Planner:
 
                 # <-- вот это ключевое: гейт на мозг
                 if self.block_input:
-                    brain.update(brain_snap)
+                    brain.tick_one(brain_snap)
                 else:
                     # опционально: можно логировать/ничего не делать
                     pass
@@ -968,93 +902,7 @@ class Planner:
 
 
 
-    @debug_log_result
-    def goto_nearest_camp(self,
-                          hwnd: int,
-                          camp_kind: str = "малый",
-                          *,
-                          from_pos: Optional[tuple[float, float]] = None,
-                          attack: bool = True):
-        """
-        Идём на ближайший кемп заданного вида:
-          camp_kind: 'малый' / 'средний' / 'большой'
-                     (поддерживаются и английские small/medium/large).
 
-        Логика:
-          1) Берём текущую позицию self из NN, либо from_pos, либо (50,50).
-          2) Берём из landmarks список кемпов нужного типа:
-             ожидаемые ключи в landmarks['data'] или просто в landmarks:
-                'camp_small', 'camp_medium', 'camp_large'
-                формата:
-                    "camp_small": [
-                      [ { "x": 25, "y": 21 }, ... ]
-                    ]
-          3) Находим ближайший кемп по евклиду.
-          4) Кликаем по нему на миникарте (ПКМ или A+ПКМ, если attack=True).
-        """
-
-
-        # 1) текущая позиция героя
-        cur: Optional[tuple[float, float]] = None
-        snap = self.last_by_hwnd.get(hwnd)
-        if snap:
-            me = snap.combined.get("units", {}).get("self", [])
-            if me:
-                cur = (float(me[0]["x"]), float(me[0]["y"]))
-        if cur is None:
-            cur = from_pos if from_pos is not None else (50.0, 50.0)
-
-        # 2) достаём кемпы из landmarks
-        # сначала пытаемся через .get("data"), если его нет — берём сам словарь
-        root = self.landmarks.get("data", self.landmarks)
-        key = f"camp_{camp_kind}"          # camp_small / camp_medium / camp_large
-
-        arr = root.get(key)
-        if not arr:
-            if self.log:
-                self.log.debug(f"[CAMP] no camps for key={key}")
-            return
-
-        # твой формат: "camp_small": [ [ {x,y}, ... ] ]
-        points_raw = arr[0] if isinstance(arr, list) and len(arr) > 0 else arr
-
-        candidates: list[tuple[float, float]] = []
-        if isinstance(points_raw, list):
-            for pt in points_raw:
-                try:
-                    px = float(pt["x"])
-                    py = float(pt["y"])
-                    candidates.append((px, py))
-                except Exception:
-                    continue
-
-        if not candidates:
-            if self.log:
-                self.log.debug(f"[CAMP] empty camps for key={key}")
-            return
-
-        # 3) выбираем ближайший кемп к текущей позиции
-        best = None
-        best_d2 = 1e18
-        for (px, py) in candidates:
-            d2 = _euclid2(cur, (px, py))
-            if d2 < best_d2:
-                best_d2 = d2
-                best = (px, py)
-
-        if best is None:
-            return
-
-        bx, by = best
-
-        # 4) кликаем по кемпу
-        self.click_minimap_pct(hwnd, bx + 1, by + 1, attack=attack)
-
-        if self.log:
-            self.log.debug(
-                f"[CAMP] hwnd={hex(hwnd)} -> kind={camp_kind} @ ({bx:.1f},{by:.1f}), "
-                f"from=({cur[0]:.1f},{cur[1]:.1f}), attack={attack}"
-            )
 
     @debug_log_result
     def _send_mouse_click_client(self, hwnd: int, x: int, y: int, button: str = "right"):
@@ -1134,108 +982,7 @@ class Planner:
             time.sleep(0.015)
             win32api.SetCursorPos((ox, oy))
 
-    @debug_log_result
-    def _pick_fountain_point(self) -> Tuple[float, float]:
-        """
-        Ищем точку фонтана из landmarks.
-        Приоритет: fountain_<side> → ancient_<side>.
-        """
-        d = self.landmarks.get("data", {})
-        side = self.side
-        keys = d.get(f"ancient_{side}",{})[0][0]
-        return float(keys["x"]), float(keys["y"])
 
-    @debug_log_result
-    def goto_fountain(self, hwnd: int):
-        x, y = self._pick_fountain_point()
-        self.click_minimap_pct(hwnd, x, y, attack=False)
-
-    @debug_log_result
-    def goto_nearest_lane(self,
-                          hwnd: int,
-                          *,
-                          from_pos: Optional[Tuple[float, float]] = None,
-                          attack: bool = False):
-        """
-        Идём на ближайшую линию (top/mid/bot), НЕ указывая имя.
-        Берём текущую позицию из NN (units['self'][0]) → проецируем на каждую линию → выбираем минимум.
-        Клик по ближайшей точке на выбранной линии.
-        """
-        # 1) источник позиции: self из последнего снапшота, иначе from_pos, иначе центр
-        cur: Optional[Tuple[float, float]] = None
-        snap = self.last_by_hwnd.get(hwnd)
-        if snap:
-            me = snap.combined.get("units", {}).get("self", [])
-            if me:
-                cur = (float(me[0]["x"]), float(me[0]["y"]))
-        if cur is None:
-            cur = from_pos if from_pos is not None else (50.0, 50.0)
-
-        # 2) набор линий из landmarks
-        d = self.landmarks.get("data", {})
-        lane_keys = ["lane_top", "lane_mid", "lane_bot"]
-        candidates: List[Tuple[str, List[Dict[str, float]]]] = []
-        for k in lane_keys:
-            arr = d.get(k, [])
-            if arr and arr[0]:
-                # формат: lane_*: [[{x,y}, ...]]
-                candidates.append((k, arr[0]))
-
-        if not candidates:
-            return  # нет лейнов — ничего не делаем
-
-        # 3) ищем ближайшую точку среди всех линий
-        best_lane = None
-        best_q = None
-        best_d2 = 1e18
-
-        for lname, poly in candidates:
-            qx, qy, d2 = _closest_point_on_polyline(poly, cur)
-            if d2 < best_d2:
-                best_d2 = d2
-                best_q = (qx, qy)
-                best_lane = lname
-
-        if best_q is None:
-            return
-
-        # 4) клик по ближайшей точке (с атакой или без)
-        self.click_minimap_pct(hwnd, best_q[0], best_q[1], attack=attack)
-
-        # (опционально) можно логировать выбранную линию/цель
-        if self.log:
-            self.log.debug(f"[LANE] hwnd={hex(hwnd)} -> {best_lane} @ ({best_q[0]:.1f},{best_q[1]:.1f})")
-
-    @debug_log_result
-    def goto_nearest_tower(self, hwnd: int, ally_or_enemy: str = "enemy", *, only_alive: bool = True, attack: bool = False):
-        """
-        Находим ближайшую (живую) башню запрошенной стороны к текущей позиции self и кликаем по ней.
-        """
-        snap = self.last_by_hwnd.get(hwnd)
-        if not snap:
-            return
-        tws = snap.combined.get("towers", {}).get(ally_or_enemy, [])
-        if not tws:
-            return
-
-        # текущая позиция self
-        me = snap.combined.get("units", {}).get("self", [])
-        cur = (float(me[0]["x"]), float(me[0]["y"])) if me else (50.0, 50.0)
-
-        best = None
-        best_d2 = 1e18
-        for t in tws:
-            if only_alive and not t.get("alive", False):
-                continue
-            px, py = float(t["x"]), float(t["y"])
-            d2 = _euclid2(cur, (px, py))
-            if d2 < best_d2:
-                best_d2 = d2
-                best = (px, py)
-
-        if best is None:
-            return
-        self.click_minimap_pct(hwnd, best[0] + 1, best[1] + 1, attack=attack)
 
 
 def visualize_full_frame(pl: "Planner",
@@ -1412,7 +1159,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S"
     )
