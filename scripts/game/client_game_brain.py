@@ -163,6 +163,14 @@ class Brain:
         self._digit_prev_down: Dict[int, bool] = {d: False for d in range(1, 10)}
         self._manual_switch_cooldown: float = 0.20  # антидребезг
 
+        # --- anti spam walk clicks ---
+        self.walk_cmd_cooldown: float = 0.30   # общий кулдаун на walk-команды
+        self.walk_same_target_tol_px: float = 18.0  # "та же цель" для walk
+
+        self._last_walk_ts: float = 0.0
+        self._last_walk_target: Optional[Tuple[int, int]] = None
+
+
     # --------- публичный метод ---------
     def tick_one(self, snap: "Snapshot"):
         """
@@ -531,6 +539,35 @@ class Brain:
         except Exception:
             return None
 
+    def _walk_throttled(self, x: int, y: int, *, cooldown: Optional[float] = None,
+                        tol_px: Optional[float] = None, attack: bool = False) -> bool:
+        """
+        Делает click_on_screen_walk, но:
+          - не чаще чем cooldown секунд
+          - не повторяет клик в почти ту же точку (tol_px) слишком часто
+        Возвращает True если команда отправлена, иначе False.
+        """
+        now = time.time()
+        cd = self.walk_cmd_cooldown if cooldown is None else float(cooldown)
+        tol = self.walk_same_target_tol_px if tol_px is None else float(tol_px)
+
+        if now - self._last_walk_ts < cd:
+            # слишком рано
+            return False
+
+        if self._last_walk_target is not None:
+            lx, ly = self._last_walk_target
+            dx = float(x - lx)
+            dy = float(y - ly)
+            if (dx * dx + dy * dy) <= (tol * tol):
+                # почти та же цель -> не спамим
+                return False
+
+        self.pl.click_on_screen_walk(self.hwnd, int(x), int(y), attack=attack)
+        self._last_walk_ts = now
+        self._last_walk_target = (int(x), int(y))
+        self.last_action_ts = now
+        return True
     @debug_log_result
     def _compute_laning_point(self, c: Dict[str, Any], min_dist_to_enemy: float) -> Optional[tuple[int, int]]:
         """
@@ -1106,7 +1143,7 @@ class Brain:
         if new_state is self.state:
             return
         if self.log:
-            self.log.debug(f"[BRAIN {hex(self.hwnd)}] {self.state.name} -> {new_state.name}")
+            self.log.info(f"[BRAIN {hex(self.hwnd)}] {self.state.name} -> {new_state.name}")
         self.state = new_state
         self.last_action_ts = 0.0
 
@@ -1185,8 +1222,9 @@ class Brain:
                         f"[BRAIN] lasthit: APPROACH creep at ({cx:.0f},{cy:.0f}) "
                         f"dist={dist:.0f}px creep_hp={creep_hp:.2f}"
                     )
-                self.pl.click_on_screen_walk(self.hwnd, int(cx), int(cy) + 10, attack=False)
-                self.last_action_ts = now
+                sent = self._walk_throttled(int(cx), int(cy) + 10, cooldown=self.lasthit_cmd_cooldown, tol_px=14.0)
+                if sent and self.log:
+                    self.log.debug("[BRAIN] lasthit: walk command sent")
                 return
 
             if self.log:
@@ -1214,8 +1252,7 @@ class Brain:
         if self.log:
             self.log.debug(f"[BRAIN] laning: move to ({tx},{ty})")
 
-        self.pl.click_on_screen_walk(self.hwnd, tx, ty, attack=False)
-        self.last_action_ts = now
+        self._walk_throttled(tx, ty, cooldown=0.35, tol_px=22.0, attack=False)
 
     def _tick_farming(self, c: Dict[str, Any], s: Senses):
         pass

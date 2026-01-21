@@ -14,8 +14,8 @@ from scripts.vision.screen_hp_scanner import scan_hp_bars_on_screen,HpBarBox
 from scripts.core.CONSTANTS import *
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
-from scripts.vision.hud_scanner import SelfHud
-from scripts.core.utils import _force_foreground,debug_log_result,find_main_hwnd_for_pid
+from scripts.vision.hud.hud_scanner import SelfHud
+from scripts.core.utils import _force_foreground,debug_log_result,find_main_hwnd_for_pid,find_dota_hwnd
 import numpy as np
 import cv2
 from PIL import Image
@@ -28,8 +28,8 @@ import win32api
 import win32con
 
 # === NN и пики ===
-from scripts.ml.train_minimap_heatmap import load_model
-from scripts.ml.metrics import find_peaks_per_channel,infer_one_minimap,infer_one_hp
+
+from scripts.ml.infer import find_peaks_per_channel,infer_one_minimap,load_minimap_model
 from scripts.vision.tower_detector import TowerVisibilityTracker  # type: ignore
 
 from scripts.game.client_game_brain import Brain
@@ -41,13 +41,7 @@ import logging
 # ---------------------------------------------------------------------
 # Геометрия миникарты
 # ---------------------------------------------------------------------
-MM_W = 100
-MM_H = 100
-DX = 4  # от правого края внутрь на 4 px
-DY = 4  # от нижнего края вверх на 4 px
 
-DEFAULT_THR = 0.9
-DEFAULT_NMS = 7
 
 
 # ---------------------------------------------------------------------
@@ -248,7 +242,7 @@ class Planner:
         self.hwnds = hwnds
         self.side  = side.lower().strip()  # 'radiant' | 'dire'
         self.log   = logger
-        self.self_hp = SelfHud(hp_ckpt_path=DEFAULT_ML_HP_DIR)
+        self.self_hp = SelfHud()
         self.game_start_ts: float = time.time()  # пока просто "момент запуска бота"
 
         # частоты обновления
@@ -284,7 +278,7 @@ class Planner:
         self.tower_tracker = TowerVisibilityTracker(radiant_towers=self.landmarks['data']['tower_radiant'][0], dire_towers=self.landmarks['data']['tower_dire'][0])
 
         # NN
-        self.net, self.classes, self.size = load_model(DEFAULT_ML_MINIMAP_DIR, device='cuda')
+        self.net, self.classes, self.size = load_minimap_model(DEFAULT_ML_MINIMAP_DIR, device='cuda')
         self.cls2idx = {c: i for i, c in enumerate(self.classes)}  # {'self','ally','enemy'}
         self.brains: Dict[int, Brain] = {
             hwnd: Brain(hwnd, planner=self, logger=logger)
@@ -722,12 +716,12 @@ class Planner:
         # экранные координаты окна
         x, y, w, h = get_client_rect(hwnd)
         # экранные координаты миникарты
-        rx = x + w - MM_W - DX
-        ry = y + h - MM_H - DY
+        rx = x + w - MM_W - MM_DX
+        ry = y + h - MM_H - MM_DY
         # локальные координаты в hay_pil
         # hay_pil = клиентская область (w,h)
-        rx_l = w - MM_W - DX
-        ry_l = h - MM_H - DY
+        rx_l = w - MM_W - MM_DX
+        ry_l = h - MM_H - MM_DY
         if rx_l < 0 or ry_l < 0 or (rx_l + MM_W) > w or (ry_l + MM_H) > h:
             # fallback на numpy кроп (на всякий)
             arr = np.array(hay_pil)
@@ -1050,8 +1044,8 @@ def visualize_full_frame(pl: "Planner",
     # ------------------------------------------------------------------
     # get_client_rect -> клиентские координаты окна (в пикселях)
     _, _, win_w, win_h = get_client_rect(hwnd)
-    mm_x0 = win_w - MM_W - DX
-    mm_y0 = win_h - MM_H - DY
+    mm_x0 = win_w - MM_W - MM_DX
+    mm_y0 = win_h - MM_H - MM_DY
     mm_x1 = mm_x0 + MM_W - 1
     mm_y1 = mm_y0 + MM_H - 1
 
@@ -1154,7 +1148,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Planner demo / debugger (one frame overlay)")
-    parser.add_argument("--pid", type=int, default=0, help="PID игры (0 = использовать жёстко прописанный)")
+
     parser.add_argument("--side", type=str, default="radiant", help="radiant|dire")
     args = parser.parse_args()
 
@@ -1166,13 +1160,14 @@ if __name__ == "__main__":
     log = logging.getLogger("planner-demo")
 
     # --- hwnd по PID ---
-    pid = args.pid if args.pid != 0 else 12360  # сюда свой дефолтный PID по умолчанию
-    hwnd = find_main_hwnd_for_pid(pid)
+
+
+    hwnd = find_dota_hwnd()
     if hwnd is None:
-        log.error(f"Не нашёл главное окно для PID={pid}")
+        log.error(f"Не нашёл главное окно ")
         raise SystemExit(1)
 
-    log.info(f"Нашёл hwnd={hex(hwnd)} для PID={pid}, side={args.side}")
+    log.info(f"Нашёл hwnd={hex(hwnd)} для , side={args.side}")
 
     pl = Planner(hwnds=[hwnd], side=args.side, logger=log)
 

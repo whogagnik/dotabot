@@ -1,6 +1,8 @@
 # train_minimap_heatmap.py
 # -*- coding: utf-8 -*-
 
+from __future__ import annotations
+
 import os
 import json
 import glob
@@ -8,7 +10,7 @@ import uuid
 import random
 import argparse
 import datetime
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional, Union
 
 import numpy as np
 import cv2
@@ -18,11 +20,21 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from scripts.ml.metrics import find_peaks_per_channel
-from scripts.ml.models import MiniMapNet
-# ---------------------------
+from scripts.ml.infer import find_peaks_per_channel
+from scripts.ml.metrics import (
+    confusion_binary,
+    metrics_from_confusion,
+    roc_auc_score_binary,
+    pr_auc_score_binary,
+)
+from scripts.ml.models import ResUNetLite
+
+# ============================================================
 # Utils
-# ---------------------------
+# ============================================================
+
+DeviceLike = Union[str, torch.device, None]
+
 
 def set_seed(seed: int = 1337):
     random.seed(seed)
@@ -43,34 +55,41 @@ def to_tensor(img_rgb: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
 
 
-# ---------------------------
+def resolve_device(device: DeviceLike = None) -> torch.device:
+    cuda_ok = torch.cuda.is_available()
+
+    # explicit CPU
+    if device is not None:
+        if isinstance(device, torch.device):
+            if device.type == "cpu":
+                return torch.device("cpu")
+        else:
+            s = str(device).strip().lower()
+            if s == "cpu":
+                return torch.device("cpu")
+
+    # otherwise CUDA if possible
+    if cuda_ok:
+        if device is not None and not isinstance(device, torch.device):
+            s = str(device).strip().lower()
+            if s.startswith("cuda:"):
+                return torch.device(s)
+        if isinstance(device, torch.device) and device.type == "cuda":
+            return device
+        return torch.device("cuda")
+
+    return torch.device("cpu")
+
+
+def _assert_same_device(net: nn.Module, x: torch.Tensor) -> None:
+    pdev = next(net.parameters()).device
+    if pdev != x.device:
+        raise RuntimeError(f"Device mismatch: model on {pdev}, input on {x.device}")
+
+
+# ============================================================
 # Label Studio parsing
-# ---------------------------
-
-"""
-Ожидаем экспорт Label Studio JSON (Tasks), где каждая задача имеет:
-{
-  "data": { "image": "<путь или url>" },
-  "file_upload": "xxxx-mm_000123.png",
-  "annotations": [
-     {
-       "result": [
-         {
-           "value": {
-             "x": <0..100>, "y": <0..100>,
-             "width": <0..100>, "height": <0..100>,
-             "rectanglelabels": ["ally"]  # или "self"/"enemy"
-           },
-           "type":"rectanglelabels", ...
-         },
-         ...
-       ]
-     }
-  ]
-}
-Координаты x,y,width,height в ПРОЦЕНТАХ относительно исходного изображения.
-"""
-
+# ============================================================
 
 def _parse_dt_maybe(v: Optional[str]) -> Optional[datetime.datetime]:
     if not v or not isinstance(v, str):
@@ -89,26 +108,13 @@ def _parse_dt_maybe(v: Optional[str]) -> Optional[datetime.datetime]:
     return None
 
 
-def parse_ls_export(json_path: str,
-                    classes: List[str],
-                    image_root: Optional[str] = None,
-                    strict_exists: bool = True,
-                    min_results: int = 1) -> List[Dict[str, Any]]:
-    """
-    Возвращает список сэмплов:
-      {
-        "image_path": <resolved or original>,
-        "file_upload": <str|None>,
-        "boxes": [ {cls,x,y,w,h}, ... ],
-        "exists": bool,
-        "total_annotations": int,
-        "picked_ann_meta": { ... }
-      }
-
-    Политика выбора аннотации:
-      - валидная: ann с result!=[], и без was_cancelled
-      - берём ПОСЛЕДНЮЮ по updated_at; если пусто — по created_at; если пусто у всех — последнюю в массиве
-    """
+def parse_ls_export(
+    json_path: str,
+    classes: List[str],
+    image_root: Optional[str] = None,
+    strict_exists: bool = True,
+    min_results: int = 1
+) -> List[Dict[str, Any]]:
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -122,32 +128,26 @@ def parse_ls_export(json_path: str,
 
         cands: List[str] = []
 
-        # 1) /data/local-files/?d=...
         if root and p.startswith("/data/local-files/?d="):
             rel = p.split("?d=")[-1].lstrip("/\\")
             cands.append(os.path.join(root, rel))
 
-        # 2) /data/upload/... -> root/file_upload (или basename)
         if root and p.startswith("/data/upload/"):
             name = fu or os.path.basename(p)
             if name:
                 cands.append(os.path.join(root, name))
 
-        # 3) как есть
         if p:
             cands.append(p)
 
-        # 4) root + basename(image)
         if root and p:
             base = os.path.basename(p)
             if base:
                 cands.append(os.path.join(root, base))
 
-        # 5) root + file_upload
         if root and fu:
             cands.append(os.path.join(root, fu))
 
-        # 6) обрезка префикса-хэша "xxxx-" -> root/suffix, и glob по суффиксу
         def add_suffix_variants(name: str):
             if not root or not name:
                 return
@@ -250,32 +250,25 @@ def parse_ls_export(json_path: str,
     return items
 
 
-# ---------------------------
+# ============================================================
 # Dataset
-# ---------------------------
+# ============================================================
 
 class MinimapHeatmapDataset(Dataset):
-    """
-    Аугментации ТОЛЬКО:
-      - synthetic rotations (0/90/180/270) через rot_k (если synthetic=True)
-      - pixel shift dx,dy in [-shift_max, shift_max] (только если augment=True)
-    Никаких микроротаций, блюра, шума, изменения яркости и т.д.
-
-    Debug:
-      - если debug_dump_dir задан, то сохраняет КАЖДЫЙ сэмпл (после resize+shift) в PNG + JSON с боксами
-    """
-    def __init__(self,
-                 samples: List[Dict[str, Any]],
-                 classes: List[str],
-                 out_size: int = 128,
-                 augment: bool = False,
-                 synthetic: bool = False,
-                 shift_max: int = 50,
-                 shift_prob: float = 1.0,
-                 shift_border_value: int = 0,
-                 drop_tiny_boxes_px: float = 1.0,
-                 debug_dump_dir: Optional[str] = None,
-                 debug_dump_limit: int = -1):
+    def __init__(
+        self,
+        samples: List[Dict[str, Any]],
+        classes: List[str],
+        out_size: int = 128,
+        augment: bool = False,
+        synthetic: bool = False,
+        shift_max: int = 50,
+        shift_prob: float = 1.0,
+        shift_border_value: int = 0,
+        drop_tiny_boxes_px: float = 1.0,
+        debug_dump_dir: Optional[str] = None,
+        debug_dump_limit: int = -1
+    ):
         self.samples = samples
         self.classes = classes
         self.cls2idx = {c: i for i, c in enumerate(classes)}
@@ -298,7 +291,6 @@ class MinimapHeatmapDataset(Dataset):
         return len(self.samples) * 4 if self.synthetic else len(self.samples)
 
     def _rotate_boxes_ccw(self, boxes: List[Dict[str, Any]], k: int) -> List[Dict[str, Any]]:
-        """Поворот боксов на k * 90° CCW (как np.rot90). Координаты в процентах."""
         if k % 4 == 0:
             return [dict(b) for b in boxes]
 
@@ -321,7 +313,7 @@ class MinimapHeatmapDataset(Dataset):
                 cx2 = 1.0 - cx
                 cy2 = 1.0 - cy
                 w2, h2 = w, h
-            else:  # k == 3: 270 CCW
+            else:  # 270 CCW
                 cx2 = 1.0 - cy
                 cy2 = cx
                 w2, h2 = h, w
@@ -337,16 +329,13 @@ class MinimapHeatmapDataset(Dataset):
             out.append(nb)
         return out
 
-    def _shift_img_and_boxes(self,
-                             img: np.ndarray,
-                             boxes: List[Dict[str, Any]],
-                             dx: int,
-                             dy: int) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-        """
-        img: HxWx3 uint8 (уже out_size x out_size)
-        boxes: проценты 0..100
-        dx,dy: пиксельный сдвиг (dx вправо, dy вниз)
-        """
+    def _shift_img_and_boxes(
+        self,
+        img: np.ndarray,
+        boxes: List[Dict[str, Any]],
+        dx: int,
+        dy: int
+    ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         H, W = img.shape[:2]
 
         M = np.array([[1, 0, dx],
@@ -389,9 +378,6 @@ class MinimapHeatmapDataset(Dataset):
         return img_shift, new_boxes
 
     def _build_heatmap(self, H: int, W: int, boxes: List[Dict[str, Any]]) -> np.ndarray:
-        """
-        boxes: проценты (0..100). Теплокарта: CxHxW, максимум гауссиан по боксам класса.
-        """
         C = len(self.classes)
         hm = np.zeros((C, H, W), dtype=np.float32)
 
@@ -415,14 +401,7 @@ class MinimapHeatmapDataset(Dataset):
 
         return hm
 
-    def _dump_augmented(self,
-                        img_rgb: np.ndarray,
-                        boxes: List[Dict[str, Any]],
-                        src_path: str,
-                        rot_k: int,
-                        dx: int,
-                        dy: int):
-        """Сохраняем PNG + JSON (boxes) в debug_dump_dir."""
+    def _dump_augmented(self, img_rgb, boxes, src_path, rot_k, dx, dy):
         if not self.debug_dump_dir:
             return
         if self.debug_dump_limit >= 0 and self._dump_count >= self.debug_dump_limit:
@@ -452,7 +431,6 @@ class MinimapHeatmapDataset(Dataset):
         sample = self.samples[base_idx]
         img = imread_rgb(sample["image_path"])  # RGB
 
-        # 1) 0/90/180/270
         if rot_k != 0:
             img = np.rot90(img, k=rot_k)
 
@@ -460,10 +438,8 @@ class MinimapHeatmapDataset(Dataset):
         if rot_k != 0:
             boxes = self._rotate_boxes_ccw(boxes, rot_k)
 
-        # 2) resize to out_size
         img_resized = cv2.resize(img, (self.out_size, self.out_size), interpolation=cv2.INTER_AREA)
 
-        # 3) pixel shift
         dx = 0
         dy = 0
         if self.augment and (self.shift_max > 0) and (random.random() < self.shift_prob):
@@ -472,22 +448,12 @@ class MinimapHeatmapDataset(Dataset):
             dy = random.randint(-max_s, max_s)
             img_resized, boxes = self._shift_img_and_boxes(img_resized, boxes, dx, dy)
 
-        # 4) dump every augmented sample (optional)
-        self._dump_augmented(
-            img_rgb=img_resized,
-            boxes=boxes,
-            src_path=sample["image_path"],
-            rot_k=rot_k,
-            dx=dx,
-            dy=dy
-        )
+        self._dump_augmented(img_resized, boxes, sample["image_path"], rot_k, dx, dy)
 
-        # 5) heatmap
         hm = self._build_heatmap(self.out_size, self.out_size, boxes)
 
         x = to_tensor(img_resized)
         y = torch.from_numpy(hm)
-
         meta = {"boxes": boxes, "image": sample["image_path"], "rot_k": rot_k, "dx": dx, "dy": dy}
         return x, y, meta
 
@@ -497,12 +463,9 @@ def collate_keep_meta(batch):
     return torch.stack(xs, 0), torch.stack(ys, 0), list(metas)
 
 
-# ---------------------------
-# Model
-# ---------------------------
-
-
-
+# ============================================================
+# Loss
+# ============================================================
 
 class MultiHMLoss(nn.Module):
     """BCEWithLogits + Dice."""
@@ -522,13 +485,15 @@ class MultiHMLoss(nn.Module):
         return (1 - self.dice_w) * bce + self.dice_w * dice
 
 
-# ---------------------------
-# Peak metrics & inference utils
-# ---------------------------
+# ============================================================
+# Peak metrics
+# ============================================================
 
-def centers_from_boxes_percent(boxes: List[Dict[str, float]],
-                               size: int,
-                               cls2idx: Dict[str, int]) -> List[List[Tuple[float, float]]]:
+def centers_from_boxes_percent(
+    boxes: List[Dict[str, float]],
+    size: int,
+    cls2idx: Dict[str, int]
+) -> List[List[Tuple[float, float]]]:
     C = len(cls2idx)
     gts = [[] for _ in range(C)]
     for b in boxes:
@@ -539,9 +504,11 @@ def centers_from_boxes_percent(boxes: List[Dict[str, float]],
     return gts
 
 
-def match_peaks_to_gt(peaks_xy: List[Tuple[float, float]],
-                      gts_xy: List[Tuple[float, float]],
-                      radius: float = 6.0) -> Tuple[int, int, int]:
+def match_peaks_to_gt(
+    peaks_xy: List[Tuple[float, float]],
+    gts_xy: List[Tuple[float, float]],
+    radius: float = 6.0
+) -> Tuple[int, int, int]:
     used = set()
     TP = 0
     for x, y in peaks_xy:
@@ -560,15 +527,14 @@ def match_peaks_to_gt(peaks_xy: List[Tuple[float, float]],
     return TP, FP, FN
 
 
-
-
-
-def eval_peaks_batch(prob: np.ndarray,
-                     metas: List[Dict[str, Any]],
-                     classes: List[str],
-                     thr: float = 0.35,
-                     nms_kernel: int = 5,
-                     radius: float = 6.0) -> Tuple[float, float]:
+def eval_peaks_batch(
+    prob: np.ndarray,
+    metas: List[Dict[str, Any]],
+    classes: List[str],
+    thr: float = 0.35,
+    nms_kernel: int = 5,
+    radius: float = 6.0
+) -> Tuple[float, float]:
     B, C, H, W = prob.shape
     cls2idx = {c: i for i, c in enumerate(classes)}
     TP = FP = FN = 0
@@ -584,13 +550,47 @@ def eval_peaks_batch(prob: np.ndarray,
     return P, R
 
 
-# ---------------------------
+# ============================================================
+# Inference helper (как у minimap)
+# ============================================================
+
+@torch.no_grad()
+def infer_image(net: nn.Module, img_rgb: np.ndarray, size: int, device: DeviceLike = None) -> np.ndarray:
+    dev = resolve_device(device)
+    img_resized = cv2.resize(img_rgb, (size, size), interpolation=cv2.INTER_AREA)
+    x = to_tensor(img_resized).unsqueeze(0).to(dev)  # 1x3xSxS
+
+    net = net.eval().to(dev)
+    _assert_same_device(net, x)
+
+    logits = net(x)
+    prob = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return prob
+
+
+@torch.no_grad()
+def load_model(ckpt_path: str, device: Optional[str] = None):
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    classes = ckpt.get("classes", ["self", "ally", "enemy"])
+    size = int(ckpt.get("size", 128))
+    base = int(ckpt.get("base", 32))
+    dropout = float(ckpt.get("dropout", 0.0))
+
+    net = ResUNetLite(in_ch=3, base=base, out_ch=len(classes), dropout=dropout)
+    net.load_state_dict(ckpt["model"], strict=True)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    net.to(device).eval()
+    return net, classes, size
+
+
+# ============================================================
 # Training
-# ---------------------------
+# ============================================================
 
 def train(args):
     set_seed(args.seed)
-
     classes = ["self", "ally", "enemy"]
 
     print(f"[i] Loading Label Studio export: {args.ls_json}")
@@ -615,8 +615,8 @@ def train(args):
     train_ds = MinimapHeatmapDataset(
         train_samples, classes,
         out_size=args.size,
-        augment=True,              # <-- включает shift
-        synthetic=True,            # <-- 0/90/180/270
+        augment=True,
+        synthetic=True,
         shift_max=args.shift_max,
         shift_prob=args.shift_prob,
         shift_border_value=args.shift_border_value,
@@ -643,10 +643,10 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"[i] Device: {device}")
 
-    net = MiniMapNet(in_ch=3, base=args.base, out_ch=len(classes), dropout=args.dropout).to(device)
+    net = ResUNetLite(in_ch=3, base=args.base, out_ch=len(classes), dropout=args.dropout).to(device)
     criterion = MultiHMLoss(pos_weight=None, dice_w=args.dice_w).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', patience=3, factor=0.5)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", patience=3, factor=0.5)
 
     os.makedirs(args.out_dir, exist_ok=True)
     best_val = 1e9
@@ -724,6 +724,10 @@ def train(args):
         val_loss = 0.0
         P_pk_list, R_pk_list = [], []
 
+        pres_true = {c: [] for c in classes}
+        pres_pred = {c: [] for c in classes}
+        pres_score = {c: [] for c in classes}
+
         with torch.no_grad():
             for x, y, metas in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [valid]"):
                 x_dev = x.to(device, non_blocking=True)
@@ -733,7 +737,9 @@ def train(args):
                 loss = criterion(logits, y_dev)
                 val_loss += loss.item() * x.size(0)
 
-                prob_np = torch.sigmoid(logits).cpu().numpy()
+                prob_np = torch.sigmoid(logits).cpu().numpy()  # BxCxHxW
+
+                # peaks metrics
                 Ppk, Rpk = eval_peaks_batch(
                     prob_np, metas, classes,
                     thr=args.thr, nms_kernel=args.nms_kernel, radius=args.radius
@@ -741,14 +747,83 @@ def train(args):
                 P_pk_list.append(Ppk)
                 R_pk_list.append(Rpk)
 
+                # presence metrics data
+                B, C, _H, _W = prob_np.shape
+                for b in range(B):
+                    gt_present = {c: 0 for c in classes}
+                    for box in metas[b]["boxes"]:
+                        cls = box.get("cls")
+                        if cls in gt_present:
+                            gt_present[cls] = 1
+
+                    for ci, cname in enumerate(classes):
+                        sc = float(prob_np[b, ci].max())
+                        pr = 1 if sc >= args.pres_thr else 0
+                        pres_true[cname].append(int(gt_present[cname]))
+                        pres_pred[cname].append(int(pr))
+                        pres_score[cname].append(float(sc))
+
         val_loss /= len(val_loader.dataset)
         Ppk_mean = float(np.mean(P_pk_list)) if P_pk_list else 0.0
         Rpk_mean = float(np.mean(R_pk_list)) if R_pk_list else 0.0
 
-        print(f"[epoch {epoch}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"P_peaks={Ppk_mean:.3f} R_peaks={Rpk_mean:.3f}")
+        pres_lines = []
+        macro_vals = {
+            "precision": [],
+            "recall": [],
+            "f1": [],
+            "acc": [],
+            "bal_acc": [],
+            "mcc": [],
+        }
+        macro_rocs = []
+        macro_prs = []
 
-        # save best (по сумме P+R)
+        for cname in classes:
+            TP, FP, FN, TN = confusion_binary(pres_true[cname], pres_pred[cname])
+            m = metrics_from_confusion(TP, FP, FN, TN)
+
+            roc = roc_auc_score_binary(pres_true[cname], pres_score[cname])
+            pr = pr_auc_score_binary(pres_true[cname], pres_score[cname])
+
+            # --- собираем для macro ---
+            for k in macro_vals.keys():
+                macro_vals[k].append(float(m[k]))
+            if roc is not None:
+                macro_rocs.append(float(roc))
+            if pr is not None:
+                macro_prs.append(float(pr))
+
+            pres_lines.append(
+                f"{cname}:F1={m['f1']:.3f} P={m['precision']:.3f} R={m['recall']:.3f} "
+                f"Acc={m['acc']:.3f} BalAcc={m['bal_acc']:.3f} MCC={m['mcc']:.3f} "
+                f"ROC-AUC={('nan' if roc is None else f'{roc:.3f}')} "
+                f"PR-AUC={('nan' if pr is None else f'{pr:.3f}')}"
+            )
+
+        # --- macro summary ---
+        def _mean(xs):
+            return sum(xs) / max(1, len(xs))
+
+        macro = {k: _mean(v) for k, v in macro_vals.items()}
+        macro_roc = (_mean(macro_rocs) if len(macro_rocs) > 0 else None)
+        macro_pr = (_mean(macro_prs) if len(macro_prs) > 0 else None)
+
+        pres_lines.append(
+            "macro:"
+            f"F1={macro['f1']:.3f} P={macro['precision']:.3f} R={macro['recall']:.3f} "
+            f"Acc={macro['acc']:.3f} BalAcc={macro['bal_acc']:.3f} MCC={macro['mcc']:.3f} "
+            f"ROC-AUC={('nan' if macro_roc is None else f'{macro_roc:.3f}')} "
+            f"PR-AUC={('nan' if macro_pr is None else f'{macro_pr:.3f}')}"
+        )
+
+        print(
+            f"[epoch {epoch}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"P_peaks={Ppk_mean:.3f} R_peaks={Rpk_mean:.3f}\n"
+            f"[presence@thr={args.pres_thr:.2f}] " + " | ".join(pres_lines)
+        )
+
+        # save best (по сумме P+R peaks)
         if (best_r + best_p) < (Rpk_mean + Ppk_mean):
             best_val = val_loss
             best_r = Rpk_mean
@@ -758,6 +833,7 @@ def train(args):
                 "classes": classes,
                 "size": args.size,
                 "base": args.base,
+                "dropout": args.dropout,
                 "epoch": epoch,
                 "best_val": best_val,
                 "best_r": best_r,
@@ -769,7 +845,7 @@ def train(args):
             print(f"[i] saved best → {best_path}")
 
         sched.step(val_loss)
-        current_lr = opt.param_groups[0]['lr']
+        current_lr = opt.param_groups[0]["lr"]
         if last_lr is None or abs(current_lr - last_lr) > 1e-12:
             print(f"[lr] → {current_lr:.6g}")
             last_lr = current_lr
@@ -780,6 +856,7 @@ def train(args):
         "classes": classes,
         "size": args.size,
         "base": args.base,
+        "dropout": args.dropout,
         "epoch": args.epochs,
         "best_val": best_val,
         "optimizer": opt.state_dict(),
@@ -788,30 +865,17 @@ def train(args):
     torch.save(ckpt, final_path)
     print(f"[i] saved last → {final_path}")
 
-# --------------------------- # Inference helper # ---------------------------
-@torch.no_grad()
-def load_model(ckpt_path: str, device: Optional[str] = None):
-    ckpt = torch.load(ckpt_path, map_location=device)
-    classes = ckpt.get("classes", ["self", "ally", "enemy"])
-    size = ckpt.get("size", 128)
-    base = ckpt.get("base", 32)
-    net = MiniMapNet(in_ch=3, base=base, out_ch=len(classes))
-    net.load_state_dict(ckpt["model"])
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    net.to(device).eval()
-    return net, classes, size
 
-# ---------------------------
+# ============================================================
 # CLI
-# ---------------------------
+# ============================================================
 
 def build_argparser():
     ap = argparse.ArgumentParser("Train multi-heatmap detector for minimap (Label Studio rectangles)")
     ap.add_argument("--ls_json", type=str, required=True, help="Путь к экспортированному JSON из Label Studio")
     ap.add_argument("--image_root", type=str, default=None, help="Корень, где лежат PNG из экспорта (без префиксов)")
     ap.add_argument("--out_dir", type=str, default="runs/minimap", help="куда писать чекпоинты и debug")
-    ap.add_argument("--size", type=int, default=128, help="размер входа / heatmap (например 100)")
+    ap.add_argument("--size", type=int, default=128, help="размер входа / heatmap")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=40)
@@ -821,25 +885,25 @@ def build_argparser():
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--seed", type=int, default=1337)
 
-    # loss/metrics
     ap.add_argument("--dice_w", type=float, default=0.3)
     ap.add_argument("--dropout", type=float, default=0.1)
+
     ap.add_argument("--thr", type=float, default=0.35)
     ap.add_argument("--radius", type=float, default=6.0)
     ap.add_argument("--nms_kernel", type=int, default=5)
 
-    # shift augmentation (единственная аугментация кроме 90° rotations)
+    ap.add_argument("--pres_thr", type=float, default=0.5,
+                    help="порог по max(prob_map) для presence-классификации")
+
     ap.add_argument("--shift_max", type=int, default=50, help="dx,dy в [-shift_max, shift_max]")
     ap.add_argument("--shift_prob", type=float, default=1.0, help="вероятность применения shift на train")
     ap.add_argument("--shift_border_value", type=int, default=0, help="цвет заполнения при сдвиге (0..255)")
 
-    # debug dump of ALL augmented images
     ap.add_argument("--debug_dump_aug", action="store_true",
                     help="Сохранять все аугментированные train-картинки в out_dir/debug_dump (PNG + JSON)")
     ap.add_argument("--debug_dump_limit", type=int, default=-1,
                     help="Лимит сохранённых картинок (-1 = без лимита)")
 
-    # resume
     ap.add_argument("--resume", type=str, default=None)
     ap.add_argument("--auto_resume", action="store_true")
     ap.add_argument("--strict_resume", action="store_true")

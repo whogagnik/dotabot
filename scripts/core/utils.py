@@ -5,6 +5,8 @@ import win32process
 import ctypes
 from typing import Dict, List, Tuple, Optional, Union
 import logging
+import numpy as np
+import pyautogui as p
 from functools import wraps
 from ctypes import wintypes
 
@@ -74,7 +76,24 @@ def _area(hwnd:int)->int:
         L,T,R,B = win32gui.GetWindowRect(hwnd)
         return max(0,R-L)*max(0,B-T)
     except: return 0
-
+def grab_roi_rgb_from_window(hwnd: int, roi_win: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    """
+    ROI в координатах КЛИЕНТСКОЙ области -> абсолютный экран -> PyAutoGUI screenshot(region).
+    Возвращает ROI в RGB (HxWx3).
+    """
+    cx, cy, cw, ch = client_rect_screen(hwnd)
+    x1, y1, x2, y2 = roi_win
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    sx = cx + x1
+    sy = cy + y1
+    try:
+        shot = p.screenshot(region=(sx, sy, w, h))  # PIL RGB
+        arr = np.array(shot)  # RGB uint8
+        return arr
+    except Exception as e:
+        print("[grab] screenshot failed:", e)
+        return None
 def find_dota_hwnd()->Optional[int]:
     c=[]
     def cb(hwnd,_):

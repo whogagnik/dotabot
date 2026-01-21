@@ -1,4 +1,5 @@
 from scripts.ml.train_hp_seq import *
+import torch.nn.functional as F
 
 #for HudHPSeqNet
 ALPHABET = "0123456789/"
@@ -88,37 +89,98 @@ class HudHPSeqNet(nn.Module):
         logits = self.head(feat).view(-1, self.max_len, NUM_CLASSES)
         return logits
 
-class MiniMapNet(nn.Module):
-    def __init__(self, in_ch=3, base=32, out_ch=3, dropout: float = 0.0):
+class ResBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
         super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
 
-        def block(cin, cout, down=False):
-            k, s, p = (3, 2, 1) if down else (3, 1, 1)
-            return nn.Sequential(
-                nn.Conv2d(cin, cout, k, s, p), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
-                nn.Conv2d(cout, cout, 3, 1, 1), nn.ReLU(inplace=True),
+        self.proj = None
+        if stride != 1 or in_ch != out_ch:
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
             )
 
-        self.enc1 = block(in_ch, base, down=False)
-        self.enc2 = block(base, base * 2, down=True)
-        self.enc3 = block(base * 2, base * 4, down=True)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        out = self.bn2(self.conv2(out))
+        if self.proj is not None:
+            identity = self.proj(identity)
+        out = F.relu(out + identity, inplace=True)
+        return out
 
-        self.dec2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base * 4, base * 2, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-        )
-        self.dec1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(base * 2, base, 3, 1, 1), nn.ReLU(inplace=True),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-        )
-        self.head = nn.Conv2d(base, out_ch, 1)
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+        super().__init__()
+        # после concat(in, skip) -> ResBlock
+        self.block = ResBlock(in_ch + skip_ch, out_ch, stride=1)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.block(x)
+        return x
+
+
+class ResUNetLite(nn.Module):
+    """
+    Нормальный UNet-подобный сегментатор/heatmap детектор:
+      - encoder: ResBlock + stride=2 downsample
+      - decoder: bilinear upsample + skip connections
+      - output: logits CxHxW
+
+
+    """
+    def __init__(self, in_ch: int = 3, base: int = 32, out_ch: int = 3, dropout: float = 0.0):
+        super().__init__()
+        self.stem = ResBlock(in_ch, base)
+
+        self.enc1 = ResBlock(base, base * 2, stride=1)      # 1/2
+        self.enc2 = ResBlock(base * 2, base * 4, stride=1)  # 1/4
+        self.enc3 = ResBlock(base * 4, base * 8, stride=1)  # 1/8
+
+        self.bottleneck = ResBlock(base * 8, base * 8, stride=1)
+
+        self.dec3 = UpBlock(base * 8, base * 4, base * 4)
+        self.dec2 = UpBlock(base * 4, base * 2, base * 2)
+        self.dec1 = UpBlock(base * 2, base, base)
+
+        self.drop = nn.Dropout2d(p=float(dropout)) if dropout and dropout > 0 else nn.Identity()
+        self.head = nn.Conv2d(base, out_ch, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s0 = self.stem(x)      # base
+        s1 = self.enc1(s0)     # base*2
+        s2 = self.enc2(s1)     # base*4
+        s3 = self.enc3(s2)     # base*8
+
+        b = self.bottleneck(s3)
+
+        x = self.dec3(b, s2)
+        x = self.dec2(x, s1)
+        x = self.dec1(x, s0)
+
+        x = self.drop(x)
+        logits = self.head(x)
+        return logits
+
+
+# -----------------------------------------
+# MiniMapNet (оставляем для совместимости)
+# -----------------------------------------
+class ConvBNAct(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, k, stride=s, padding=p, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.act = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x1 = self.enc1(x)
-        x2 = self.enc2(x1)
-        x3 = self.enc3(x2)
-        y2 = self.dec2(x3)
-        y1 = self.dec1(y2)
-        return self.head(y1)
+        return self.act(self.bn(self.conv(x)))
+
+
