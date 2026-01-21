@@ -129,7 +129,7 @@ class UpBlock(nn.Module):
 
 class ResUNetLite(nn.Module):
     """
-    Нормальный UNet-подобный сегментатор/heatmap детектор:
+
       - encoder: ResBlock + stride=2 downsample
       - decoder: bilinear upsample + skip connections
       - output: logits CxHxW
@@ -170,9 +170,6 @@ class ResUNetLite(nn.Module):
         return logits
 
 
-# -----------------------------------------
-# MiniMapNet (оставляем для совместимости)
-# -----------------------------------------
 class ConvBNAct(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
         super().__init__()

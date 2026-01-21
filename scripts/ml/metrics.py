@@ -48,9 +48,6 @@ def metrics_from_confusion(TP: int, FP: int, FN: int, TN: int) -> Dict[str, floa
     }
 
 
-# =========================
-# AUC без sklearn
-# =========================
 def _rankdata_average_ties(values: List[float]) -> List[float]:
     """
     Средние ранги при tie-значениях.
