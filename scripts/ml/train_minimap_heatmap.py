@@ -1,4 +1,4 @@
-# train_minimap_heatmap.py
+# scripts/ml/train_minimap_heatmap.py
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
@@ -58,7 +58,6 @@ def to_tensor(img_rgb: np.ndarray) -> torch.Tensor:
 def resolve_device(device: DeviceLike = None) -> torch.device:
     cuda_ok = torch.cuda.is_available()
 
-    # explicit CPU
     if device is not None:
         if isinstance(device, torch.device):
             if device.type == "cpu":
@@ -68,7 +67,6 @@ def resolve_device(device: DeviceLike = None) -> torch.device:
             if s == "cpu":
                 return torch.device("cpu")
 
-    # otherwise CUDA if possible
     if cuda_ok:
         if device is not None and not isinstance(device, torch.device):
             s = str(device).strip().lower()
@@ -551,22 +549,125 @@ def eval_peaks_batch(
 
 
 # ============================================================
-# Inference helper (как у minimap)
+# Eval: метрики считаем ТОЛЬКО для val/test
 # ============================================================
 
 @torch.no_grad()
-def infer_image(net: nn.Module, img_rgb: np.ndarray, size: int, device: DeviceLike = None) -> np.ndarray:
-    dev = resolve_device(device)
-    img_resized = cv2.resize(img_rgb, (size, size), interpolation=cv2.INTER_AREA)
-    x = to_tensor(img_resized).unsqueeze(0).to(dev)  # 1x3xSxS
+def evaluate_loader(
+    net: nn.Module,
+    loader: DataLoader,
+    classes: List[str],
+    device: torch.device,
+    *,
+    criterion: nn.Module,
+    peaks_thr: float,
+    nms_kernel: int,
+    radius: float,
+    pres_thr: float,
+    desc: str
+) -> Dict[str, Any]:
+    net.eval()
+    total_loss = 0.0
+    n_items = 0
 
-    net = net.eval().to(dev)
-    _assert_same_device(net, x)
+    P_pk_list, R_pk_list = [], []
 
-    logits = net(x)
-    prob = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy().astype(np.float32)
-    return prob
+    pres_true = {c: [] for c in classes}
+    pres_pred = {c: [] for c in classes}
+    pres_score = {c: [] for c in classes}
 
+    for x, y, metas in tqdm(loader, desc=desc):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = net(x)
+        loss = criterion(logits, y)
+        total_loss += float(loss.item()) * x.size(0)
+
+        prob_np = torch.sigmoid(logits).cpu().numpy()  # BxCxHxW
+
+        # peaks
+        Ppk, Rpk = eval_peaks_batch(
+            prob_np, metas, classes,
+            thr=peaks_thr, nms_kernel=nms_kernel, radius=radius
+        )
+        P_pk_list.append(float(Ppk))
+        R_pk_list.append(float(Rpk))
+
+        # presence
+        B, C, _H, _W = prob_np.shape
+        for b in range(B):
+            gt_present = {c: 0 for c in classes}
+            for box in metas[b]["boxes"]:
+                cls = box.get("cls")
+                if cls in gt_present:
+                    gt_present[cls] = 1
+
+            for ci, cname in enumerate(classes):
+                sc = float(prob_np[b, ci].max())
+                pr = 1 if sc >= pres_thr else 0
+                pres_true[cname].append(int(gt_present[cname]))
+                pres_pred[cname].append(int(pr))
+                pres_score[cname].append(float(sc))
+
+        n_items += x.size(0)
+
+    val_loss = total_loss / max(1, n_items)
+    P_peaks = float(np.mean(P_pk_list)) if P_pk_list else 0.0
+    R_peaks = float(np.mean(R_pk_list)) if R_pk_list else 0.0
+
+    lines = []
+    macro_vals = {k: [] for k in ("precision", "recall", "f1", "acc", "bal_acc", "mcc")}
+    macro_rocs = []
+    macro_prs = []
+
+    for cname in classes:
+        TP, FP, FN, TN = confusion_binary(pres_true[cname], pres_pred[cname])
+        m = metrics_from_confusion(TP, FP, FN, TN)
+        roc = roc_auc_score_binary(pres_true[cname], pres_score[cname])
+        pr = pr_auc_score_binary(pres_true[cname], pres_score[cname])
+
+        for k in macro_vals.keys():
+            macro_vals[k].append(float(m[k]))
+        if roc is not None:
+            macro_rocs.append(float(roc))
+        if pr is not None:
+            macro_prs.append(float(pr))
+
+        lines.append(
+            f"{cname}:F1={m['f1']:.3f} P={m['precision']:.3f} R={m['recall']:.3f} "
+            f"Acc={m['acc']:.3f} BalAcc={m['bal_acc']:.3f} MCC={m['mcc']:.3f} "
+            f"ROC-AUC={('nan' if roc is None else f'{roc:.3f}')} "
+            f"PR-AUC={('nan' if pr is None else f'{pr:.3f}')}"
+        )
+
+    def _mean(xs: List[float]) -> float:
+        return float(sum(xs) / max(1, len(xs)))
+
+    macro = {k: _mean(v) for k, v in macro_vals.items()
+             } if macro_vals["f1"] else {k: 0.0 for k in macro_vals.keys()}
+    macro_roc = (_mean(macro_rocs) if len(macro_rocs) > 0 else None)
+    macro_pr = (_mean(macro_prs) if len(macro_prs) > 0 else None)
+
+    lines.append(
+        "macro:"
+        f"F1={macro['f1']:.3f} P={macro['precision']:.3f} R={macro['recall']:.3f} "
+        f"Acc={macro['acc']:.3f} BalAcc={macro['bal_acc']:.3f} MCC={macro['mcc']:.3f} "
+        f"ROC-AUC={('nan' if macro_roc is None else f'{macro_roc:.3f}')} "
+        f"PR-AUC={('nan' if macro_pr is None else f'{macro_pr:.3f}')}"
+    )
+
+    return {
+        "loss": float(val_loss),
+        "P_peaks": P_peaks,
+        "R_peaks": R_peaks,
+        "presence_lines": lines,
+    }
+
+
+# ============================================================
+# load_model helper
+# ============================================================
 
 @torch.no_grad()
 def load_model(ckpt_path: str, device: Optional[str] = None):
@@ -605,10 +706,19 @@ def train(args):
 
     random.shuffle(samples)
     n_total = len(samples)
-    n_val = max(1, int(n_total * args.val_split))
-    n_train = n_total - n_val
-    train_samples = samples[:n_train]
-    val_samples = samples[n_train:]
+
+    # 3-way split: test first, then val from remaining
+    n_test = max(1, int(n_total * args.test_split)) if args.test_split > 0 else 0
+    test_samples = samples[:n_test] if n_test > 0 else []
+    rest = samples[n_test:] if n_test > 0 else samples
+
+    n_rest = len(rest)
+    n_val = max(1, int(n_rest * args.val_split))
+    n_train = n_rest - n_val
+    train_samples = rest[:n_train]
+    val_samples = rest[n_train:]
+
+    print(f"[i] split: total={n_total}  train={len(train_samples)}  val={len(val_samples)}  test={len(test_samples)}")
 
     debug_dump_dir = os.path.join(args.out_dir, "debug_dump") if args.debug_dump_aug else None
 
@@ -623,13 +733,18 @@ def train(args):
         debug_dump_dir=debug_dump_dir,
         debug_dump_limit=args.debug_dump_limit
     )
-
     val_ds = MinimapHeatmapDataset(
         val_samples, classes,
         out_size=args.size,
         augment=False,
         synthetic=False
     )
+    test_ds = MinimapHeatmapDataset(
+        test_samples, classes,
+        out_size=args.size,
+        augment=False,
+        synthetic=False
+    ) if test_samples else None
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -639,6 +754,10 @@ def train(args):
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, collate_fn=collate_keep_meta
     )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, collate_fn=collate_keep_meta
+    ) if test_ds is not None else None
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"[i] Device: {device}")
@@ -717,117 +836,33 @@ def train(args):
 
             tr_loss += loss.item() * x.size(0)
 
-        tr_loss /= len(train_loader.dataset)
+        tr_loss /= max(1, len(train_loader.dataset))
 
-        # validation
-        net.eval()
-        val_loss = 0.0
-        P_pk_list, R_pk_list = [], []
+        # TRAIN: только лосс
+        print(f"[epoch {epoch}] train_loss={tr_loss:.4f}")
 
-        pres_true = {c: [] for c in classes}
-        pres_pred = {c: [] for c in classes}
-        pres_score = {c: [] for c in classes}
-
-        with torch.no_grad():
-            for x, y, metas in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [valid]"):
-                x_dev = x.to(device, non_blocking=True)
-                y_dev = y.to(device, non_blocking=True)
-
-                logits = net(x_dev)
-                loss = criterion(logits, y_dev)
-                val_loss += loss.item() * x.size(0)
-
-                prob_np = torch.sigmoid(logits).cpu().numpy()  # BxCxHxW
-
-                # peaks metrics
-                Ppk, Rpk = eval_peaks_batch(
-                    prob_np, metas, classes,
-                    thr=args.thr, nms_kernel=args.nms_kernel, radius=args.radius
-                )
-                P_pk_list.append(Ppk)
-                R_pk_list.append(Rpk)
-
-                # presence metrics data
-                B, C, _H, _W = prob_np.shape
-                for b in range(B):
-                    gt_present = {c: 0 for c in classes}
-                    for box in metas[b]["boxes"]:
-                        cls = box.get("cls")
-                        if cls in gt_present:
-                            gt_present[cls] = 1
-
-                    for ci, cname in enumerate(classes):
-                        sc = float(prob_np[b, ci].max())
-                        pr = 1 if sc >= args.pres_thr else 0
-                        pres_true[cname].append(int(gt_present[cname]))
-                        pres_pred[cname].append(int(pr))
-                        pres_score[cname].append(float(sc))
-
-        val_loss /= len(val_loader.dataset)
-        Ppk_mean = float(np.mean(P_pk_list)) if P_pk_list else 0.0
-        Rpk_mean = float(np.mean(R_pk_list)) if R_pk_list else 0.0
-
-        pres_lines = []
-        macro_vals = {
-            "precision": [],
-            "recall": [],
-            "f1": [],
-            "acc": [],
-            "bal_acc": [],
-            "mcc": [],
-        }
-        macro_rocs = []
-        macro_prs = []
-
-        for cname in classes:
-            TP, FP, FN, TN = confusion_binary(pres_true[cname], pres_pred[cname])
-            m = metrics_from_confusion(TP, FP, FN, TN)
-
-            roc = roc_auc_score_binary(pres_true[cname], pres_score[cname])
-            pr = pr_auc_score_binary(pres_true[cname], pres_score[cname])
-
-            # --- собираем для macro ---
-            for k in macro_vals.keys():
-                macro_vals[k].append(float(m[k]))
-            if roc is not None:
-                macro_rocs.append(float(roc))
-            if pr is not None:
-                macro_prs.append(float(pr))
-
-            pres_lines.append(
-                f"{cname}:F1={m['f1']:.3f} P={m['precision']:.3f} R={m['recall']:.3f} "
-                f"Acc={m['acc']:.3f} BalAcc={m['bal_acc']:.3f} MCC={m['mcc']:.3f} "
-                f"ROC-AUC={('nan' if roc is None else f'{roc:.3f}')} "
-                f"PR-AUC={('nan' if pr is None else f'{pr:.3f}')}"
-            )
-
-        # --- macro summary ---
-        def _mean(xs):
-            return sum(xs) / max(1, len(xs))
-
-        macro = {k: _mean(v) for k, v in macro_vals.items()}
-        macro_roc = (_mean(macro_rocs) if len(macro_rocs) > 0 else None)
-        macro_pr = (_mean(macro_prs) if len(macro_prs) > 0 else None)
-
-        pres_lines.append(
-            "macro:"
-            f"F1={macro['f1']:.3f} P={macro['precision']:.3f} R={macro['recall']:.3f} "
-            f"Acc={macro['acc']:.3f} BalAcc={macro['bal_acc']:.3f} MCC={macro['mcc']:.3f} "
-            f"ROC-AUC={('nan' if macro_roc is None else f'{macro_roc:.3f}')} "
-            f"PR-AUC={('nan' if macro_pr is None else f'{macro_pr:.3f}')}"
+        # VALID: считаем ВСЕ метрики
+        val_out = evaluate_loader(
+            net, val_loader, classes, device,
+            criterion=criterion,
+            peaks_thr=args.thr,
+            nms_kernel=args.nms_kernel,
+            radius=args.radius,
+            pres_thr=args.pres_thr,
+            desc=f"Epoch {epoch}/{args.epochs} [valid]"
         )
 
         print(
-            f"[epoch {epoch}] train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
-            f"P_peaks={Ppk_mean:.3f} R_peaks={Rpk_mean:.3f}\n"
-            f"[presence@thr={args.pres_thr:.2f}] " + " | ".join(pres_lines)
+            f"[VAL epoch {epoch}] val_loss={val_out['loss']:.4f}  "
+            f"P_peaks={val_out['P_peaks']:.3f} R_peaks={val_out['R_peaks']:.3f}\n"
+            f"[VAL presence@thr={args.pres_thr:.2f}] " + " | ".join(val_out["presence_lines"])
         )
 
-        # save best (по сумме P+R peaks)
-        if (best_r + best_p) < (Rpk_mean + Ppk_mean):
-            best_val = val_loss
-            best_r = Rpk_mean
-            best_p = Ppk_mean
+        # save best (по сумме P+R peaks на val)
+        if (best_r + best_p) < (val_out["R_peaks"] + val_out["P_peaks"]):
+            best_val = float(val_out["loss"])
+            best_r = float(val_out["R_peaks"])
+            best_p = float(val_out["P_peaks"])
             ckpt = {
                 "model": net.state_dict(),
                 "classes": classes,
@@ -844,12 +879,13 @@ def train(args):
             torch.save(ckpt, best_path)
             print(f"[i] saved best → {best_path}")
 
-        sched.step(val_loss)
+        sched.step(val_out["loss"])
         current_lr = opt.param_groups[0]["lr"]
         if last_lr is None or abs(current_lr - last_lr) > 1e-12:
             print(f"[lr] → {current_lr:.6g}")
             last_lr = current_lr
 
+    # save last
     final_path = os.path.join(args.out_dir, "last.pt")
     ckpt = {
         "model": net.state_dict(),
@@ -864,6 +900,27 @@ def train(args):
     }
     torch.save(ckpt, final_path)
     print(f"[i] saved last → {final_path}")
+
+    # FINAL TEST (best)
+    if test_loader is not None:
+        print("[i] Final TEST eval using best checkpoint…")
+        best_net, _classes, _size = load_model(best_path, device=str(device))
+        test_out = evaluate_loader(
+            best_net, test_loader, classes, device,
+            criterion=criterion,
+            peaks_thr=args.thr,
+            nms_kernel=args.nms_kernel,
+            radius=args.radius,
+            pres_thr=args.pres_thr,
+            desc="Final [test]"
+        )
+        print(
+            f"[FINAL TEST] test_loss={test_out['loss']:.4f}  "
+            f"P_peaks={test_out['P_peaks']:.3f} R_peaks={test_out['R_peaks']:.3f}\n"
+            f"[FINAL TEST presence@thr={args.pres_thr:.2f}] " + " | ".join(test_out["presence_lines"])
+        )
+    else:
+        print("[i] test_split=0 -> no test evaluation.")
 
 
 # ============================================================
@@ -881,7 +938,8 @@ def build_argparser():
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--base", type=int, default=32)
-    ap.add_argument("--val_split", type=float, default=0.15)
+    ap.add_argument("--val_split", type=float, default=0.15, help="доля val ОТ ОСТАТКА (после test)")
+    ap.add_argument("--test_split", type=float, default=0.10, help="доля test ОТ ВСЕГО (0 = отключить test)")
     ap.add_argument("--cpu", action="store_true")
     ap.add_argument("--seed", type=int, default=1337)
 
