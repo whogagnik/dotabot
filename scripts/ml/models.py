@@ -140,9 +140,9 @@ class ResUNetLite(nn.Module):
         super().__init__()
         self.stem = ResBlock(in_ch, base)
 
-        self.enc1 = ResBlock(base, base * 2, stride=1)      # 1/2
-        self.enc2 = ResBlock(base * 2, base * 4, stride=1)  # 1/4
-        self.enc3 = ResBlock(base * 4, base * 8, stride=1)  # 1/8
+        self.enc1 = ResBlock(base, base * 2, stride=2)      # 1/2
+        self.enc2 = ResBlock(base * 2, base * 4, stride=2)  # 1/4
+        self.enc3 = ResBlock(base * 4, base * 8, stride=2)  # 1/8
 
         self.bottleneck = ResBlock(base * 8, base * 8, stride=1)
 
