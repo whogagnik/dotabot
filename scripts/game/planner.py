@@ -305,6 +305,8 @@ class Planner:
         self._hk_p_prev_down: bool = False
         self._hk_last_toggle_ts: float = 0.0
         self._hk_toggle_cooldown: float = 0.25  # антидребезг (сек)
+        self._last_center_ts_by_hwnd: Dict[int, float] = {}
+        self._center_cooldown_sec: float = 0.15
 
 
     # --- вспомогательные ---
@@ -312,11 +314,13 @@ class Planner:
     @debug_log_result
     def tick_one(self) -> Dict[int, Snapshot]:
 
-
         self._poll_hotkeys()
-
         out: Dict[int, Snapshot] = {}
         for hwnd in list(self.hwnds):
+            # перед сбором с этого окна всегда жмём F1 (с cooldown)
+            if self.block_input:
+                self.center_screen_on_self(hwnd, force_fg=True)
+
             snap = self.collect_for_hwnd(hwnd)
             if snap is not None:
                 self.last_by_hwnd[hwnd] = snap
@@ -561,6 +565,35 @@ class Planner:
         # возвращаем курсор назад
         if ox is not None and oy is not None:
             win32api.SetCursorPos((ox, oy))
+
+    # ----------------- KEY INPUT -----------------
+    def _press_vk_global(self, vk: int, *, hold_ms: int = 25) -> None:
+        """Глобальный keypress (работает если окно в фокусе)."""
+        win32api.keybd_event(vk, 0, 0, 0)
+        time.sleep(max(0.0, hold_ms) / 1000.0)
+        win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+    def _press_vk_for_hwnd(self, hwnd: int, vk: int, *, hold_ms: int = 25, force_fg: bool = True) -> None:
+        if force_fg:
+            try:
+                _force_foreground(hwnd)
+            except Exception:
+                pass
+        self._press_vk_global(vk, hold_ms=hold_ms)
+
+    def center_screen_on_self(self, hwnd: int, *, force_fg: bool = True, cooldown_sec: Optional[float] = None) -> None:
+        """
+        Центруем камеру на себе через горячую клавишу KEY_FOR_CENTER_SCREEN.
+        Есть per-hwnd cooldown чтобы не спамить каждый тик.
+        """
+        now = time.time()
+        cd = self._center_cooldown_sec if cooldown_sec is None else float(cooldown_sec)
+        last = self._last_center_ts_by_hwnd.get(hwnd, 0.0)
+        if cd > 0 and (now - last) < cd:
+            return
+
+        self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=25, force_fg=force_fg)
+        self._last_center_ts_by_hwnd[hwnd] = now
 
     def _stabilize_creeps_for_hwnd(
             self,
