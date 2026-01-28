@@ -185,6 +185,8 @@ class Brain:
         self._camps_inited: bool = False
         self._camp_reset_minute: int = -1  # для ресета каждую минуту
 
+        self._farming_minimap_click_cooldown: float = 1.0  # сек
+        self._farming_last_minimap_click_ts: float = 0.0
 
         self.min_enemy_dist_px: float = 150.0
         self.max_enemy_dist_px: float = 400.0
@@ -192,12 +194,16 @@ class Brain:
         self._lasthit_target_key: Optional[tuple[str, object]] = None
         self._lasthit_target_expire: float = 0.0  # safety timeout
 
+        # --- attack (screen click) cooldown ---
+        self._attack_click_cooldown: float = 0.4  # сек, подстрой если надо
+        self._last_attack_click_ts: float = 0.0
+
         # --- lasthit / approach tuning ---
         self.lasthit_prepare_hp: float = 0.50  # если крип <= 0.5 -> можно готовиться
         self.lasthit_attack_hp: float = 0.25  # реально добивать при <= 0.25
         self.lasthit_attack_range_px: float = 150.0  # “мы в радиусе удара”
         self.lasthit_max_seek_px: float = 650.0  # дальше не рассматриваем
-        self.lasthit_cmd_cooldown: float = 0.18  # чтобы не спамить клики
+        self.lasthit_cmd_cooldown: float = 0.4  # чтобы не спамить клики
 
         self._manual_switch_last_ts: float = 0.0
         self._digit_prev_down: Dict[int, bool] = {d: False for d in range(1, 10)}
@@ -617,6 +623,37 @@ class Brain:
 
         self._camps = camps
         self._camps_inited = True
+    def _attack_on_screen_throttled(
+        self,
+        x: float,
+        y: float,
+        *,
+        y_offset: int = 10,
+        cooldown: Optional[float] = None,
+    ) -> bool:
+        """
+        Универсальный удар кликом по экрану (крип/герой/что угодно).
+        Есть кулдаун, чтобы не спамить атаки.
+        """
+        now = time.time()
+        cd = self._attack_click_cooldown if cooldown is None else float(cooldown)
+        if now - self._last_attack_click_ts < cd:
+            return False
+
+        self.pl.click_on_screen(self.hwnd, int(x), int(y) + int(y_offset), attack=True)
+        self._last_attack_click_ts = now
+        self.last_action_ts = now
+        return True
+
+    def _minimap_click_throttled(self, x: float, y: float, *, cooldown: Optional[float] = None) -> bool:
+        now = time.time()
+        cd = self._farming_minimap_click_cooldown if cooldown is None else float(cooldown)
+        if now - self._farming_last_minimap_click_ts < cd:
+            return False
+        self.pl.click_minimap_pct(self.hwnd, x, y, attack=False)
+        self._farming_last_minimap_click_ts = now
+        self.last_action_ts = now
+        return True
     def _walk_throttled(self, x: int, y: int, *, cooldown: Optional[float] = None,
                         tol_px: Optional[float] = None, attack: bool = False) -> bool:
         """
@@ -836,72 +873,33 @@ class Brain:
             return False
 
         cx, cy = best_xy
-        self.pl.click_on_screen(self.hwnd, int(cx), int(cy) + 10, attack=True)
-        self.last_action_ts = time.time()
-        return True
+        return self._attack_on_screen_throttled(cx, cy, y_offset=10)
     def goto_nearest_camp(
-            self,
-            c: Dict[str, Any],
-            *,
-            camp_kind: str = "малый",
-            from_pos: Optional[Tuple[float, float]] = None,
-            attack: bool = True,
+        self,
+        c: Dict[str, Any],
+        *,
+        camp_kind: CampKind = CampKind.SMALL,
+        from_pos: Optional[Tuple[float, float]] = None,
+        attack: bool = True,
     ) -> None:
-        """
-        Идём на ближайший кемп заданного вида.
-        Использует данные из текущего combined (c), НЕ из Planner напрямую.
-        """
-
-        # 1) позиция героя
-        cur = self._get_self_uv(c)
-        if cur is None:
-            cur = from_pos if from_pos is not None else (50.0, 50.0)
-
-        # 2) нормализация camp_kind -> key
-        ck = (camp_kind or "").strip().lower()
-        kind_map = {
-            "малый": "small", "small": "small",
-            "средний": "medium", "medium": "medium",
-            "большой": "large", "large": "large",
-        }
-        ck2 = kind_map.get(ck, ck)  # если уже small/medium/large
-        key = f"camp_{ck2}"  # camp_small / camp_medium / camp_large
-
-        root = self._lm_root(c)
-        arr = root.get(key)
-        if not arr:
-            if self.log:
-                self.log.debug(f"[CAMP] no camps for key={key}")
+        cur = self._get_self_uv(c) or (from_pos if from_pos is not None else (50.0, 50.0))
+        # используем уже инициализированные кемпы
+        # (если хочешь — можно дергать _ensure_camps_inited(s) из tick_farming, а тут не надо)
+        best = None
+        best_d2 = 1e18
+        for camp in self._camps:
+            if camp.kind is not camp_kind:
+                continue
+            d2 = _euclid2(cur, (camp.x, camp.y))
+            if d2 < best_d2:
+                best_d2 = d2
+                best = camp
+        if best is None:
             return
+        self.pl.click_minimap_pct(self.hwnd, best.x + 1, best.y + 1, attack=attack)
 
-        # формат: [ [ {x,y}, ... ] ] или просто [ {x,y}, ...]
-        points_raw = arr[0] if isinstance(arr, list) and len(arr) > 0 and isinstance(arr[0], list) else arr
 
-        candidates: List[Tuple[float, float]] = []
-        if isinstance(points_raw, list):
-            for pt in points_raw:
-                try:
-                    candidates.append((float(pt["x"]), float(pt["y"])))
-                except Exception:
-                    continue
 
-        if not candidates:
-            if self.log:
-                self.log.debug(f"[CAMP] empty camps for key={key}")
-            return
-
-        # 3) ближайший по евклиду
-        best = min(candidates, key=lambda p: _euclid2(cur, p))
-        bx, by = best
-
-        # 4) клик по миникарте
-        self.pl.click_minimap_pct(self.hwnd, bx + 1, by + 1, attack=attack)
-
-        if self.log:
-            self.log.debug(
-                f"[CAMP] hwnd={hex(self.hwnd)} kind={ck2} -> ({bx:.1f},{by:.1f}) "
-                f"from=({cur[0]:.1f},{cur[1]:.1f}) attack={attack}"
-            )
 
     @debug_log_result
     def goto_nearest_lane(
@@ -919,7 +917,7 @@ class Brain:
         if cur is None:
             cur = from_pos if from_pos is not None else (50.0, 50.0)
 
-        root = self._lm_root(c)
+        root = self._get_landmarks(c)
         lane_keys = ["lane_top", "lane_mid", "lane_bot"]
 
         candidates: List[Tuple[str, List[Dict[str, float]]]] = []
@@ -974,7 +972,7 @@ class Brain:
         """
         Приоритет: fountain_<side> -> ancient_<side> -> (50,50)
         """
-        root = self._lm_root(c)
+        root = self._get_landmarks(c)
         side = self._get_side()
 
         for key in (f"fountain_{side}", f"ancient_{side}"):
@@ -1369,8 +1367,8 @@ class Brain:
                     f"hp_ratio={creep_hp:.2f}"
                 )
 
-            self.pl.click_on_screen(self.hwnd, int(cx), int(cy) + 10, attack=True)
-
+            if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
+                return
             key = self._make_lasthit_key(cb, cx, cy)
             self._lasthit_target_key = key
             self._lasthit_target_expire = now + 1.5
@@ -1391,12 +1389,7 @@ class Brain:
         self._walk_throttled(tx, ty, cooldown=0.35, tol_px=22.0, attack=False)
 
     def _tick_farming(self, c: Dict[str, Any], s: Senses):
-        # 0) если мало хп — уходим (без доп. логики)
-        if s.low_hp:
-            self._farm_phase = FarmPhase.RETREAT
-            self._farm_target_id = None
-            self.goto_fountain(c)
-            return
+
 
         # 1) кемпы из landmarks, которые уже в senses
         self._ensure_camps_inited(s)
@@ -1435,8 +1428,8 @@ class Brain:
                 return
 
             # просто идём к кемпу по миникарте
-            self.pl.click_minimap_pct(self.hwnd, camp.x, camp.y, attack=False)
-            self.last_action_ts = time.time()
+            self._minimap_click_throttled(camp.x, camp.y)
+
             return
 
     def _tick_fighting(self, c: Dict[str, Any], s: Senses):
