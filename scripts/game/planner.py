@@ -2,10 +2,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from collections import deque
-import os
-
-os.environ["TCL_LIBRARY"] = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tcl8.6"
-os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tk8.6"
 
 import time
 import json

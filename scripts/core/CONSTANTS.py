@@ -1,13 +1,15 @@
 from pathlib import Path
 import ctypes
 from typing import Tuple
+import os
 SANDBOXIE_START_EXE = r"C:\Program Files\Sandboxie-Plus\Start.exe"
 DEFAULT_MAFILES_DIR = Path("mafiles")
 DEFAULT_ML_MINIMAP_DIR = Path("config/minimap.pt")
 DEFAULT_ML_HP_DIR = Path("config/hp.pt")
 DEFAULT_LANDMARKS_DIR = Path("config/minimap_landmarks.json")
 
-
+os.environ["TCL_LIBRARY"] = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tcl8.6"
+os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tk8.6"
 
 HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)   # x1, y1, x2, y2
 GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
