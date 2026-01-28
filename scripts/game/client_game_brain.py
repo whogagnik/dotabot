@@ -81,6 +81,37 @@ def _closest_point_on_polyline(poly: List[Dict[str, float]],
             best_q = (qx, qy)
 
     return best_q[0], best_q[1], best_d2
+from enum import Enum, auto
+from dataclasses import dataclass
+
+class CampKind(Enum):
+    SMALL = auto()
+    MEDIUM = auto()
+    LARGE = auto()
+
+class CampState(Enum):
+    READY = auto()
+    CLEARED = auto()
+
+class FarmPlan(Enum):
+    # “взвешивание”: либо сначала линия (точку добавишь позже) -> лес, либо сразу лес
+    LANE_THEN_JUNGLE = auto()
+    JUNGLE_ONLY = auto()
+
+class FarmPhase(Enum):
+    PICK_TARGET = auto()
+    MOVE_TO_TARGET = auto()
+    FIGHT = auto()
+    RETREAT = auto()
+
+@dataclass
+class CampNode:
+    camp_id: int
+    kind: CampKind
+    x: float          # 0..100
+    y: float          # 0..100
+    state: CampState = CampState.READY
+
 @dataclass
 class Senses:
     alive: bool
@@ -108,6 +139,7 @@ class Senses:
     near_enemy_tower: bool
     enemy_tower_dist_mm: Optional[float]
 
+    landmarks: Optional[Dict[str, Any]]
 
 class BrainState(Enum):
     IDLE = auto()
@@ -142,9 +174,17 @@ class Brain:
         self._moving_radius: float = 5.0  # радиус "достаточно близко" (в тех же единицах)
         self.lane_offset_px: float = 80.0  # насколько пикселей отходить от линии по нормали
 
-        self._laning_fig = None
-        self._laning_ax = None
-        self._laning_last_ts = 0.0  # чтобы не рисовать каждый кадр, а раз в N секунд
+        # --------- FARMING state ---------
+        self.farm_plan: FarmPlan = FarmPlan.JUNGLE_ONLY
+        self.farm_lane_prob: float = 0.35   # шанс выбрать LANE_THEN_JUNGLE (если линия будет задана)
+
+        self._farm_phase: FarmPhase = FarmPhase.PICK_TARGET
+        self._farm_target_id: Optional[int] = None
+
+        self._camps: list[CampNode] = []
+        self._camps_inited: bool = False
+        self._camp_reset_minute: int = -1  # для ресета каждую минуту
+
 
         self.min_enemy_dist_px: float = 150.0
         self.max_enemy_dist_px: float = 400.0
@@ -307,7 +347,9 @@ class Brain:
 
             near_enemy_tower=near_enemy_tower,
             enemy_tower_dist_mm=enemy_tower_dist_mm,
+            landmarks=c.get("landmarks").get('data')
         )
+
 
     @staticmethod
     @debug_log_result
@@ -539,6 +581,42 @@ class Brain:
         except Exception:
             return None
 
+    def _ensure_camps_inited(self, s: Senses) -> None:
+        if self._camps_inited:
+            return
+
+        root = s.landmarks
+
+        key_to_kind = {
+            "camp_small": CampKind.SMALL,
+            "camp_medium": CampKind.MEDIUM,
+            "camp_large": CampKind.LARGE,
+        }
+
+        camps: list[CampNode] = []
+        cid = 0
+
+        for key, kind in key_to_kind.items():
+            arr = root.get(key)
+            if not arr:
+                continue
+
+            # ожидаем формат как у тебя в landmarks: либо [[{x,y},...]] либо [{x,y},...]
+            points_raw = arr[0] if isinstance(arr, list) and arr and isinstance(arr[0], list) else arr
+            if not isinstance(points_raw, list):
+                continue
+
+            for pt in points_raw:
+                try:
+                    x = float(pt["x"])
+                    y = float(pt["y"])
+                except Exception:
+                    continue
+                camps.append(CampNode(camp_id=cid, kind=kind, x=x, y=y, state=CampState.READY))
+                cid += 1
+
+        self._camps = camps
+        self._camps_inited = True
     def _walk_throttled(self, x: int, y: int, *, cooldown: Optional[float] = None,
                         tol_px: Optional[float] = None, attack: bool = False) -> bool:
         """
@@ -686,14 +764,12 @@ class Brain:
         self._lasthit_target_key = None
         return False
 
-    def _lm_root(self, c: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_landmarks(self, c: Dict[str, Any]) -> Dict[str, Any]:
         """
         Возвращает словарь landmarks['data'] если есть, иначе весь landmarks.
         """
-        lm = c.get("landmarks") or {}
-        if isinstance(lm, dict) and "data" in lm and isinstance(lm["data"], dict):
-            return lm["data"]
-        return lm if isinstance(lm, dict) else {}
+        lm = c.get("landmarks")
+        return lm
 
     def _get_side(self) -> str:
         """
@@ -703,6 +779,66 @@ class Brain:
         return str(side).lower().strip()
 
     @debug_log_result
+    def _reset_camps_if_needed(self, t_game: float) -> None:
+        minute = int(max(0.0, float(t_game)) // 60.0)
+        if minute == self._camp_reset_minute:
+            return
+        self._camp_reset_minute = minute
+        for camp in self._camps:
+            camp.state = CampState.READY
+
+    def _get_camp_by_id(self, camp_id: Optional[int]) -> Optional[CampNode]:
+        if camp_id is None:
+            return None
+        for camp in self._camps:
+            if camp.camp_id == camp_id:
+                return camp
+        return None
+
+    def _pick_next_ready_camp(self, c: Dict[str, Any], *, kind: Optional[CampKind] = None) -> Optional[CampNode]:
+        if not self._camps:
+            return None
+        cur = self._get_self_uv(c) or (50.0, 50.0)
+
+        best = None
+        best_d2 = 1e18
+        for camp in self._camps:
+            if camp.state is CampState.CLEARED:
+                continue
+            if kind is not None and camp.kind is not kind:
+                continue
+            d2 = _euclid2(cur, (camp.x, camp.y))
+            if d2 < best_d2:
+                best_d2 = d2
+                best = camp
+        return best
+
+    def _attack_enemy_creep_on_screen(self, c: Dict[str, Any]) -> bool:
+        heroes = c.get("heroes", {})
+        creeps = c.get("creeps", {})
+        self_heroes = heroes.get("self", [])
+        enemy_creeps = creeps.get("enemy", [])
+        if not self_heroes or not enemy_creeps:
+            return False
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+
+        best_xy = None
+        best_d2 = 1e18
+        for cb in enemy_creeps:
+            cx, cy = self._hpbar_center(cb)
+            d2 = (cx - hx) * (cx - hx) + (cy - hy) * (cy - hy)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_xy = (cx, cy)
+
+        if best_xy is None:
+            return False
+
+        cx, cy = best_xy
+        self.pl.click_on_screen(self.hwnd, int(cx), int(cy) + 10, attack=True)
+        self.last_action_ts = time.time()
+        return True
     def goto_nearest_camp(
             self,
             c: Dict[str, Any],
@@ -1255,7 +1391,53 @@ class Brain:
         self._walk_throttled(tx, ty, cooldown=0.35, tol_px=22.0, attack=False)
 
     def _tick_farming(self, c: Dict[str, Any], s: Senses):
-        pass
+        # 0) если мало хп — уходим (без доп. логики)
+        if s.low_hp:
+            self._farm_phase = FarmPhase.RETREAT
+            self._farm_target_id = None
+            self.goto_fountain(c)
+            return
+
+        # 1) кемпы из landmarks, которые уже в senses
+        self._ensure_camps_inited(s)
+        self._reset_camps_if_needed(s.t_game)
+
+        # если кемпов нет — нечего делать
+        if not self._camps:
+            return
+
+        # 2) если на экране есть enemy creeps — фармим/убиваем
+        if s.enemy_creep_near:
+            self._farm_phase = FarmPhase.FIGHT
+            self._attack_enemy_creep_on_screen(c)
+            return
+
+        # 3) если мы были в FIGHT, а крипов теперь нет — кемп зафармлен
+        if self._farm_phase is FarmPhase.FIGHT:
+            camp = self._get_camp_by_id(self._farm_target_id)
+            if camp is not None:
+                camp.state = CampState.CLEARED
+            self._farm_target_id = None
+            self._farm_phase = FarmPhase.PICK_TARGET
+
+        # 4) выбрать следующий кемп и идти на него
+        if self._farm_phase is FarmPhase.PICK_TARGET:
+            nxt = self._pick_next_ready_camp(c)  # ближайший READY
+            if nxt is None:
+                return
+            self._farm_target_id = nxt.camp_id
+            self._farm_phase = FarmPhase.MOVE_TO_TARGET
+
+        if self._farm_phase is FarmPhase.MOVE_TO_TARGET:
+            camp = self._get_camp_by_id(self._farm_target_id)
+            if camp is None:
+                self._farm_phase = FarmPhase.PICK_TARGET
+                return
+
+            # просто идём к кемпу по миникарте
+            self.pl.click_minimap_pct(self.hwnd, camp.x, camp.y, attack=False)
+            self.last_action_ts = time.time()
+            return
 
     def _tick_fighting(self, c: Dict[str, Any], s: Senses):
         pass
