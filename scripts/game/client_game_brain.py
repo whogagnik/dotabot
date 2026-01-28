@@ -216,6 +216,12 @@ class Brain:
         self._last_walk_ts: float = 0.0
         self._last_walk_target: Optional[Tuple[int, int]] = None
 
+        # --- LANING orientation ---
+        self._lane_inited: bool = False
+        self._lane_key: Optional[str] = None          # "lane_top" / "lane_mid" / "lane_bot"
+        self._lane_anchor_uv: Optional[Tuple[float, float]] = None  # точка 0..100 на линии у Т1
+
+
 
     # --------- публичный метод ---------
     def tick_one(self, snap: "Snapshot"):
@@ -383,31 +389,49 @@ class Brain:
     @staticmethod
     @debug_log_result
     def _compromise_line(
-        points_a: np.ndarray,
-        points_e: np.ndarray,
+            points_a: np.ndarray,
+            points_e: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         A — "наши" точки, E — "вражеские".
-
-        Возвращает:
-          mid  — точка на разделяющей прямой (середина между центрами масс)
-          d    — направление прямой (перпендикуляр к нормали)
-          n    — нормаль из A в E (юнит-вектор)
-          c_a  — центр масс A
-          c_e  — центр масс E
+        Работает даже если один из наборов пустой.
         """
-        c_a = points_a.mean(axis=0)
-        c_e = points_e.mean(axis=0)
+
+        # приведение к форме (N,2)
+        if points_a is None:
+            points_a = np.zeros((0, 2), dtype=np.float32)
+        if points_e is None:
+            points_e = np.zeros((0, 2), dtype=np.float32)
+
+        if points_a.ndim != 2 or points_a.shape[1] != 2:
+            points_a = np.zeros((0, 2), dtype=np.float32)
+        if points_e.ndim != 2 or points_e.shape[1] != 2:
+            points_e = np.zeros((0, 2), dtype=np.float32)
+
+        # fallback центры
+        if points_a.shape[0] == 0 and points_e.shape[0] == 0:
+            c_a = np.array([0.0, 0.0], dtype=np.float32)
+            c_e = np.array([0.0, 1.0], dtype=np.float32)
+        elif points_a.shape[0] == 0:
+            c_e = points_e.mean(axis=0).astype(np.float32)
+            c_a = (c_e + np.array([0.0, -1.0], dtype=np.float32)).astype(np.float32)
+        elif points_e.shape[0] == 0:
+            c_a = points_a.mean(axis=0).astype(np.float32)
+            c_e = (c_a + np.array([0.0, 1.0], dtype=np.float32)).astype(np.float32)
+        else:
+            c_a = points_a.mean(axis=0).astype(np.float32)
+            c_e = points_e.mean(axis=0).astype(np.float32)
 
         n = c_e - c_a
-        if np.allclose(n, 0):
+        if float(np.linalg.norm(n)) < 1e-6:
             n = np.array([0.0, 1.0], dtype=np.float32)
-        n = n / np.linalg.norm(n)
+        else:
+            n = (n / np.linalg.norm(n)).astype(np.float32)
 
-        mid = 0.5 * (c_a + c_e)
+        mid = (0.5 * (c_a + c_e)).astype(np.float32)
         d = np.array([-n[1], n[0]], dtype=np.float32)
 
-        return mid.astype(np.float32), d, n, c_a.astype(np.float32), c_e.astype(np.float32)
+        return mid, d, n, c_a, c_e
 
     @debug_log_result
     def _compute_dist_to_enemy_hero(self, s: Senses) -> float:
@@ -683,12 +707,9 @@ class Brain:
         self._last_walk_target = (int(x), int(y))
         self.last_action_ts = now
         return True
+
     @debug_log_result
     def _compute_laning_point(self, c: Dict[str, Any], min_dist_to_enemy: float) -> Optional[tuple[int, int]]:
-        """
-        Возвращает экранную точку (КЛИЕНТСКИЕ координаты),
-        куда хотим кликать при лайнинге.
-        """
         heroes = c.get("heroes", {})
         creeps = c.get("creeps", {})
 
@@ -698,17 +719,29 @@ class Brain:
         ally_creeps = creeps.get("ally", [])
         enemy_creeps = creeps.get("enemy", [])
 
-        if not self_list or len(ally_creeps) < 2 or len(enemy_creeps) < 2:
+        if not self_list:
             return None
 
-        ally_creep_pts = np.array([self._hpbar_center(cb) for cb in ally_creeps], dtype=np.float32)
-        enemy_creep_pts = np.array([self._hpbar_center(cb) for cb in enemy_creeps], dtype=np.float32)
-
-        if ally_creep_pts.shape[0] < 2 or enemy_creep_pts.shape[0] < 2:
+        # союзные крипы обязательны (хотя бы 1), иначе пусть решает tick_laning ("просто бить крипов")
+        if len(ally_creeps) < 1:
             return None
 
-        mid_all, d_all, n_all, cA_all, cE_all = self._compromise_line(ally_creep_pts, enemy_creep_pts)
+        ally_pts = np.array([self._hpbar_center(cb) for cb in ally_creeps], dtype=np.float32)
+        if ally_pts.shape[0] == 0:
+            return None
 
+        # enemy точки: сначала enemy creeps, если их нет — enemy heroes, если и их нет — пусто
+        if len(enemy_creeps) >= 1:
+            enemy_pts = np.array([self._hpbar_center(cb) for cb in enemy_creeps], dtype=np.float32)
+        elif len(enemy_heroes) >= 1:
+            enemy_pts = np.array([self._hpbar_center(b) for b in enemy_heroes], dtype=np.float32)
+        else:
+            enemy_pts = np.zeros((0, 2), dtype=np.float32)
+
+        # общая линия "all"
+        mid_all, d_all, n_all, cA_all, cE_all = self._compromise_line(ally_pts, enemy_pts)
+
+        # лидеры (как было)
         leaders_ally_boxes = [self_list[0]] + list(ally_heroes)
         leaders_enemy_boxes = list(enemy_heroes)
 
@@ -734,16 +767,18 @@ class Brain:
         t_proj = float(np.dot(vec_to_A, mix_dir))
         base_point = mid_third + mix_dir * t_proj
 
-        proj_allies = ally_creep_pts @ n_all
-        proj_enemies = enemy_creep_pts @ n_all
-
+        # фронт союзных крипов по нормали
+        proj_allies = ally_pts @ n_all
         front_allies = float(np.max(proj_allies))
         s_behind_allies = front_allies - float(self.lane_offset_px)
 
+        # ограничение "дальше от врага" только если есть enemy точки
         s_far_from_enemy = None
-        if proj_enemies.size > 0:
-            front_enemy = float(np.min(proj_enemies))
-            s_far_from_enemy = front_enemy - float(min_dist_to_enemy)
+        if enemy_pts.shape[0] > 0:
+            proj_enemies = enemy_pts @ n_all
+            if proj_enemies.size > 0:
+                front_enemy = float(np.min(proj_enemies))
+                s_far_from_enemy = front_enemy - float(min_dist_to_enemy)
 
         s_base = float(np.dot(base_point, n_all))
         s_target = s_behind_allies
@@ -756,6 +791,81 @@ class Brain:
         tx = float(target[0])
         ty = float(target[1])
         return int(round(tx)), int(round(ty))
+
+
+    def _closest_point_to_polyline_uv(
+        self,
+        poly: List[Dict[str, float]],
+        p: Tuple[float, float],
+    ) -> Optional[Tuple[float, float]]:
+        if not poly:
+            return None
+        qx, qy, _ = _closest_point_on_polyline(poly, p)
+        return float(qx), float(qy)
+
+    def _pick_nearest_lane_key(self, s: Senses, cur_uv: Tuple[float, float]) -> Optional[str]:
+        root = s.landmarks or {}
+        best_key = None
+        best_d2 = 1e18
+
+        for key in ("lane_top", "lane_mid", "lane_bot"):
+            arr = root.get(key)
+            if not (isinstance(arr, list) and arr and isinstance(arr[0], list) and arr[0]):
+                continue
+            poly = arr[0]
+            q = self._closest_point_to_polyline_uv(poly, cur_uv)
+            if q is None:
+                continue
+            d2 = _euclid2(cur_uv, q)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_key = key
+
+        return best_key
+
+    def _build_lane_anchor_near_t1(self, c: Dict[str, Any], s: Senses, lane_key: str) -> Optional[Tuple[float, float]]:
+        """
+        Точка на lane_key (0..100) ближайшая к нашей ближайшей ally T1.
+        """
+        root = s.landmarks or {}
+        arr = root.get(lane_key)
+        if not (isinstance(arr, list) and arr and isinstance(arr[0], list) and arr[0]):
+            return None
+        poly = arr[0]
+
+        # Берём ближайшую ally T1 из c.towers (tier==1 или tier отсутствует)
+        towers = c.get("towers", {}).get("ally", []) or []
+        if not towers:
+            return None
+
+        t1 = []
+        for t in towers:
+            tier = t.get("tier", None)
+            if tier is None or tier == 1:
+                t1.append(t)
+        if not t1:
+            t1 = towers
+
+        # позиция героя нужна только чтобы выбрать ближайшую T1
+        cur = self._get_self_uv(c) or (50.0, 50.0)
+
+        best_t = None
+        best_d2 = 1e18
+        for t in t1:
+            try:
+                tx, ty = float(t["x"]), float(t["y"])
+            except Exception:
+                continue
+            d2 = _euclid2(cur, (tx, ty))
+            if d2 < best_d2:
+                best_d2 = d2
+                best_t = (tx, ty)
+
+        if best_t is None:
+            return None
+
+        q = self._closest_point_to_polyline_uv(poly, best_t)
+        return q
 
     @debug_log_result
     def _make_lasthit_key(self, cb, cx: float, cy: float) -> tuple[str, object]:
@@ -1030,20 +1140,23 @@ class Brain:
         self.pl.click_minimap_pct(self.hwnd, best[0] + 1, best[1] + 1, attack=attack)
 
     @debug_log_result
-    def _select_lasthit_creep(
-        self,
-        c: Dict[str, Any],
-        *,
-        hp_threshold: float = 0.25,
-        max_dist_px: float = 550.0,
+    def _select_creep(
+            self,
+            c: Dict[str, Any],
+            *,
+            enemy: bool = True,
+            hp_threshold: float = 0.25,
+            max_dist_px: float = 550.0,
     ):
         heroes = c.get("heroes", {})
         creeps = c.get("creeps", {})
 
         self_heroes = heroes.get("self", [])
-        enemy_creeps = creeps.get("enemy", [])
+        if not self_heroes:
+            return None
 
-        if not self_heroes or not enemy_creeps:
+        creep_list = creeps.get("enemy" if enemy else "ally", [])
+        if not creep_list:
             return None
 
         hx, hy = self._hpbar_center(self_heroes[0])
@@ -1054,7 +1167,7 @@ class Brain:
 
         max_d2 = max_dist_px * max_dist_px
 
-        for cb in enemy_creeps:
+        for cb in creep_list:
             hp_ratio = getattr(cb, "hp_ratio", None)
             if hp_ratio is None:
                 continue
@@ -1300,6 +1413,14 @@ class Brain:
           3) если подходящих крипов нет — занимаем позицию по линии.
         """
         now = time.time()
+        # если союзных крипов нет — не позиционируемся, просто бьём enemy creeps (если есть)
+        ally_creeps = c.get("creeps", {}).get("ally", [])
+        if len(ally_creeps) == 0:
+            if s.enemy_creep_near:
+                # бей ближайшего (желательно через твою _attack_on_screen_throttled)
+                # можно использовать твою _attack_enemy_creep_on_screen, но лучше с cooldown:
+                self._attack_enemy_creep_on_screen(c)  # или заменишь на _attack_on_screen_throttled внутри
+            return
 
         # --- 1) если уже атакуем цель — ждём её смерти ---
         if self._lasthit_target_key is not None:
@@ -1311,9 +1432,27 @@ class Brain:
                 if self.log:
                     self.log.debug("[BRAIN] lasthit: target gone, resume laning")
                 self._lasthit_target_key = None
+        # --- 1.5) ориентация в начале: выбрать линию и точку у T1, встать туда ---
+        if not self._lane_inited:
+            cur_uv = self._get_self_uv(c) or (50.0, 50.0)
+            lane_key = self._pick_nearest_lane_key(s, cur_uv)
+            if lane_key is not None:
+                anchor = self._build_lane_anchor_near_t1(c, s, lane_key)
+                if anchor is not None:
+                    self._lane_key = lane_key
+                    self._lane_anchor_uv = anchor
+                    self._lane_inited = True
+
+        # Если крипы ещё не видны, просто стоим на линии у T1 (любая из 3)
+        # (без лишней логики: пока нет крипов -> идём к якорю)
+        if (not s.enemy_creep_near) and (not s.ally_creep_near):
+            if self._lane_anchor_uv is not None:
+                ax, ay = self._lane_anchor_uv
+                self._minimap_click_throttled(ax, ay)   # уже с cooldown
+            return
 
         # --- 2) ищем крипа на ластхит ---
-        lasthit_candidate = self._select_lasthit_creep(c, hp_threshold=0.5)
+        lasthit_candidate = self._select_creep(c, hp_threshold=0.5,enemy=True)
         if lasthit_candidate is not None:
             cb, cx, cy = lasthit_candidate
             creep_hp = float(getattr(cb, "hp_ratio", 1.0))
@@ -1369,6 +1508,57 @@ class Brain:
 
             if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
                 return
+            key = self._make_lasthit_key(cb, cx, cy)
+            self._lasthit_target_key = key
+            self._lasthit_target_expire = now + 1.5
+            self.last_action_ts = now
+            return
+        # --- 2.5) DENY: добивание своих (аналогично ластхиту) ---
+        deny_candidate = self._select_creep(c, hp_threshold=0.3)
+        if deny_candidate is not None:
+            cb, cx, cy = deny_candidate
+            creep_hp = float(getattr(cb, "hp_ratio", 1.0))
+
+            heroes = c.get("heroes", {})
+            self_heroes = heroes.get("self", [])
+            if self_heroes:
+                hx, hy = self._hpbar_center(self_heroes[0])
+                dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
+            else:
+                dist = 9999.0
+
+            # allow — используем ту же эвристику сближения (без доп. логики)
+            enemy_cnt = s.enemy_hero_cnt_screen
+            avg_enemy_hp = s.avg_enemy_hero_hp_ratio_screen
+
+            allow = self._should_approach_for_lasthit(
+                s,
+                creep_hp=creep_hp,
+                dist_to_creep_px=dist,
+                enemy_hero_cnt_near=enemy_cnt,
+                avg_enemy_hp=avg_enemy_hp,
+            )
+
+            if not allow:
+                return
+
+            attack_dist_px = 260.0
+
+            if dist > attack_dist_px:
+                self._walk_throttled(
+                    int(cx), int(cy) + 10,
+                    cooldown=self.lasthit_cmd_cooldown,
+                    tol_px=14.0,
+                    attack=False
+                )
+                return
+
+            # удар по своему крипу (deny) — через общий cooldown
+            if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
+                return
+
+            # можно использовать тот же механизм "ждём смерти цели",
+            # чтобы не спамить новую цель каждую миллисекунду
             key = self._make_lasthit_key(cb, cx, cy)
             self._lasthit_target_key = key
             self._lasthit_target_expire = now + 1.5
@@ -1498,7 +1688,7 @@ class Brain:
             return
 
         self._moving_point = (tx, ty)
-        self._set_state(BrainState.MOVING)
+
 
         if self.log:
             self.log.debug(
