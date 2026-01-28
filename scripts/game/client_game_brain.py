@@ -1456,11 +1456,13 @@ class Brain:
             return
 
         towers = c.get("towers", {}).get("ally", [])
+
         if not towers:
             return
 
         t1_list = []
         for t in towers:
+
             tier = t.get("tier", None)
             if tier is None or tier == 1:
                 t1_list.append(t)
@@ -1483,7 +1485,7 @@ class Brain:
 
         if close_any:
             if self.log:
-                self.log.debug(f"[BRAIN {hex(self.hwnd)}] WAIT_START: already near T1")
+                self.log.info(f"[BRAIN {hex(self.hwnd)}] WAIT_START: already near T1")
             return
 
         import random

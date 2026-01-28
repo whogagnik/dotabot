@@ -26,7 +26,7 @@ import win32con
 # === NN и пики ===
 
 from scripts.ml.infer import find_peaks_per_channel,infer_one_minimap,load_minimap_model
-from scripts.vision.tower_detector import TowerVisibilityTracker  # type: ignore
+from scripts.vision.tower_detector import TowerVisibilityTracker,load_landmarks  # type: ignore
 
 from scripts.game.client_game_brain import Brain
 
@@ -271,7 +271,16 @@ class Planner:
 
         # башни (используй свою реализацию внутри tower_decetor.py)
         # Ожидается интерфейс update(mm_rgb, now_s, side) -> dict с ally/enemy и полями alive/last_seen/tier/flags
-        self.tower_tracker = TowerVisibilityTracker(radiant_towers=self.landmarks['data']['tower_radiant'][0], dire_towers=self.landmarks['data']['tower_dire'][0])
+        radiant_pts, dire_pts, ancient_r, ancient_d, lanes = load_landmarks(DEFAULT_LANDMARKS_DIR)
+
+        self.tower_tracker  = TowerVisibilityTracker(
+            radiant_pts, dire_pts,
+            radiant_ancient=ancient_r,
+            dire_ancient=ancient_d,
+            lanes=lanes,
+            timeout_sec=TIMEOUT_SEC_TOWER_DETECTOR,
+            color_radius=COLOR_RADIUS_TOWER_DETECTOR
+        )
 
         # NN
         self.net, self.classes, self.size = load_minimap_model(DEFAULT_ML_MINIMAP_DIR, device='cuda')

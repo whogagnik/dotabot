@@ -16,6 +16,9 @@ GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
 LEVEL_ROI: Tuple[int, int, int, int] = (360, 500, 390, 530)
 TIME_ROI:  Tuple[int, int, int, int] = (880, 15, 1020, 45)
 
+#tower_detectore
+TIMEOUT_SEC_TOWER_DETECTOR = 60.0
+COLOR_RADIUS_TOWER_DETECTOR = 3
 
 KEY_FOR_CENTER_SCREEN = 0x70  # VK_F1 (по умолчанию)
 #(mm) - minimap

@@ -28,21 +28,17 @@ import time
 import math
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Union
-
+from scripts.core.CONSTANTS import *
 import numpy as np
 import cv2
 import pyautogui as p
 
 # ------------------ Константы ------------------
 
-JSON_PATH = r"../../config/minimap_landmarks.json"  # ЖЁСТКИЙ путь
-MINIMAP_W = 100
-MINIMAP_H = 100
-DX = 4  # смещение от правого края внутрь
-DY = 4  # смещение от нижнего края вверх
 
-TIMEOUT_SEC = 60.0
-COLOR_RADIUS = 3
+
+
+
 
 RGB_GREEN = (0, 255, 0)  # союзники на миникарте
 RGB_RED   = (255, 0, 0)  # враги на миникарте
@@ -128,27 +124,31 @@ class TowerState:
     tier: int                  # 1..4
     alive: bool = False
     visible_now: bool = False
+    lane: Optional[str] = None  # "top"|"mid"|"bot"|None
     inferred: bool = False
     last_seen: float = -1.0    # -1: ни разу не видели
 
 class TowerVisibilityTracker:
-    """
-    Трек видимости башен 100x100.
-    Если в исходных точках нет tier — проставляет автоматически:
-      ближе к центру → меньший тир (T1), дальше → больший тир (T4),
-      раскладка T1×3, T2×3, T3×3, T4×2 (если 11 точек). Иначе — квартильное разбиение.
-    """
-
     def __init__(self,
                  radiant_towers: List[TowerInput],
                  dire_towers: List[TowerInput],
                  *,
-                 timeout_sec: float = TIMEOUT_SEC,
-                 color_radius: int = COLOR_RADIUS):
+                 radiant_ancient: Optional[Tuple[int,int]] = None,
+                 dire_ancient: Optional[Tuple[int,int]] = None,
+                 lanes: Optional[Dict[str, List[Tuple[int,int]]]] = None,
+                 timeout_sec: float = TIMEOUT_SEC_TOWER_DETECTOR,
+                 color_radius: int = COLOR_RADIUS_TOWER_DETECTOR,):
         self.timeout_sec = float(timeout_sec)
         self.radius = int(color_radius)
-        self.radiant = self._normalize_towers(radiant_towers)
-        self.dire    = self._normalize_towers(dire_towers)
+
+        # вот это должно быть ДО _normalize_towers
+        self.lanes = lanes or {}
+        self.radiant_ancient = radiant_ancient
+        self.dire_ancient = dire_ancient
+
+        self.radiant = self._normalize_towers(radiant_towers, side="radiant")
+        self.dire    = self._normalize_towers(dire_towers, side="dire")
+
 
     # ---------- нормализация входа ----------
 
@@ -170,52 +170,101 @@ class TowerVisibilityTracker:
         else:
             raise ValueError(f"Unsupported tower item: {item}")
 
-    @staticmethod
-    def _dist_from_center(x: int, y: int) -> float:
-        return math.hypot(x - 50.0, y - 50.0)
+    def _dist(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
 
-    def _infer_tiers_by_distance(self, pts: List[Tuple[int,int]]) -> List[int]:
+    def _closest_lane(self, pt: Tuple[int, int], lanes: Dict[str, List[Tuple[int, int]]]) -> Optional[str]:
+        # проще и достаточно точно: минимальная дистанция до точек полилинии
+        best_lane, best_d = None, 1e9
+        for name, poly in lanes.items():
+            if not poly:
+                continue
+            d = min(self._dist(pt, p) for p in poly)
+            if d < best_d:
+                best_d, best_lane = d, name
+        return best_lane
+
+    def _infer_tiers_by_ancient_and_lanes(
+            self,
+            pts: List[Tuple[int, int]],
+            ancient_xy: Tuple[int, int],
+            lanes: Dict[str, List[Tuple[int, int]]],
+    ) -> Tuple[List[int], List[Optional[str]]]:
+        """
+        Возвращает tiers и lane для каждой точки.
+        Правило:
+          - 2 ближайшие к ancient -> T4
+          - остальные 9: по lane (top/mid/bot), в lane по расстоянию к ancient:
+                ближе -> T3, средняя -> T2, дальняя -> T1
+        """
         n = len(pts)
-        dists = [(self._dist_from_center(x, y), i) for i, (x, y) in enumerate(pts)]
-        dists.sort(key=lambda t: t[0])  # ближе к центру — раньше
-        tiers = [0]*n
-        if n == 11:
-            idx = [i for _, i in dists]
-            # T1: 3 ближайшие; T2: следующие 3; T3: следующие 3; T4: 2 самые дальние
-            for i in idx[0:3]:   tiers[i]=1
-            for i in idx[3:6]:   tiers[i]=2
-            for i in idx[6:9]:   tiers[i]=3
-            for i in idx[9:11]:  tiers[i]=4
-        else:
-            # квартильное разбиение
-            vals = [d for d,_ in dists]
-            def q(p):
-                k = (n - 1) * p
-                f = math.floor(k); c = math.ceil(k)
-                if f == c: return vals[f]
-                return vals[f] + (vals[c]-vals[f])*(k-f)
-            q1, q2, q3 = q(0.25), q(0.50), q(0.75)
-            for d,i in dists:
-                tiers[i] = 1 if d <= q1 else 2 if d <= q2 else 3 if d <= q3 else 4
-        return tiers
+        tiers = [0] * n
+        lanes_out: List[Optional[str]] = [None] * n
 
-    def _normalize_towers(self, items: List[TowerInput]) -> List[TowerState]:
+        # 1) T4
+        by_anc = sorted([(self._dist(p, ancient_xy), i) for i, p in enumerate(pts)], key=lambda x: x[0])
+        t4_idx = [i for _, i in by_anc[:2]]
+        for i in t4_idx:
+            tiers[i] = 4
+
+        # 2) lane assign для остальных
+        rest = [i for i in range(n) if tiers[i] == 0]
+        for i in rest:
+            lanes_out[i] = self._closest_lane(pts[i], lanes)
+
+        # 3) по каждой lane раздать T3/T2/T1
+        for lane_name in ("top", "mid", "bot"):
+            idxs = [i for i in rest if lanes_out[i] == lane_name]
+            if len(idxs) != 3:
+                # fallback: если lane не распозналась ровно на 3 точки
+                continue
+            idxs.sort(key=lambda i: self._dist(pts[i], ancient_xy))  # ближе к ancient — "внутрь"
+            tiers[idxs[0]] = 3
+            tiers[idxs[1]] = 2
+            tiers[idxs[2]] = 1
+
+        # 4) если что-то не распределилось (редко), fallback по расстоянию к ancient
+        unresolved = [i for i in range(n) if tiers[i] == 0]
+        if unresolved:
+            unresolved.sort(key=lambda i: self._dist(pts[i], ancient_xy))
+            # ближе к ancient -> больше tier (3..1)
+            # просто добиваем по убыванию "внутренности"
+            # (обычно сюда не попадаешь, если lane_* корректные)
+            for j, i in enumerate(unresolved):
+                # j=0 ближе всего => T3
+                tiers[i] = 3 if j == 0 else 2 if j == 1 else 1
+
+        return tiers, lanes_out
+
+    def _normalize_towers(self, items: List[TowerInput], side: str) -> List[TowerState]:
         parsed = [self._to_xy_t(it) for it in items]
+        pts = [(x, y) for (x, y, _) in parsed]
+
+        # если tiers не заданы — пытаемся “правильно” вывести
         if any(t is None for *_, t in parsed):
-            pts = [(x,y) for (x,y,_) in parsed]
-            inferred = self._infer_tiers_by_distance(pts)
+            ancient = self.radiant_ancient if side == "radiant" else self.dire_ancient
+
+
+            inferred_tiers, inferred_lanes = self._infer_tiers_by_ancient_and_lanes(
+                    pts, ancient_xy=ancient, lanes=self.lanes
+                )
+
+
             out = []
-            for idx, (x,y,t) in enumerate(parsed):
-                tier = inferred[idx] if t is None else int(t)
-                out.append(TowerState(x=int(x), y=int(y), tier=tier))
+            for idx, (x, y, t) in enumerate(parsed):
+                tier = inferred_tiers[idx] if t is None else int(t)
+                lane = inferred_lanes[idx]
+                out.append(TowerState(x=int(x), y=int(y), tier=int(tier), lane=lane))
             return out
-        return [TowerState(x=int(x), y=int(y), tier=int(t)) for (x,y,t) in parsed]
+
+        # если tier уже есть — просто упаковали
+        return [TowerState(x=int(x), y=int(y), tier=int(t), lane=None) for (x, y, t) in parsed]
 
     # ---------- апдейт от кадра ----------
 
     @staticmethod
     def _in_bounds(x: int, y: int) -> bool:
-        return 0 <= x < MINIMAP_W and 0 <= y < MINIMAP_H
+        return 0 <= x < MM_W and 0 <= y < MM_H
 
     def _has_color_radius(self, mm_rgb: np.ndarray, cx: int, cy: int, color: Tuple[int,int,int]) -> bool:
         h,w,_ = mm_rgb.shape
@@ -268,7 +317,7 @@ class TowerVisibilityTracker:
         mm_rgb — RGB 100x100; my_side: "radiant" | "dire"
         Возвращает словарь с состояниями по сторонам с учётом вашей стороны (ALLY/ENEMY).
         """
-        assert isinstance(mm_rgb, np.ndarray) and mm_rgb.shape == (MINIMAP_H, MINIMAP_W, 3), "Ожидаю RGB 100x100"
+        assert isinstance(mm_rgb, np.ndarray) and mm_rgb.shape == (MM_H, MM_W, 3), "Ожидаю RGB 100x100"
         tnow = time.time() if now is None else float(now)
 
         self._reset_flags(self.radiant)
@@ -291,16 +340,23 @@ class TowerVisibilityTracker:
         self._apply_timeouts(self.dire,    tnow)
 
         # Инференс: видели T1 → считаем жив T2, видели T2 → T3, видели T3 → T4
-        def infer_chain(lst: List[TowerState]):
-            if self._any_recently_seen_of_tier(lst, 1, tnow, self.timeout_sec):
-                self._infer_inner(lst, 2, tnow)
-            if self._any_recently_seen_of_tier(lst, 2, tnow, self.timeout_sec):
-                self._infer_inner(lst, 3, tnow)
+        def infer_chain_by_lane(lst: List[TowerState]):
+            for lane_name in ("top", "mid", "bot", None):
+                lane_lst = [s for s in lst if s.lane == lane_name]
+                if not lane_lst:
+                    continue
+
+                if self._any_recently_seen_of_tier(lane_lst, 1, tnow, self.timeout_sec):
+                    self._infer_inner(lane_lst, 2, tnow)
+                if self._any_recently_seen_of_tier(lane_lst, 2, tnow, self.timeout_sec):
+                    self._infer_inner(lane_lst, 3, tnow)
+
+            # T4 можно инферить, если видели любую T3 недавно (обычно вы уже у базы)
             if self._any_recently_seen_of_tier(lst, 3, tnow, self.timeout_sec):
                 self._infer_inner(lst, 4, tnow)
 
-        infer_chain(self.radiant)
-        infer_chain(self.dire)
+        infer_chain_by_lane(self.radiant)
+        infer_chain_by_lane(self.dire)
 
         # Пакуем с учётом вашей стороны: ally/enemy
         def pack(lst: List[TowerState], side_label: str) -> List[Dict]:
@@ -346,17 +402,30 @@ class TowerVisibilityTracker:
 
 # ------------------ Загрузка JSON координат ------------------
 
-def load_landmarks(json_path: str) -> Tuple[List[Dict[str,int]], List[Dict[str,int]]]:
+def load_landmarks(json_path: str):
     with open(json_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     data = raw.get("data", {})
-    rad = data.get("tower_radiant", [])[0]
-    dire = data.get("tower_dire", [])[0]
-    # Ожидаем список словарей {"x":..,"y":..}
 
+    rad = data.get("tower_radiant", [[]])[0]
+    dire = data.get("tower_dire", [[]])[0]
     rad_pts  = [{"x": int(d["x"]), "y": int(d["y"])} for d in rad]
     dire_pts = [{"x": int(d["x"]), "y": int(d["y"])} for d in dire]
-    return rad_pts, dire_pts
+
+    # ancient тоже лежит как [ [ {x,y} ] ]
+    ar = data.get("ancient_radiant", [[{"x": 0, "y": 0}]])[0][0]
+    ad = data.get("ancient_dire",    [[{"x": 0, "y": 0}]])[0][0]
+    ancient_r = (int(ar["x"]), int(ar["y"]))
+    ancient_d = (int(ad["x"]), int(ad["y"]))
+
+    lane_top = [(int(p["x"]), int(p["y"])) for p in data.get("lane_top", [[]])[0]]
+    lane_mid = [(int(p["x"]), int(p["y"])) for p in data.get("lane_mid", [[]])[0]]
+    lane_bot = [(int(p["x"]), int(p["y"])) for p in data.get("lane_bot", [[]])[0]]
+    lanes = {"top": lane_top, "mid": lane_mid, "bot": lane_bot}
+
+    return rad_pts, dire_pts, ancient_r, ancient_d, lanes
+
+
 
 # ------------------ Основной пример цикла (1 Гц) ------------------
 
@@ -369,13 +438,18 @@ def main():
     print(f"[i] Dota hwnd: {hex(hwnd)} title='{_title(hwnd)}'")
 
     # 2) Загрузка координат башен
-    if not os.path.exists(JSON_PATH):
-        print(f"[!] Не найден JSON с координатами: {JSON_PATH}")
+    if not os.path.exists(DEFAULT_LANDMARKS_DIR):
+        print(f"[!] Не найден JSON с координатами: {DEFAULT_LANDMARKS_DIR}")
         return
-    radiant_pts, dire_pts = load_landmarks(JSON_PATH)
-
-    # 3) Трекер
-    tracker = TowerVisibilityTracker(radiant_pts, dire_pts, timeout_sec=TIMEOUT_SEC, color_radius=COLOR_RADIUS)
+    radiant_pts, dire_pts, ancient_r, ancient_d, lanes = load_landmarks(DEFAULT_LANDMARKS_DIR)
+    tracker = TowerVisibilityTracker(
+        radiant_pts, dire_pts,
+        radiant_ancient=ancient_r,
+        dire_ancient=ancient_d,
+        lanes=lanes,
+        timeout_sec=TIMEOUT_SEC_TOWER_DETECTOR,
+        color_radius=COLOR_RADIUS_TOWER_DETECTOR
+    )
 
     # 4) Предпросмотр
     cv2.namedWindow("Minimap", cv2.WINDOW_NORMAL)
@@ -387,16 +461,16 @@ def main():
         cx, cy, cw, ch = client_rect_screen(hwnd)
 
         # правая-нижняя вырезка 100x100 + смещения DX,DY
-        x = cx + cw - MINIMAP_W - DX
-        y = cy + ch - MINIMAP_H - DY
+        x = cx + cw - MM_W - MM_DX
+        y = cy + ch - MM_H - MM_DY
 
-        mm_rgb = grab_region_rgb(x, y, MINIMAP_W, MINIMAP_H)
-        if mm_rgb is None or mm_rgb.shape[:2] != (MINIMAP_H, MINIMAP_W):
+        mm_rgb = grab_region_rgb(x, y, MM_W, MM_H)
+        if mm_rgb is None or mm_rgb.shape[:2] != (MM_H, MM_W):
             time.sleep(0.2)
             continue
 
         # апдейт трекера
-        report = tracker.tick_one(mm_rgb, my_side=MY_SIDE)
+        report = tracker.tick_one(mm_rgb)
         print(report)
         # печать
         #print(TowerVisibilityTracker.pretty_report(report))
