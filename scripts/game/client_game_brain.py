@@ -1156,6 +1156,7 @@ class Brain:
             return None
 
         creep_list = creeps.get("enemy" if enemy else "ally", [])
+
         if not creep_list:
             return None
 
@@ -1453,6 +1454,7 @@ class Brain:
 
         # --- 2) ищем крипа на ластхит ---
         lasthit_candidate = self._select_creep(c, hp_threshold=0.5,enemy=True)
+
         if lasthit_candidate is not None:
             cb, cx, cy = lasthit_candidate
             creep_hp = float(getattr(cb, "hp_ratio", 1.0))
@@ -1514,8 +1516,9 @@ class Brain:
             self.last_action_ts = now
             return
         # --- 2.5) DENY: добивание своих (аналогично ластхиту) ---
-        deny_candidate = self._select_creep(c, hp_threshold=0.3)
-        if deny_candidate is not None:
+        deny_candidate = self._select_creep(c, hp_threshold=0.3,enemy=False)
+
+        if deny_candidate is not None and lasthit_candidate is None:
             cb, cx, cy = deny_candidate
             creep_hp = float(getattr(cb, "hp_ratio", 1.0))
 

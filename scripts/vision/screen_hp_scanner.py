@@ -617,6 +617,7 @@ def find_hp_bars(
 
 
         # ВАЖНО: используем ИМЕННО x0_bar / y0_bar / x1_bar / y1_bar
+
         box = HpBarBox(
             x0=int(x0_bar),
             y0=int(y0_bar),
@@ -716,13 +717,14 @@ def find_self_heroes_hp_bars(
 def find_ally_creeps_hp_bars(
     frame_rgb: np.ndarray,
     w_min: int = 30,
-    w_max: int = 40,
+    w_max: int = 41,
     h_min: int = 1,
     h_max: int = 2,
     target_w: int | None = None,
 ) -> List[HpBarBox]:
     hp_ranges = [
         (ALLY_GREEN_CREEPS_LOWER, ALLY_GREEN_CREEPS_UPPER),
+        (ENEMY_RED_CREEPS_CL_LOWER, ENEMY_RED_CREEPS_CL_UPPER),
         (HP_BROWN_ALLY_CREEPS_LOWER, HP_BROWN_ALLY_CREEPS_UPPER)
     ]
     return find_hp_bars(
@@ -748,7 +750,7 @@ def find_ally_creeps_hp_bars(
 def find_enemy_creeps_hp_bars(
     frame_rgb: np.ndarray,
     w_min: int = 30,
-    w_max: int = 41,
+    w_max: int = 40,
     h_min: int = 1,
     h_max: int = 2,
     target_w: int | None = None,
