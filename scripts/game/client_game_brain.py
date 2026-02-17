@@ -81,6 +81,87 @@ def _closest_point_on_polyline(poly: List[Dict[str, float]],
             best_q = (qx, qy)
 
     return best_q[0], best_q[1], best_d2
+
+def _project_to_lane(poly: List[Dict[str, float]],
+                     p: Tuple[float, float]) -> Tuple[Tuple[float, float], float, float]:
+    """
+    Проекция точки на ломаную.
+    Возвращает (q_uv, t_progress, dist2), где t_progress in [0,1].
+    """
+    if not poly:
+        return (50.0, 50.0), 0.0, 1e18
+
+    seg_lens: List[float] = []
+    total_len = 0.0
+    for i in range(len(poly) - 1):
+        ax, ay = float(poly[i]["x"]), float(poly[i]["y"])
+        bx, by = float(poly[i + 1]["x"]), float(poly[i + 1]["y"])
+        seg_len = float(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5)
+        seg_lens.append(seg_len)
+        total_len += seg_len
+
+    if total_len <= 1e-6:
+        pt = poly[0]
+        q = (float(pt["x"]), float(pt["y"]))
+        dx, dy = p[0] - q[0], p[1] - q[1]
+        return q, 0.0, dx * dx + dy * dy
+
+    best_d2 = 1e18
+    best_q = (float(poly[0]["x"]), float(poly[0]["y"]))
+    best_progress = 0.0
+    len_before = 0.0
+
+    for i in range(len(poly) - 1):
+        ax, ay = float(poly[i]["x"]), float(poly[i]["y"])
+        bx, by = float(poly[i + 1]["x"]), float(poly[i + 1]["y"])
+        qx, qy, d2 = _closest_point_on_segment(ax, ay, bx, by, p[0], p[1])
+        if d2 < best_d2:
+            best_d2 = d2
+            seg_len = seg_lens[i]
+            if seg_len <= 1e-6:
+                seg_progress = 0.0
+            else:
+                seg_progress = float(((qx - ax) ** 2 + (qy - ay) ** 2) ** 0.5) / seg_len
+            best_progress = (len_before + seg_len * seg_progress) / total_len
+            best_q = (qx, qy)
+        len_before += seg_lens[i]
+
+    return best_q, max(0.0, min(1.0, best_progress)), best_d2
+
+def _point_at_progress(poly: List[Dict[str, float]],
+                       t_progress: float) -> Optional[Tuple[float, float]]:
+    if not poly:
+        return None
+    t_progress = max(0.0, min(1.0, float(t_progress)))
+    seg_lens: List[float] = []
+    total_len = 0.0
+    for i in range(len(poly) - 1):
+        ax, ay = float(poly[i]["x"]), float(poly[i]["y"])
+        bx, by = float(poly[i + 1]["x"]), float(poly[i + 1]["y"])
+        seg_len = float(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5)
+        seg_lens.append(seg_len)
+        total_len += seg_len
+    if total_len <= 1e-6:
+        pt = poly[0]
+        return float(pt["x"]), float(pt["y"])
+
+    target_len = total_len * t_progress
+    walked = 0.0
+    for i in range(len(poly) - 1):
+        seg_len = seg_lens[i]
+        if walked + seg_len >= target_len:
+            ax, ay = float(poly[i]["x"]), float(poly[i]["y"])
+            bx, by = float(poly[i + 1]["x"]), float(poly[i + 1]["y"])
+            if seg_len <= 1e-6:
+                return ax, ay
+            local_t = (target_len - walked) / seg_len
+            qx = ax + (bx - ax) * local_t
+            qy = ay + (by - ay) * local_t
+            return qx, qy
+        walked += seg_len
+
+    last = poly[-1]
+    return float(last["x"]), float(last["y"])
 from enum import Enum, auto
 from dataclasses import dataclass
 
@@ -103,6 +184,21 @@ class FarmPhase(Enum):
     MOVE_TO_TARGET = auto()
     FIGHT = auto()
     RETREAT = auto()
+
+class LaneFarmPhase(Enum):
+    SELECT_SEGMENT = auto()
+    MOVE_TO_POINT = auto()
+    WAIT_OR_CLEAR_WAVE = auto()
+    DONE = auto()
+    ABORT = auto()
+
+class CatboostAction(Enum):
+    FARMING_JUNGLE = "farming_jungle"
+    FARMING_LANE = "farming_lane"
+    LANING = "laning"
+    FIGHTING = "fighting"
+    RETREAT = "retreat"
+    IDLE = "idle"
 
 @dataclass
 class CampNode:
@@ -220,6 +316,23 @@ class Brain:
         self._lane_inited: bool = False
         self._lane_key: Optional[str] = None          # "lane_top" / "lane_mid" / "lane_bot"
         self._lane_anchor_uv: Optional[Tuple[float, float]] = None  # точка 0..100 на линии у Т1
+
+        # --- LANE FARM FSM ---
+        self._lane_farm_phase: LaneFarmPhase = LaneFarmPhase.SELECT_SEGMENT
+        self._lane_target_uv: Optional[Tuple[float, float]] = None
+        self._lane_wave_seen: bool = False
+        self._lane_wave_last_seen_ts: float = 0.0
+        self._lane_phase_start_ts: float = 0.0
+
+        # --- LANE FARM PARAMS ---
+        self.lane_attach_uv: float = 5.0
+        self.max_depth_frac: float = 0.45
+        self.tower_margin_frac: float = 0.03
+        self.arrive_radius_uv: float = 5.0
+        self.lane_move_timeout_s: float = 15.0
+        self.lane_find_wave_timeout_s: float = 30.0
+        self.lane_wave_timeout_s: float = 22.0
+        self.lane_wave_clear_grace_s: float = 2.5
 
 
 
@@ -361,6 +474,34 @@ class Brain:
             enemy_tower_dist_mm=enemy_tower_dist_mm,
             landmarks=c.get("landmarks").get('data')
         )
+
+    def _build_catboost_features(self, c: Dict[str, Any], s: Senses) -> Dict[str, Any]:
+        last_action_delta = max(0.0, time.time() - float(self.last_action_ts))
+        features = {
+            "alive": bool(s.alive),
+            "t_game": float(s.t_game),
+            "hp_ratio": 0.0 if s.hp_ratio is None else float(s.hp_ratio),
+            "low_hp": bool(s.low_hp),
+            "enemy_hero_near": bool(s.enemy_hero_near),
+            "enemy_hero_dist_screen": -1.0 if s.enemy_hero_dist_screen is None else float(s.enemy_hero_dist_screen),
+            "enemy_hero_dist_mm": -1.0 if s.enemy_hero_dist_mm is None else float(s.enemy_hero_dist_mm),
+            "enemy_hero_cnt_screen": int(s.enemy_hero_cnt_screen),
+            "enemy_creep_near": bool(s.enemy_creep_near),
+            "ally_creep_near": bool(s.ally_creep_near),
+            "near_enemy_tower": bool(s.near_enemy_tower),
+            "under_ally_tower": bool(s.under_ally_tower),
+            "lane_key_known": bool(self._lane_key is not None),
+            "lane_wave_seen": bool(self._lane_wave_seen),
+            "last_action_delta": last_action_delta,
+        }
+        return features
+
+    def _predict_catboost_action(self, features: Dict[str, Any]) -> str:
+        """
+        Заглушка CatBoost: вернуть строковый action.
+        """
+        _ = features
+        return CatboostAction.FARMING_JUNGLE.value
 
 
     @staticmethod
@@ -867,6 +1008,93 @@ class Brain:
         q = self._closest_point_to_polyline_uv(poly, best_t)
         return q
 
+    def _get_lane_poly(self, s: Senses, lane_key: str) -> Optional[List[Dict[str, float]]]:
+        root = s.landmarks or {}
+        arr = root.get(lane_key)
+        if not (isinstance(arr, list) and arr and isinstance(arr[0], list) and arr[0]):
+            return None
+        return arr[0]
+
+    def _normalize_lane_progress(self, t_progress: float, *, reverse: bool) -> float:
+        t = max(0.0, min(1.0, float(t_progress)))
+        return 1.0 - t if reverse else t
+
+    def _lane_progress_direction(self, poly: List[Dict[str, float]], c: Dict[str, Any]) -> bool:
+        """
+        Возвращает reverse=True если направление нужно развернуть,
+        чтобы progress(ally_base) < progress(enemy_base).
+        """
+        ally_base = self._pick_fountain_point(c)
+        enemy_base = self._pick_enemy_base_point(c)
+        _, t_ally, _ = _project_to_lane(poly, ally_base)
+        _, t_enemy, _ = _project_to_lane(poly, enemy_base)
+        return t_ally > t_enemy
+
+    def _compute_lane_target_uv(self, c: Dict[str, Any], s: Senses) -> Optional[Tuple[float, float]]:
+        if self._lane_key is None:
+            cur_uv = self._get_self_uv(c) or (50.0, 50.0)
+            self._lane_key = self._pick_nearest_lane_key(s, cur_uv)
+            if self._lane_key is None:
+                return None
+
+        poly = self._get_lane_poly(s, self._lane_key)
+        if poly is None:
+            return None
+
+        reverse = self._lane_progress_direction(poly, c)
+
+        towers_ally = c.get("towers", {}).get("ally", []) or []
+        towers_enemy = c.get("towers", {}).get("enemy", []) or []
+
+        ally_front = None
+        enemy_front = None
+
+        for t in towers_ally:
+            if not bool(t.get("alive", True)):
+                continue
+            try:
+                tx, ty = float(t["x"]), float(t["y"])
+            except Exception:
+                continue
+            _, t_prog, dist2 = _project_to_lane(poly, (tx, ty))
+            if dist2 ** 0.5 > self.lane_attach_uv:
+                continue
+            t_prog = self._normalize_lane_progress(t_prog, reverse=reverse)
+            if ally_front is None or t_prog > ally_front[0]:
+                ally_front = (t_prog, (tx, ty))
+
+        for t in towers_enemy:
+            if not bool(t.get("alive", True)):
+                continue
+            try:
+                tx, ty = float(t["x"]), float(t["y"])
+            except Exception:
+                continue
+            _, t_prog, dist2 = _project_to_lane(poly, (tx, ty))
+            if dist2 ** 0.5 > self.lane_attach_uv:
+                continue
+            t_prog = self._normalize_lane_progress(t_prog, reverse=reverse)
+            if enemy_front is None or t_prog < enemy_front[0]:
+                enemy_front = (t_prog, (tx, ty))
+
+        if ally_front is None or enemy_front is None:
+            return None
+
+        tA = ally_front[0]
+        tE = enemy_front[0]
+        if tE <= tA:
+            return None
+
+        t_target = tA + (tE - tA) * 0.35
+        t_cap = tA + (tE - tA) * self.max_depth_frac
+        t_target = min(t_target, t_cap)
+
+        t_target = max(t_target, tA + self.tower_margin_frac)
+        t_target = min(t_target, tE - self.tower_margin_frac)
+
+        t_poly = 1.0 - t_target if reverse else t_target
+        return _point_at_progress(poly, t_poly)
+
     @debug_log_result
     def _make_lasthit_key(self, cb, cx: float, cy: float) -> tuple[str, object]:
         for attr in ("id", "uid", "track_id", "ent_id"):
@@ -924,6 +1152,14 @@ class Brain:
         """
         side = getattr(self.pl, "side", "radiant")
         return str(side).lower().strip()
+
+    def _get_enemy_side(self) -> str:
+        side = self._get_side()
+        if side == "radiant":
+            return "dire"
+        if side == "dire":
+            return "radiant"
+        return "dire"
 
     @debug_log_result
     def _reset_camps_if_needed(self, t_game: float) -> None:
@@ -1084,6 +1320,21 @@ class Brain:
         """
         root = self._get_landmarks(c)
         side = self._get_side()
+
+        for key in (f"fountain_{side}", f"ancient_{side}"):
+            val = root.get(key)
+            pt = self._extract_point_xy(val)
+            if pt is not None:
+                return pt
+
+        return 50.0, 50.0
+
+    def _pick_enemy_base_point(self, c: Dict[str, Any]) -> Tuple[float, float]:
+        """
+        Приоритет: fountain_<enemy_side> -> ancient_<enemy_side> -> (50,50)
+        """
+        root = self._get_landmarks(c)
+        side = self._get_enemy_side()
 
         for key in (f"fountain_{side}", f"ancient_{side}"):
             val = root.get(key)
@@ -1582,8 +1833,20 @@ class Brain:
         self._walk_throttled(tx, ty, cooldown=0.35, tol_px=22.0, attack=False)
 
     def _tick_farming(self, c: Dict[str, Any], s: Senses):
+        features = self._build_catboost_features(c, s)
+        action = self._predict_catboost_action(features)
+        dispatch = {
+            CatboostAction.FARMING_JUNGLE.value: self.tick_farming_jungle,
+            CatboostAction.FARMING_LANE.value: self.tick_farming_lane,
+            CatboostAction.LANING.value: self.tick_laning,
+            CatboostAction.FIGHTING.value: self.tick_fighting,
+            CatboostAction.RETREAT.value: self.tick_retreat,
+            CatboostAction.IDLE.value: self.tick_idle,
+        }
+        handler = dispatch.get(action, self.tick_idle)
+        handler(c, s)
 
-
+    def tick_farming_jungle(self, c: Dict[str, Any], s: Senses):
         # 1) кемпы из landmarks, которые уже в senses
         self._ensure_camps_inited(s)
         self._reset_camps_if_needed(s.t_game)
@@ -1624,6 +1887,73 @@ class Brain:
             self._minimap_click_throttled(camp.x, camp.y)
 
             return
+
+    def tick_farming_lane(self, c: Dict[str, Any], s: Senses):
+        now = time.time()
+
+        if s.low_hp or s.enemy_hero_near:
+            self._lane_farm_phase = LaneFarmPhase.ABORT
+
+        if self._lane_farm_phase is LaneFarmPhase.SELECT_SEGMENT:
+            self._lane_target_uv = self._compute_lane_target_uv(c, s)
+            self._lane_wave_seen = False
+            self._lane_wave_last_seen_ts = 0.0
+            self._lane_phase_start_ts = now
+            if self._lane_target_uv is None:
+                self._lane_farm_phase = LaneFarmPhase.ABORT
+            else:
+                self._lane_farm_phase = LaneFarmPhase.MOVE_TO_POINT
+
+        if self._lane_farm_phase is LaneFarmPhase.MOVE_TO_POINT:
+            if self._lane_target_uv is None:
+                self._lane_farm_phase = LaneFarmPhase.ABORT
+            else:
+                cur = self._get_self_uv(c)
+                if cur is None:
+                    return
+                dx = cur[0] - self._lane_target_uv[0]
+                dy = cur[1] - self._lane_target_uv[1]
+                if (dx * dx + dy * dy) ** 0.5 <= self.arrive_radius_uv:
+                    self._lane_farm_phase = LaneFarmPhase.WAIT_OR_CLEAR_WAVE
+                    self._lane_phase_start_ts = now
+                elif now - self._lane_phase_start_ts >= self.lane_move_timeout_s:
+                    self._lane_farm_phase = LaneFarmPhase.ABORT
+                else:
+                    self._minimap_click_throttled(self._lane_target_uv[0], self._lane_target_uv[1])
+
+        if self._lane_farm_phase is LaneFarmPhase.WAIT_OR_CLEAR_WAVE:
+            if s.enemy_creep_near:
+                self._lane_wave_seen = True
+                self._lane_wave_last_seen_ts = now
+                self._attack_enemy_creep_on_screen(c)
+            else:
+                if self._lane_wave_seen and (now - self._lane_wave_last_seen_ts) >= self.lane_wave_clear_grace_s:
+                    self._lane_farm_phase = LaneFarmPhase.DONE
+                elif (now - self._lane_phase_start_ts) >= self.lane_wave_timeout_s:
+                    self._lane_farm_phase = LaneFarmPhase.DONE
+                elif (not self._lane_wave_seen) and (now - self._lane_phase_start_ts) >= self.lane_find_wave_timeout_s:
+                    self._lane_farm_phase = LaneFarmPhase.DONE
+
+        if self._lane_farm_phase in (LaneFarmPhase.DONE, LaneFarmPhase.ABORT):
+            self._lane_target_uv = None
+            self._lane_wave_seen = False
+            self._lane_wave_last_seen_ts = 0.0
+            self._lane_phase_start_ts = 0.0
+            self._lane_farm_phase = LaneFarmPhase.SELECT_SEGMENT
+            return
+
+    def tick_retreat(self, c: Dict[str, Any], s: Senses):
+        _ = c, s
+        return
+
+    def tick_fighting(self, c: Dict[str, Any], s: Senses):
+        self._tick_fighting(c, s)
+
+    def tick_laning(self, c: Dict[str, Any], s: Senses):
+        self._tick_laning(c, s)
+
+    def tick_idle(self, c: Dict[str, Any], s: Senses):
+        self._tick_idle(c, s)
 
     def _tick_fighting(self, c: Dict[str, Any], s: Senses):
         pass
