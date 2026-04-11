@@ -8,6 +8,10 @@ DEFAULT_ML_MINIMAP_DIR = Path("config/minimap.pt")
 DEFAULT_ML_HP_DIR = Path("config/hp.pt")
 DEFAULT_LANDMARKS_DIR = Path("config/minimap_landmarks.json")
 
+
+OUT_FILE_PARSER_ITEMS = "config/items_parsed.json"
+
+
 os.environ["TCL_LIBRARY"] = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tcl8.6"
 os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tk8.6"
 
