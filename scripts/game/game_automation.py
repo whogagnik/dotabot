@@ -10,7 +10,7 @@ import threading
 import dxcam
 import numpy as np
 from PIL import Image
-from scripts.core.CONSTANTS import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
+from scripts.core.config import *           # STATUS_LABELS / STATUS_COLORS и прочие константы — из общего файла
 from scripts.core.utils import _force_foreground,_window_area,find_main_hwnd_for_pid, _window_ok, steam64_to_friend_id_local
 # === External deps ===
 import pyautogui as p

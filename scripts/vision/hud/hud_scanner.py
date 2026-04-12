@@ -13,7 +13,7 @@ import cv2
 import torch
 
 from uuid import uuid4
-from scripts.core.CONSTANTS import *
+from scripts.core.config import *
 from scripts.ml.infer import load_hp_ocr_net
 
 """

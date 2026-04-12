@@ -18,7 +18,7 @@ import win32con
 import win32api
 import win32process
 
-from scripts.core.CONSTANTS import *
+from scripts.core.config import *
 from scripts.app.window_placer import WindowPlacer
 try:
     from scripts.app.thread_registry import ThreadRegistry  # опционально

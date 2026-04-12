@@ -28,7 +28,7 @@ import time
 import math
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Union
-from scripts.core.CONSTANTS import *
+from scripts.core.config import *
 import numpy as np
 import cv2
 import pyautogui as p

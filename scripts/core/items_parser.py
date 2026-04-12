@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
-from scripts.core.CONSTANTS import OUT_FILE_PARSER_ITEMS
+from scripts.core.config import OUT_FILE_PARSER_ITEMS
 
 
 FANDOM_API = "https://dota2.fandom.com/api.php"

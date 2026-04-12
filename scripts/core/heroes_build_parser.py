@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from scripts.core.CONSTANTS import (
+from scripts.core.config import (
     DEFAULT_HEADERS,
     DEFAULT_MAX_ITEMS,
     DEFAULT_HERO_BUILDS_DIR,

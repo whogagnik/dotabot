@@ -7,7 +7,7 @@ import time
 import json
 
 from scripts.vision.screen_hp_scanner import scan_hp_bars_on_screen,HpBarBox
-from scripts.core.CONSTANTS import *
+from scripts.core.config import *
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 from scripts.vision.hud.hud_scanner import SelfHud
