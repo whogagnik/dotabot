@@ -1,0 +1,516 @@
+{
+  "source": "Official Dota 2 hero names mapped to Dota2ProTracker hero pages",
+  "base_url": "https://dota2protracker.com/hero/",
+  "transform_rule": "dota2protracker_url = 'https://dota2protracker.com/hero/' + encodeURIComponent(name)",
+  "heroes_count": 127,
+  "heroes": [
+    {
+      "name": "Abaddon",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Abaddon"
+    },
+    {
+      "name": "Alchemist",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Alchemist"
+    },
+    {
+      "name": "Ancient Apparition",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Ancient%20Apparition"
+    },
+    {
+      "name": "Anti-Mage",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Anti-Mage"
+    },
+    {
+      "name": "Arc Warden",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Arc%20Warden"
+    },
+    {
+      "name": "Axe",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Axe"
+    },
+    {
+      "name": "Bane",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Bane"
+    },
+    {
+      "name": "Batrider",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Batrider"
+    },
+    {
+      "name": "Beastmaster",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Beastmaster"
+    },
+    {
+      "name": "Bloodseeker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Bloodseeker"
+    },
+    {
+      "name": "Bounty Hunter",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Bounty%20Hunter"
+    },
+    {
+      "name": "Brewmaster",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Brewmaster"
+    },
+    {
+      "name": "Bristleback",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Bristleback"
+    },
+    {
+      "name": "Broodmother",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Broodmother"
+    },
+    {
+      "name": "Centaur Warrunner",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Centaur%20Warrunner"
+    },
+    {
+      "name": "Chaos Knight",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Chaos%20Knight"
+    },
+    {
+      "name": "Chen",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Chen"
+    },
+    {
+      "name": "Clinkz",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Clinkz"
+    },
+    {
+      "name": "Clockwerk",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Clockwerk"
+    },
+    {
+      "name": "Crystal Maiden",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Crystal%20Maiden"
+    },
+    {
+      "name": "Dark Seer",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Dark%20Seer"
+    },
+    {
+      "name": "Dark Willow",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Dark%20Willow"
+    },
+    {
+      "name": "Dawnbreaker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Dawnbreaker"
+    },
+    {
+      "name": "Dazzle",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Dazzle"
+    },
+    {
+      "name": "Death Prophet",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Death%20Prophet"
+    },
+    {
+      "name": "Disruptor",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Disruptor"
+    },
+    {
+      "name": "Doom",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Doom"
+    },
+    {
+      "name": "Dragon Knight",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Dragon%20Knight"
+    },
+    {
+      "name": "Drow Ranger",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Drow%20Ranger"
+    },
+    {
+      "name": "Earth Spirit",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Earth%20Spirit"
+    },
+    {
+      "name": "Earthshaker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Earthshaker"
+    },
+    {
+      "name": "Elder Titan",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Elder%20Titan"
+    },
+    {
+      "name": "Ember Spirit",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Ember%20Spirit"
+    },
+    {
+      "name": "Enchantress",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Enchantress"
+    },
+    {
+      "name": "Enigma",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Enigma"
+    },
+    {
+      "name": "Faceless Void",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Faceless%20Void"
+    },
+    {
+      "name": "Grimstroke",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Grimstroke"
+    },
+    {
+      "name": "Gyrocopter",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Gyrocopter"
+    },
+    {
+      "name": "Hoodwink",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Hoodwink"
+    },
+    {
+      "name": "Huskar",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Huskar"
+    },
+    {
+      "name": "Invoker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Invoker"
+    },
+    {
+      "name": "Io",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Io"
+    },
+    {
+      "name": "Jakiro",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Jakiro"
+    },
+    {
+      "name": "Juggernaut",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Juggernaut"
+    },
+    {
+      "name": "Keeper of the Light",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Keeper%20of%20the%20Light"
+    },
+    {
+      "name": "Kez",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Kez"
+    },
+    {
+      "name": "Kunkka",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Kunkka"
+    },
+    {
+      "name": "Legion Commander",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Legion%20Commander"
+    },
+    {
+      "name": "Leshrac",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Leshrac"
+    },
+    {
+      "name": "Lich",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Lich"
+    },
+    {
+      "name": "Lifestealer",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Lifestealer"
+    },
+    {
+      "name": "Lina",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Lina"
+    },
+    {
+      "name": "Lion",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Lion"
+    },
+    {
+      "name": "Lone Druid",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Lone%20Druid"
+    },
+    {
+      "name": "Luna",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Luna"
+    },
+    {
+      "name": "Lycan",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Lycan"
+    },
+    {
+      "name": "Magnus",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Magnus"
+    },
+    {
+      "name": "Marci",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Marci"
+    },
+    {
+      "name": "Mars",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Mars"
+    },
+    {
+      "name": "Medusa",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Medusa"
+    },
+    {
+      "name": "Meepo",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Meepo"
+    },
+    {
+      "name": "Mirana",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Mirana"
+    },
+    {
+      "name": "Monkey King",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Monkey%20King"
+    },
+    {
+      "name": "Morphling",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Morphling"
+    },
+    {
+      "name": "Muerta",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Muerta"
+    },
+    {
+      "name": "Naga Siren",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Naga%20Siren"
+    },
+    {
+      "name": "Nature's Prophet",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Nature's%20Prophet"
+    },
+    {
+      "name": "Necrophos",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Necrophos"
+    },
+    {
+      "name": "Night Stalker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Night%20Stalker"
+    },
+    {
+      "name": "Nyx Assassin",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Nyx%20Assassin"
+    },
+    {
+      "name": "Ogre Magi",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Ogre%20Magi"
+    },
+    {
+      "name": "Omniknight",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Omniknight"
+    },
+    {
+      "name": "Oracle",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Oracle"
+    },
+    {
+      "name": "Outworld Destroyer",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Outworld%20Destroyer"
+    },
+    {
+      "name": "Pangolier",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Pangolier"
+    },
+    {
+      "name": "Phantom Assassin",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Phantom%20Assassin"
+    },
+    {
+      "name": "Phantom Lancer",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Phantom%20Lancer"
+    },
+    {
+      "name": "Phoenix",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Phoenix"
+    },
+    {
+      "name": "Primal Beast",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Primal%20Beast"
+    },
+    {
+      "name": "Puck",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Puck"
+    },
+    {
+      "name": "Pudge",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Pudge"
+    },
+    {
+      "name": "Pugna",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Pugna"
+    },
+    {
+      "name": "Queen of Pain",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Queen%20of%20Pain"
+    },
+    {
+      "name": "Razor",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Razor"
+    },
+    {
+      "name": "Riki",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Riki"
+    },
+    {
+      "name": "Ringmaster",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Ringmaster"
+    },
+    {
+      "name": "Rubick",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Rubick"
+    },
+    {
+      "name": "Sand King",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Sand%20King"
+    },
+    {
+      "name": "Shadow Demon",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Shadow%20Demon"
+    },
+    {
+      "name": "Shadow Fiend",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Shadow%20Fiend"
+    },
+    {
+      "name": "Shadow Shaman",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Shadow%20Shaman"
+    },
+    {
+      "name": "Silencer",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Silencer"
+    },
+    {
+      "name": "Skywrath Mage",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Skywrath%20Mage"
+    },
+    {
+      "name": "Slardar",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Slardar"
+    },
+    {
+      "name": "Slark",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Slark"
+    },
+    {
+      "name": "Snapfire",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Snapfire"
+    },
+    {
+      "name": "Sniper",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Sniper"
+    },
+    {
+      "name": "Spectre",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Spectre"
+    },
+    {
+      "name": "Spirit Breaker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Spirit%20Breaker"
+    },
+    {
+      "name": "Storm Spirit",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Storm%20Spirit"
+    },
+    {
+      "name": "Sven",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Sven"
+    },
+    {
+      "name": "Techies",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Techies"
+    },
+    {
+      "name": "Templar Assassin",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Templar%20Assassin"
+    },
+    {
+      "name": "Terrorblade",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Terrorblade"
+    },
+    {
+      "name": "Tidehunter",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Tidehunter"
+    },
+    {
+      "name": "Timbersaw",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Timbersaw"
+    },
+    {
+      "name": "Tinker",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Tinker"
+    },
+    {
+      "name": "Tiny",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Tiny"
+    },
+    {
+      "name": "Treant Protector",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Treant%20Protector"
+    },
+    {
+      "name": "Troll Warlord",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Troll%20Warlord"
+    },
+    {
+      "name": "Tusk",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Tusk"
+    },
+    {
+      "name": "Underlord",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Underlord"
+    },
+    {
+      "name": "Undying",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Undying"
+    },
+    {
+      "name": "Ursa",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Ursa"
+    },
+    {
+      "name": "Vengeful Spirit",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Vengeful%20Spirit"
+    },
+    {
+      "name": "Venomancer",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Venomancer"
+    },
+    {
+      "name": "Viper",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Viper"
+    },
+    {
+      "name": "Visage",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Visage"
+    },
+    {
+      "name": "Void Spirit",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Void%20Spirit"
+    },
+    {
+      "name": "Warlock",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Warlock"
+    },
+    {
+      "name": "Weaver",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Weaver"
+    },
+    {
+      "name": "Windranger",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Windranger"
+    },
+    {
+      "name": "Winter Wyvern",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Winter%20Wyvern"
+    },
+    {
+      "name": "Witch Doctor",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Witch%20Doctor"
+    },
+    {
+      "name": "Wraith King",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Wraith%20King"
+    },
+    {
+      "name": "Zeus",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Zeus"
+    },
+    {
+      "name": "Largo",
+      "dota2protracker_url": "https://dota2protracker.com/hero/Largo"
+    }
+  ]
+}

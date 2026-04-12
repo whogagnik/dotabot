@@ -10,10 +10,53 @@ DEFAULT_LANDMARKS_DIR = Path("config/minimap_landmarks.json")
 
 
 OUT_FILE_PARSER_ITEMS = "config/items_parsed.json"
-
+CATBOOST_DATASET_CSV_PATH = 'config/catboost_dataset_csv.csv'
 
 os.environ["TCL_LIBRARY"] = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tcl8.6"
 os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tk8.6"
+
+
+
+
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+OUT_FILE_HERO_BUILDS = BASE_DIR / "config" / "hero_builds.json"
+
+# ---------- HTTP ----------
+HTTP_TIMEOUT_SECONDS = 30
+HTTP_RETRIES = 4
+HTTP_BACKOFF_BASE_SECONDS = 1.5
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "dotabot-builds-parser/1.0 "
+        "(requests; contact: you@example.com)"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
+}
+
+# ---------- Sources ----------
+DOTA2PROTRACKER_BASE_URL = "https://dota2protracker.com"
+DOTABUFF_BASE_URL_RU = "https://ru.dotabuff.com"
+
+DOTA2PROTRACKER_HERO_URL = DOTA2PROTRACKER_BASE_URL + "/hero/{hero_slug}"
+DOTABUFF_HERO_URL = DOTABUFF_BASE_URL_RU + "/heroes/{hero_slug}"
+
+BUILD_SOURCES = ("dota2protracker", "dotabuff")
+DOTA2PROTRACKER_REFERER = DOTA2PROTRACKER_BASE_URL + "/"
+DOTABUFF_REFERER = DOTABUFF_BASE_URL_RU + "/"
+
+
+# ---------- Parsing ----------
+SLEEP_BETWEEN_REQUESTS_SECONDS = 0.5
+
+# Если нужно парсить только топ-N предметов из таблицы item stats / popular items
+DEFAULT_MAX_ITEMS = 20
+
+# ---------- CSV / JSON helpers ----------
+JSON_INDENT = 2
+JSON_ENSURE_ASCII = False
 
 HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)   # x1, y1, x2, y2
 GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
