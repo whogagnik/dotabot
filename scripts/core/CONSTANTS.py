@@ -2,12 +2,18 @@ from pathlib import Path
 import ctypes
 from typing import Tuple
 import os
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+
 SANDBOXIE_START_EXE = r"C:\Program Files\Sandboxie-Plus\Start.exe"
 DEFAULT_MAFILES_DIR = Path("mafiles")
 DEFAULT_ML_MINIMAP_DIR = Path("config/minimap.pt")
 DEFAULT_ML_HP_DIR = Path("config/hp.pt")
 DEFAULT_LANDMARKS_DIR = Path("config/minimap_landmarks.json")
-
+DEFAULT_HERO_BUILDS_DIR = Path("config/hero_builds.json")
+DEFAULT_HERO_URL_DIR = Path("config/hero_urls.json")
+DEFALUT_ID_HERO_TO_NAME = Path("config/id_hero_to_name.json")
 
 OUT_FILE_PARSER_ITEMS = "config/items_parsed.json"
 CATBOOST_DATASET_CSV_PATH = 'config/catboost_dataset_csv.csv'
@@ -19,7 +25,7 @@ os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Pyth
 
 
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+
 OUT_FILE_HERO_BUILDS = BASE_DIR / "config" / "hero_builds.json"
 
 # ---------- HTTP ----------
@@ -38,14 +44,14 @@ DEFAULT_HEADERS = {
 
 # ---------- Sources ----------
 DOTA2PROTRACKER_BASE_URL = "https://dota2protracker.com"
-DOTABUFF_BASE_URL_RU = "https://ru.dotabuff.com"
+
 
 DOTA2PROTRACKER_HERO_URL = DOTA2PROTRACKER_BASE_URL + "/hero/{hero_slug}"
-DOTABUFF_HERO_URL = DOTABUFF_BASE_URL_RU + "/heroes/{hero_slug}"
+
 
 BUILD_SOURCES = ("dota2protracker", "dotabuff")
 DOTA2PROTRACKER_REFERER = DOTA2PROTRACKER_BASE_URL + "/"
-DOTABUFF_REFERER = DOTABUFF_BASE_URL_RU + "/"
+
 
 
 # ---------- Parsing ----------

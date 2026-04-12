@@ -5,14 +5,14 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
-from pathlib import Path
-from bs4 import BeautifulSoup, Tag
+from urllib.parse import quote
+
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from scripts.core.CONSTANTS import (
     DEFAULT_HEADERS,
     DEFAULT_MAX_ITEMS,
-    DOTABUFF_HERO_URL,
-    DOTABUFF_REFERER,
+    DEFAULT_HERO_BUILDS_DIR,
     DOTA2PROTRACKER_HERO_URL,
     DOTA2PROTRACKER_REFERER,
     HTTP_BACKOFF_BASE_SECONDS,
@@ -22,6 +22,8 @@ from scripts.core.CONSTANTS import (
     JSON_INDENT,
     OUT_FILE_HERO_BUILDS,
     SLEEP_BETWEEN_REQUESTS_SECONDS,
+
+
 )
 
 try:
@@ -43,13 +45,20 @@ class BuildItem:
 
 
 @dataclass
+class StartingItemSet:
+    items: List[str]
+    matches: Optional[str] = None
+    winrate: Optional[str] = None
+
+
+@dataclass
 class HeroBuild:
     hero: str
     hero_slug: str
     source: str
     role: Optional[str]
     patch: Optional[str]
-    starting_items: List[BuildItem]
+    starting_items: List[StartingItemSet]
     core_items: List[BuildItem]
     situational_items: List[BuildItem]
     raw_url: str
@@ -67,18 +76,12 @@ def _collapse_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def _safe_text(el: Optional[Tag]) -> str:
-    if el is None:
-        return ""
-    return _collapse_ws(el.get_text(" ", strip=True))
+def _hero_slug(hero_name: str) -> str:
+    return hero_name.strip()
 
 
-def _slugify_hero_name_for_d2pt(hero_name: str) -> str:
-    return hero_name.strip().replace(" ", "-")
-
-
-def _slugify_hero_name_for_dotabuff(hero_name: str) -> str:
-    return hero_name.strip().lower().replace(" ", "-")
+def _hero_url_part(hero_name: str) -> str:
+    return quote(hero_name.strip(), safe="")
 
 
 def _make_session(referer: str):
@@ -97,10 +100,6 @@ def _make_session(referer: str):
 
 def make_d2pt_session():
     return _make_session(DOTA2PROTRACKER_REFERER)
-
-
-def make_dotabuff_session():
-    return _make_session(DOTABUFF_REFERER)
 
 
 def _looks_like_cloudflare_block(html: str) -> bool:
@@ -158,34 +157,24 @@ def _request_html(session, url: str, logger=None) -> str:
     raise RuntimeError(f"Failed to fetch {url}") from last_err
 
 
-def _extract_item_name_from_text(text: str) -> Optional[str]:
-    text = _collapse_ws(text)
-    if not text:
-        return None
-
-    if text.upper() == "CORE":
-        return None
-    if re.fullmatch(r"\d+(\.\d+)?%", text):
-        return None
-    if re.fullmatch(r"\d[\d,]*", text):
-        return None
-    if re.fullmatch(r"\d+m.*", text, flags=re.IGNORECASE):
-        return None
-    if re.fullmatch(r"\d{1,2}:\d{2}", text):
-        return None
-
-    return text
-
-
 def _clean_item_name(name: str) -> str:
-    name = _collapse_ws(name)
-    name = name.replace("#|n|#", "").strip()
+    name = _collapse_ws(name).replace("#|n|#", "").strip()
+    name = re.sub(r"^Image:\s*", "", name, flags=re.IGNORECASE).strip()
+
+    words = name.split()
+    if len(words) % 2 == 0 and words:
+        half = len(words) // 2
+        if words[:half] == words[half:]:
+            name = " ".join(words[:half])
+
     return name
 
 
 def _is_bad_item_name(name: str) -> bool:
     if not name:
         return True
+
+    name = _collapse_ws(name)
 
     bad_exact = {
         "Основа",
@@ -206,27 +195,44 @@ def _is_bad_item_name(name: str) -> bool:
         "Item",
         "Purchase Rate",
         "Average Time",
+        "Table View",
+        "Normal View",
         "Table View Normal View",
-        "Show Core Items (≥50% purchase rate)",
-        "Show Core Items (>=50% purchase rate)",
+        "Stats of all Items for this Build",
+        "More Items",
+        "Main Items",
+        "Other Items",
+        "Loading…",
+        "Loading...",
+        "CORE",
+        "Different common options",
+        "Builds Meta Analysis Matchups & Synergies Item Stats Off-Meta Builds",
     }
-
     if name in bad_exact:
+        return True
+
+    if name.startswith("Show Core Items"):
+        return True
+
+    if "purchase rate" in name.lower():
         return True
 
     if name.startswith("#|n|#"):
         return True
 
-    if "LH @" in name:
+    if re.fullmatch(r"\d+(\.\d+)?%", name):
         return True
 
-    bad_single_words = {
-        "Alert",
-        "Mystical",
-        "Quickened",
-        "Timeless",
-    }
-    if name in bad_single_words:
+    if re.fullmatch(r"\d[\d,]*", name):
+        return True
+
+    if re.search(r"\b\d+m\b", name, flags=re.IGNORECASE):
+        return True
+
+    if re.fullmatch(r"\d{1,2}:\d{2}", name):
+        return True
+
+    if "matches" in name.lower() and "win rate" in name.lower():
         return True
 
     return False
@@ -246,197 +252,347 @@ def _dedupe_items(items: List[BuildItem]) -> List[BuildItem]:
     return out
 
 
-def parse_d2pt_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
-    hero_slug = _slugify_hero_name_for_d2pt(hero_name)
-    url = DOTA2PROTRACKER_HERO_URL.format(hero_slug=hero_slug)
+def _dedupe_names(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
-    html = _request_html(session, url, logger=logger)
-    soup = BeautifulSoup(html, "html.parser")
 
-    page_text = soup.get_text("\n", strip=True)
-    lines = [_collapse_ws(x) for x in page_text.splitlines() if _collapse_ws(x)]
+def _looks_like_time(line: str) -> bool:
+    line = _collapse_ws(line)
+    return bool(
+        re.search(r"\b\d+m\b", line, flags=re.IGNORECASE)
+        or re.fullmatch(r"\d{1,2}:\d{2}", line)
+    )
 
-    patch = None
-    m_patch = re.search(r"Patch\s+([0-9.]+[a-z]?)", page_text, flags=re.IGNORECASE)
-    if m_patch:
-        patch = m_patch.group(1)
 
-    role = None
-    role_match = re.search(
-        r"stats for .*?\b(Carry|Mid|Offlane|Support|Hard Support)\b",
+def _looks_like_percent(line: str) -> bool:
+    return bool(re.fullmatch(r"\d+(\.\d+)?%", _collapse_ws(line)))
+
+
+def _looks_like_matches(line: str) -> bool:
+    return bool(
+        re.fullmatch(r"\d[\d,]*\s+matches", _collapse_ws(line), flags=re.IGNORECASE)
+    )
+
+
+def _parse_starting_stats_line(line: str) -> tuple[Optional[str], Optional[str]]:
+    line = _collapse_ws(line)
+    m = re.search(
+        r"(\d[\d,]*)\s+matches.*?(\d+(?:\.\d+)?)%\s+win\s*rate",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None, None
+    return f"{m.group(1)} matches", f"{m.group(2)}%"
+
+
+def _extract_patch(page_text: str) -> Optional[str]:
+    m = re.search(r"Patch\s+([0-9.]+[a-z]?)", page_text, flags=re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _extract_role(page_text: str) -> Optional[str]:
+    m = re.search(
+        r"stats for .*?\b(Hard Support|Support|Offlane|Mid|Carry)\b",
         page_text,
         flags=re.IGNORECASE,
     )
-    if role_match:
-        role = _collapse_ws(role_match.group(1))
+    return _collapse_ws(m.group(1)) if m else None
 
-    starting_items: List[BuildItem] = []
+
+def _extract_item_stats_section(lines: List[str]) -> List[str]:
+    item_stats_indices = [
+        i for i, line in enumerate(lines)
+        if _collapse_ws(line).lower() == "item stats"
+    ]
+    if not item_stats_indices:
+        return []
+
+    start_idx = item_stats_indices[-1] + 1
+    end_markers = {
+        "Matchups & Synergies",
+        "Off-Meta Builds",
+        "Abilities & Talents",
+        "Neutral Items",
+        "Lategame",
+    }
+
+    section: List[str] = []
+    for line in lines[start_idx:]:
+        if line in end_markers:
+            break
+        section.append(line)
+
+    return section
+
+
+def _find_heading_tag(soup: BeautifulSoup, heading_text: str) -> Optional[Tag]:
+    pattern = re.compile(rf"^\s*{re.escape(heading_text)}\s*$", flags=re.IGNORECASE)
+    for tag in soup.find_all(True):
+        text = _collapse_ws(tag.get_text(" ", strip=True))
+        if pattern.fullmatch(text):
+            return tag
+    return None
+
+
+def _collect_section_nodes(
+    start_tag: Tag,
+    end_heading_texts: List[str],
+) -> List[Tag]:
+    end_texts = {x.lower() for x in end_heading_texts}
+    nodes: List[Tag] = []
+
+    for sib in start_tag.next_siblings:
+        if isinstance(sib, NavigableString):
+            continue
+        if not isinstance(sib, Tag):
+            continue
+
+        sib_text = _collapse_ws(sib.get_text(" ", strip=True)).lower()
+        if sib_text in end_texts:
+            break
+
+        # иногда следующий заголовок вложен глубже
+        heading_like = sib.find(
+            lambda t: isinstance(t, Tag)
+            and re.fullmatch(r"h[1-6]", t.name or "", flags=re.IGNORECASE)
+            and _collapse_ws(t.get_text(" ", strip=True)).lower() in end_texts
+        )
+        if heading_like is not None:
+            break
+
+        nodes.append(sib)
+
+    return nodes
+
+
+def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemSet]:
+    start_tag = _find_heading_tag(soup, "Starting Items")
+    if start_tag is None:
+        return []
+
+    section_nodes = _collect_section_nodes(
+        start_tag,
+        end_heading_texts=["Core Item Build", "Item Stats", "Neutral Items"],
+    )
+    if not section_nodes:
+        return []
+
+    sets: List[StartingItemSet] = []
+    current_items: List[str] = []
+    current_matches: Optional[str] = None
+    current_winrate: Optional[str] = None
+
+    def flush_current():
+        nonlocal current_items, current_matches, current_winrate
+        current_items = _dedupe_names(
+            [_clean_item_name(x) for x in current_items if not _is_bad_item_name(_clean_item_name(x))]
+        )
+        if current_items:
+            sets.append(
+                StartingItemSet(
+                    items=current_items,
+                    matches=current_matches,
+                    winrate=current_winrate,
+                )
+            )
+        current_items = []
+        current_matches = None
+        current_winrate = None
+
+    for node in section_nodes:
+        # 1) сначала пробуем собрать статистику с текста блока
+        node_lines = [
+            _collapse_ws(x)
+            for x in node.get_text("\n", strip=True).splitlines()
+            if _collapse_ws(x)
+        ]
+        for line in node_lines:
+            matches, winrate = _parse_starting_stats_line(line)
+            if matches or winrate:
+                if current_items:
+                    flush_current()
+                current_matches = matches
+                current_winrate = winrate
+
+        # 2) достаем item names из img alt/title/data-* и ссылок
+        extracted_names: List[str] = []
+
+        for img in node.find_all("img"):
+            candidates = [
+                img.get("alt"),
+                img.get("title"),
+                img.get("aria-label"),
+                img.get("data-tip"),
+                img.get("data-original-title"),
+            ]
+            for cand in candidates:
+                cand = _clean_item_name(cand or "")
+                if cand and not _is_bad_item_name(cand):
+                    extracted_names.append(cand)
+                    break
+
+        for tag in node.find_all(True):
+            for attr in ("title", "aria-label", "data-tip", "data-original-title"):
+                val = _clean_item_name(tag.get(attr, "") or "")
+                if val and not _is_bad_item_name(val):
+                    extracted_names.append(val)
+
+        # fallback: иногда название предмета лежит только текстом внутри элемента
+        for line in node_lines:
+            cleaned = _clean_item_name(line)
+            if cleaned and not _is_bad_item_name(cleaned):
+                # не забираем строки статистики
+                if _parse_starting_stats_line(cleaned) != (None, None):
+                    continue
+                extracted_names.append(cleaned)
+
+        extracted_names = _dedupe_names(extracted_names)
+
+        # отсекаем строки статистики, если случайно попали
+        extracted_names = [
+            x for x in extracted_names
+            if _parse_starting_stats_line(x) == (None, None)
+        ]
+
+        if extracted_names:
+            current_items.extend(extracted_names)
+
+    if current_items:
+        flush_current()
+
+    return sets[:3]
+
+
+def _parse_items_from_lines(lines: List[str]) -> tuple[List[BuildItem], List[BuildItem]]:
+    ignored = {
+        "Stats of all Items for this Build",
+        "Table View",
+        "Normal View",
+        "Table View Normal View",
+        "Show Core Items (≥50% purchase rate)",
+        "Show Core Items (>=50% purchase rate)",
+        "Show Core Items (â¥50% purchase rate)",
+        "Item",
+        "Purchase Rate",
+        "Average Time",
+        "Loading…",
+        "Loading...",
+    }
+
+    cleaned = []
+    for x in lines:
+        x = _collapse_ws(x)
+        if not x:
+            continue
+        if x in ignored:
+            continue
+        if x.startswith("Show Core Items"):
+            continue
+        cleaned.append(x)
+
     core_items: List[BuildItem] = []
     situational_items: List[BuildItem] = []
 
-    in_item_stats = False
-    for i, line in enumerate(lines):
-        low = line.lower()
+    i = 0
+    while i < len(cleaned):
+        name = _clean_item_name(cleaned[i])
 
-        if low == "item stats":
-            in_item_stats = True
+        if (
+            not name
+            or name == "CORE"
+            or _looks_like_percent(name)
+            or _looks_like_time(name)
+            or _looks_like_matches(name)
+            or _is_bad_item_name(name)
+        ):
+            i += 1
             continue
 
-        if not in_item_stats:
-            continue
+        j = i + 1
+        is_core = False
+        purchase_rate = None
+        timing = None
 
-        if low in {
-            "matchups & synergies",
-            "off-meta builds",
-            "loading…",
-            "loading...",
-        }:
-            break
+        if j < len(cleaned) and cleaned[j] == "CORE":
+            is_core = True
+            j += 1
+        elif j < len(cleaned) and _looks_like_percent(cleaned[j]):
+            purchase_rate = cleaned[j]
+            j += 1
 
-        item_name = _extract_item_name_from_text(line)
-        if item_name is None:
-            continue
-
-        item_name = _clean_item_name(item_name)
-        if _is_bad_item_name(item_name):
-            continue
-
-        next1 = lines[i + 1] if i + 1 < len(lines) else ""
-        next2 = lines[i + 2] if i + 2 < len(lines) else ""
-
-        purchase_rate = next1 if re.search(r"\d+(\.\d+)?%", next1) else None
-        timing = next2 if re.search(r"\b\d+m", next2) else None
-        is_core = next1.upper() == "CORE"
+        if j < len(cleaned) and _looks_like_time(cleaned[j]):
+            timing = cleaned[j]
+            j += 1
 
         item = BuildItem(
-            name=item_name,
+            name=name,
             timing=timing,
             purchase_rate=purchase_rate,
             is_core=is_core,
         )
 
-        if is_core and len(core_items) < DEFAULT_MAX_ITEMS:
+        if is_core:
             core_items.append(item)
-        elif len(situational_items) < DEFAULT_MAX_ITEMS:
+        else:
             situational_items.append(item)
 
-    core_items = _dedupe_items(core_items)
-    situational_items = _dedupe_items(situational_items)
+        i = j
 
-    if not core_items:
-        fallback_core: List[BuildItem] = []
-        for item in situational_items[:6]:
-            fallback_core.append(
-                BuildItem(
-                    name=item.name,
-                    timing=item.timing,
-                    purchase_rate=item.purchase_rate,
-                    winrate=item.winrate,
-                    matches=item.matches,
-                    is_core=True,
-                )
+    return _dedupe_items(core_items), _dedupe_items(situational_items)
+
+
+def parse_d2pt_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
+    hero_slug = _hero_slug(hero_name)
+    hero_url_part = _hero_url_part(hero_name)
+    url = DOTA2PROTRACKER_HERO_URL.format(hero_slug=hero_url_part)
+
+    html = _request_html(session, url, logger=logger)
+    soup = BeautifulSoup(html, "html.parser")
+    page_text = soup.get_text("\n", strip=True)
+    lines = [_collapse_ws(x) for x in page_text.splitlines() if _collapse_ws(x)]
+
+    patch = _extract_patch(page_text)
+    role = _extract_role(page_text)
+
+    starting_items = _extract_starting_items_from_html(soup)
+
+    item_stats_section = _extract_item_stats_section(lines)
+    core_items, situational_items = _parse_items_from_lines(item_stats_section)
+
+    core_items = core_items[:DEFAULT_MAX_ITEMS]
+    situational_items = situational_items[:DEFAULT_MAX_ITEMS]
+
+    if not core_items and situational_items:
+        core_items = [
+            BuildItem(
+                name=item.name,
+                timing=item.timing,
+                purchase_rate=item.purchase_rate,
+                is_core=True,
             )
-        core_items = fallback_core
+            for item in situational_items[:6]
+        ]
+
+    _log(
+        logger,
+        "info",
+        f"[builds] hero={hero_name} patch={patch} "
+        f"starting={len(starting_items)} core={len(core_items)} situational={len(situational_items)}",
+    )
 
     return HeroBuild(
         hero=hero_name,
         hero_slug=hero_slug,
         source="dota2protracker",
-        role=role,
-        patch=patch,
-        starting_items=starting_items,
-        core_items=core_items,
-        situational_items=situational_items,
-        raw_url=url,
-    )
-
-
-def parse_dotabuff_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
-    hero_slug = _slugify_hero_name_for_dotabuff(hero_name)
-    url = DOTABUFF_HERO_URL.format(hero_slug=hero_slug)
-
-    html = _request_html(session, url, logger=logger)
-    soup = BeautifulSoup(html, "html.parser")
-
-    page_text = soup.get_text("\n", strip=True)
-    lines = [_collapse_ws(x) for x in page_text.splitlines() if _collapse_ws(x)]
-
-    role = None
-    patch = None
-
-    starting_items: List[BuildItem] = []
-    situational_items: List[BuildItem] = []
-
-    in_common_items = False
-    for i, line in enumerate(lines):
-        low = line.lower()
-
-        if low.startswith("часто используемые предметы"):
-            in_common_items = True
-            continue
-
-        if in_common_items and (
-            low.startswith("силён против")
-            or low.startswith("слаб против")
-            or low.startswith("popular guides")
-            or low.startswith("популярное руководство")
-        ):
-            break
-
-        if not in_common_items:
-            continue
-
-        item_name = _extract_item_name_from_text(line)
-        if item_name is None:
-            continue
-
-        item_name = _clean_item_name(item_name)
-        if _is_bad_item_name(item_name):
-            continue
-
-        m = re.match(r"^(.*?)(\d[\d,]*)$", item_name)
-        if m:
-            item_name = _collapse_ws(m.group(1))
-
-        if not item_name or _is_bad_item_name(item_name):
-            continue
-
-        next1 = lines[i + 1] if i + 1 < len(lines) else ""
-        next2 = lines[i + 2] if i + 2 < len(lines) else ""
-
-        matches = next1 if re.fullmatch(r"\d[\d,]*", next1) else None
-        winrate = next2 if re.fullmatch(r"\d+(\.\d+)?%", next2) else None
-
-        situational_items.append(
-            BuildItem(
-                name=item_name,
-                matches=matches,
-                winrate=winrate,
-            )
-        )
-
-        if len(situational_items) >= DEFAULT_MAX_ITEMS:
-            break
-
-    situational_items = _dedupe_items(situational_items)
-
-    core_items: List[BuildItem] = []
-    for item in situational_items[:6]:
-        core_items.append(
-            BuildItem(
-                name=item.name,
-                timing=item.timing,
-                purchase_rate=item.purchase_rate,
-                winrate=item.winrate,
-                matches=item.matches,
-                is_core=True,
-            )
-        )
-
-    return HeroBuild(
-        hero=hero_name,
-        hero_slug=hero_slug,
-        source="dotabuff",
         role=role,
         patch=patch,
         starting_items=starting_items,
@@ -463,8 +619,6 @@ def _error_record(hero_name: str, hero_slug: str, source: str, error: str) -> Di
 
 def parse_hero_builds(hero_names: List[str], logger=None) -> List[Dict[str, Any]]:
     d2pt_session = make_d2pt_session()
-    dotabuff_session = make_dotabuff_session()
-
     out: List[Dict[str, Any]] = []
 
     for hero_name in hero_names:
@@ -476,24 +630,8 @@ def parse_hero_builds(hero_names: List[str], logger=None) -> List[Dict[str, Any]
             out.append(
                 _error_record(
                     hero_name=hero_name,
-                    hero_slug=_slugify_hero_name_for_d2pt(hero_name),
+                    hero_slug=_hero_slug(hero_name),
                     source="dota2protracker",
-                    error=str(e),
-                )
-            )
-
-        time.sleep(SLEEP_BETWEEN_REQUESTS_SECONDS)
-
-        try:
-            db = parse_dotabuff_hero_build(dotabuff_session, hero_name, logger=logger)
-            out.append(asdict(db))
-        except Exception as e:
-            _log(logger, "warning", f"[builds] dotabuff parse failed for '{hero_name}': {e}")
-            out.append(
-                _error_record(
-                    hero_name=hero_name,
-                    hero_slug=_slugify_hero_name_for_dotabuff(hero_name),
-                    source="dotabuff",
                     error=str(e),
                 )
             )
@@ -512,6 +650,10 @@ def parse_hero_builds(hero_names: List[str], logger=None) -> List[Dict[str, Any]
 if __name__ == "__main__":
     import logging
 
+    with open(DEFAULT_HERO_BUILDS_DIR, "r", encoding="utf-8") as f:
+        hero_map = dict(json.load(f))
+        print(hero_map)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -520,6 +662,6 @@ if __name__ == "__main__":
     log = logging.getLogger("hero-builds")
 
     parse_hero_builds(
-        ["Anti-Mage", "Juggernaut", "Invoker"],
+        list(hero_map.values()),
         logger=log,
     )
