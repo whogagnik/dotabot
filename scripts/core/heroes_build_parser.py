@@ -584,7 +584,7 @@ def parse_d2pt_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
 
     _log(
         logger,
-        "info",
+        "debug",
         f"[builds] hero={hero_name} patch={patch} "
         f"starting={len(starting_items)} core={len(core_items)} situational={len(situational_items)}",
     )

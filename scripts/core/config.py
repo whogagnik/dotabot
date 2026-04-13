@@ -22,9 +22,12 @@ os.environ["TCL_LIBRARY"] = r"C:\Users\bajojo\AppData\Local\Programs\Python\Pyth
 os.environ["TK_LIBRARY"]  = r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tk8.6"
 
 
+DOTABUFF_REFERER = "https://www.dotabuff.com/"
+DOTABUFF_HERO_BUILDS_URL = "https://www.dotabuff.com/heroes/{hero_slug}/builds"
+DOTABUFF_HERO_ABILITIES_URL = "https://www.dotabuff.com/heroes/{hero_slug}/abilities"
 
-
-
+DEFAULT_ID_HERO_TO_NAME = "config/id_hero_to_name.json"
+DEFAULT_OUT = "config/heroes_hero_abilities.json"
 
 OUT_FILE_HERO_BUILDS = BASE_DIR / "config" / "hero_builds.json"
 

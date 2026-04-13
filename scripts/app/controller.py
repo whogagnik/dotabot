@@ -19,7 +19,7 @@ import win32process
 from scripts.core.account import Account
 from scripts.core.config import *
 from scripts.app.window_placer import WindowPlacer
-from scripts.game.game_automation import GameAutomation  # <-- новый модуль
+from scripts.game.start_mm_dota2 import GameAutomation  # <-- новый модуль
 from scripts.app.thread_registry import ThreadRegistry
 
 user32 = ctypes.windll.user32
