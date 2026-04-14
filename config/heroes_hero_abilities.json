@@ -1,0 +1,305 @@
+[
+  {
+    "hero": "Alchemist",
+    "hero_slug": "alchemist",
+    "source": "dotabuff",
+    "builds_url": "https://www.dotabuff.com/heroes/alchemist/builds",
+    "abilities_url": "https://www.dotabuff.com/heroes/alchemist/abilities",
+    "abilities": [
+      {
+        "slot": "innate",
+        "name": "Greevil's Greed",
+        "ability_type_raw": null,
+        "target_kind": "unknown",
+        "affects": null,
+        "damage_type": null,
+        "dispellable": null,
+        "pierces_debuff_immunity": null,
+        "description": "Alchemist synthesizes additional gold from his enemies and bounty runes. With each kill, Alchemist earns base bonus gold and extra bonus gold. If Alchemist kills another unit which yields gold within the next seconds, an additional instance of Extra Bonus Gold is added to the total. Additionally, causes bounty runes to yield more gold.",
+        "extra": {
+          "RECENT KILL WINDOW": "40",
+          "BASE BONUS GOLD": "2",
+          "EXTRA BONUS GOLD": "2",
+          "BOUNTY RUNE MULTIPLIER": "2",
+          "MAX BONUS GOLD PER KILL": "16"
+        }
+      },
+      {
+        "slot": "Q",
+        "name": "Acid Spray",
+        "ability_type_raw": "Point Target",
+        "target_kind": "area",
+        "affects": null,
+        "damage_type": "Physical",
+        "dispellable": null,
+        "pierces_debuff_immunity": "No",
+        "description": null,
+        "extra": {
+          "RADIUS": "350 / 400 / 450 / 500",
+          "DURATION": "15",
+          "DAMAGE PER SECOND": "25 / 30 / 35 / 40",
+          "ARMOR REDUCTION": "3 / 4 / 5 / 6 22 / 21 / 20 / 19 120 900"
+        }
+      },
+      {
+        "slot": "W",
+        "name": "Unstable Concoction",
+        "ability_type_raw": "No Target",
+        "target_kind": "no_target",
+        "affects": null,
+        "damage_type": "Physical",
+        "dispellable": "Strong Dispels Only",
+        "pierces_debuff_immunity": "No",
+        "description": null,
+        "extra": {
+          "MAX STUN": "1.7 / 2.2 / 2.7 / 3.2",
+          "MAX DAMAGE": "150 / 220 / 290 / 360",
+          "EXPLOSION RADIUS": "250",
+          "MOVE SPEED BONUS": "4 / 8 / 12 / 16 17 100 775"
+        }
+      },
+      {
+        "slot": "E",
+        "name": "Corrosive Weaponry",
+        "ability_type_raw": "Passive",
+        "target_kind": "passive",
+        "affects": null,
+        "damage_type": null,
+        "dispellable": null,
+        "pierces_debuff_immunity": "No",
+        "description": null,
+        "extra": {
+          "MAX STACKS": "7 / 10 / 13 / 16",
+          "DEBUFF DURATION": "4",
+          "MOVEMENT SLOW PER STACK": "2.5 / 3 / 3.5 / 4",
+          "BASE ATTACK DAMAGE REDUCTION PER STACK": "2.5 / 3 / 3.5 / 4"
+        }
+      },
+      {
+        "slot": "D",
+        "name": "Berserk Potion",
+        "ability_type_raw": "Unit Target",
+        "target_kind": "unit",
+        "affects": "Allied Units",
+        "damage_type": null,
+        "dispellable": "Yes",
+        "pierces_debuff_immunity": "Yes",
+        "description": null,
+        "extra": {
+          "DURATION": "15",
+          "ATTACK SPEED": "50",
+          "HP REGEN": "40",
+          "MOVE SPEED": "30 35 100 800"
+        }
+      },
+      {
+        "slot": "R",
+        "name": "Chemical Rage",
+        "ability_type_raw": "No Target",
+        "target_kind": "no_target",
+        "affects": null,
+        "damage_type": null,
+        "dispellable": "Cannot be dispelled",
+        "pierces_debuff_immunity": null,
+        "description": null,
+        "extra": {
+          "DURATION": "30",
+          "BASE ATTACK TIME": "1.2 / 1.1 / 1",
+          "BONUS HEALTH REGEN": "60 / 90 / 120",
+          "BONUS MOVE SPEED": "20 / 30 / 40 60 50 / 75 / 100"
+        }
+      }
+    ],
+    "most_popular_builds": [
+      {
+        "build_rate": "10.35%",
+        "winrate": "26.47%",
+        "levels": {
+          "Q": [
+            2,
+            3,
+            5,
+            7
+          ],
+          "W": [
+            1,
+            4,
+            8,
+            9
+          ],
+          "E": [
+            11,
+            12,
+            14
+          ],
+          "R": [
+            6,
+            13,
+            18
+          ]
+        },
+        "talents": {
+          "15": "",
+          "16": "",
+          "10": ""
+        }
+      },
+      {
+        "build_rate": "9.87%",
+        "winrate": "27.16%",
+        "levels": {
+          "Q": [
+            2,
+            3,
+            5,
+            7
+          ],
+          "W": [
+            1,
+            4,
+            8,
+            9
+          ],
+          "E": [
+            12,
+            14
+          ],
+          "R": [
+            6,
+            11,
+            13,
+            18
+          ]
+        },
+        "talents": {
+          "10": "",
+          "15": "",
+          "16": ""
+        }
+      },
+      {
+        "build_rate": "4.99%",
+        "winrate": "26.83%",
+        "levels": {
+          "Q": [
+            2,
+            3,
+            5,
+            7
+          ],
+          "W": [
+            1,
+            4,
+            8,
+            9
+          ],
+          "E": [
+            12,
+            14
+          ],
+          "R": [
+            6,
+            11,
+            13,
+            18
+          ]
+        },
+        "talents": {
+          "10": "",
+          "15": "",
+          "16": ""
+        }
+      },
+      {
+        "build_rate": "4.57%",
+        "winrate": "22.67%",
+        "levels": {
+          "Q": [
+            2,
+            3,
+            5,
+            7
+          ],
+          "W": [
+            1,
+            4,
+            8,
+            9
+          ],
+          "E": [
+            11,
+            12,
+            14
+          ],
+          "R": [
+            6,
+            13,
+            18
+          ]
+        },
+        "talents": {
+          "15": "",
+          "10": "",
+          "16": ""
+        }
+      },
+      {
+        "build_rate": "4.51%",
+        "winrate": "25.68%",
+        "levels": {
+          "Q": [
+            1,
+            3,
+            5,
+            7
+          ],
+          "W": [
+            2,
+            4,
+            8,
+            9
+          ],
+          "E": [
+            12,
+            14
+          ],
+          "R": [
+            6,
+            11,
+            13,
+            18
+          ]
+        },
+        "talents": {
+          "10": "",
+          "15": "",
+          "16": ""
+        }
+      }
+    ],
+    "point_choices_by_level": {
+      "Q": {
+        "1": "35.2%",
+        "2": "64.8%"
+      },
+      "W": {
+        "1": "64.8%",
+        "2": "29.0%",
+        "4": "1.8%",
+        "6": "2.2%",
+        "8": "1.8%"
+      },
+      "E": {
+        "1": "6.2%",
+        "2": "22.9%",
+        "4": "4.0%",
+        "6": "33.5%",
+        "8": "32.3%"
+      },
+      "R": {
+        "1": "100.0%",
+        "2": "100.0%"
+      }
+    }
+  }
+]
