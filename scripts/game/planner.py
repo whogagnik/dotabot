@@ -230,6 +230,7 @@ class Planner:
 
     def __init__(self,
                  hwnds: List[int],
+                 roles: List[str],
                  side: str = "radiant",
                  *,
                  full_frame_min_dt: float = 0.01,
@@ -239,6 +240,7 @@ class Planner:
         self.side  = side.lower().strip()  # 'radiant' | 'dire'
         self.log   = logger
         self.self_hp = SelfHud()
+        self.roles = roles
         self.game_start_ts: float = time.time()  # пока просто "момент запуска бота"
 
         # частоты обновления
@@ -286,8 +288,8 @@ class Planner:
         self.net, self.classes, self.size = load_minimap_model(DEFAULT_ML_MINIMAP_DIR, device='cuda')
         self.cls2idx = {c: i for i, c in enumerate(self.classes)}  # {'self','ally','enemy'}
         self.brains: Dict[int, Brain] = {
-            hwnd: Brain(hwnd, planner=self, logger=logger)
-            for hwnd in hwnds
+            hwnd: Brain(hwnd, planner=self, logger=logger, role=role)
+            for hwnd, role in zip(hwnds, self.roles)
         }
 
         # последняя миникартная ROI (экранные координаты)
@@ -586,7 +588,7 @@ class Planner:
                 pass
         self._press_vk_global(vk, hold_ms=hold_ms)
 
-    def center_screen_on_self(self, hwnd: int, *, force_fg: bool = True, cooldown_sec: Optional[float] = None) -> None:
+    def center_screen_on_self(self, hwnd: int, *, force_fg: bool = True, cooldown_sec: Optional[float] = 1) -> None:
         """
         Центруем камеру на себе через горячую клавишу KEY_FOR_CENTER_SCREEN.
         Есть per-hwnd cooldown чтобы не спамить каждый тик.
@@ -597,7 +599,8 @@ class Planner:
         if cd > 0 and (now - last) < cd:
             return
 
-        self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=25, force_fg=force_fg)
+        self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=0, force_fg=force_fg)
+        self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=10, force_fg=force_fg)
         self._last_center_ts_by_hwnd[hwnd] = now
 
     def _stabilize_creeps_for_hwnd(
@@ -877,7 +880,7 @@ class Planner:
         t_total = (perf_counter() - t_total0) * 1000.0
 
         if self.log:
-            self.log.debug(
+            self.log.info(
                 f"[TIMERS] hwnd={hex(hwnd)} "
                 f"dev={t_dev:.2f}ms "
                 f"mm_infer={t_infer_mm:.2f}ms "
@@ -1207,7 +1210,7 @@ if __name__ == "__main__":
 
     log.info(f"Нашёл hwnd={hex(hwnd)} для , side={args.side}")
 
-    pl = Planner(hwnds=[hwnd], side=args.side, logger=log)
+    pl = Planner(hwnds=[hwnd], side=args.side, logger=log,roles=['unknown'])
 
     prev_time = time.time()
     fps_smooth = 0.0

@@ -1,13 +1,11 @@
 from __future__ import annotations
-
 import time
-from enum import Enum, auto
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, TYPE_CHECKING, Tuple, List
-
+from typing import Dict, Any, Optional, TYPE_CHECKING, Tuple, List, Callable
+import csv
+from pathlib import Path
 import numpy as np
 from scripts.core.utils import *  # noqa
-
+from scripts.core.config import CATBOOST_DATASET_CSV_PATH
 
 
 if TYPE_CHECKING:
@@ -92,9 +90,10 @@ class CampKind(Enum):
 class CampState(Enum):
     READY = auto()
     CLEARED = auto()
+    SKIPPED = auto()
 
 class FarmPlan(Enum):
-    # “взвешивание”: либо сначала линия (точку добавишь позже) -> лес, либо сразу лес
+    # Optional route preset for old farming pipeline.
     LANE_THEN_JUNGLE = auto()
     JUNGLE_ONLY = auto()
 
@@ -104,6 +103,26 @@ class FarmPhase(Enum):
     FIGHT = auto()
     RETREAT = auto()
 
+
+class LaneFarmPhase(Enum):
+    SELECT_SEGMENT = auto()
+    MOVE_TO_POINT = auto()
+    WAIT_OR_CLEAR_WAVE = auto()
+    DONE = auto()
+    ABORT = auto()
+
+
+
+class BrainState(Enum):
+    IDLE = auto()
+    LANING = auto()
+    FARMING_JUNGLE = auto()
+    FARMING_LANE = auto()
+    MOVING = auto()
+    FIGHTING = auto()
+    RETREAT = auto()
+    DEAD = auto()
+    WAIT_START = auto()
 @dataclass
 class CampNode:
     camp_id: int
@@ -119,19 +138,32 @@ class Senses:
     hp_ratio: Optional[float]
     low_hp: bool
 
+    side: str
+    role: str
+
     enemy_hero_near: bool
     enemy_hero_dist_screen: Optional[float]
     enemy_hero_dist_mm: Optional[float]
-
-    # --- перенесли из tick_laning сюда ---
     enemy_hero_cnt_screen: int
     avg_enemy_hero_hp_ratio_screen: Optional[float]
 
+    ally_hero_cnt_screen: int
+    closest_enemy_hero_hp_ratio: Optional[float]
+    closest_enemy_hero_dist_px: Optional[float]
+
     enemy_creep_near: bool
     enemy_creep_dist_screen: Optional[float]
+    enemy_creep_cnt_screen: int
 
     ally_creep_near: bool
     ally_creep_dist_screen: Optional[float]
+    ally_creep_cnt_screen: int
+
+    best_enemy_lasthit_hp_ratio: Optional[float]
+    best_enemy_lasthit_dist_px: Optional[float]
+
+    best_ally_deny_hp_ratio: Optional[float]
+    best_ally_deny_dist_px: Optional[float]
 
     under_ally_tower: bool
     ally_tower_dist_mm: Optional[float]
@@ -141,14 +173,86 @@ class Senses:
 
     landmarks: Optional[Dict[str, Any]]
 
-class BrainState(Enum):
-    IDLE = auto()
-    LANING = auto()
-    FARMING = auto()
-    MOVING = auto()
-    FIGHTING = auto()
-    DEAD = auto()
-    WAIT_START = auto()
+    lane_key_known: bool
+    last_action_delta: float
+    lane_wave_seen: bool
+    lane_wave_seen_delta: float
+
+    has_lasthit_target: bool
+    has_lane_target: bool
+    has_farm_target: bool
+    has_moving_target: bool
+
+    brain_state_name: str
+    farm_phase_name: str
+    lane_farm_phase_name: str
+
+    self_x_uv: Optional[float]
+    self_y_uv: Optional[float]
+
+    def to_catboost_features(self) -> Dict[str, Any]:
+        return {
+            "alive": bool(self.alive),
+            "t_game": float(self.t_game),
+            "hp_ratio": None if self.hp_ratio is None else float(self.hp_ratio),
+            "low_hp": bool(self.low_hp),
+
+            "side": self.side,
+            "role": self.role,
+
+            "enemy_hero_near": bool(self.enemy_hero_near),
+            "enemy_hero_dist_screen": self.enemy_hero_dist_screen,
+            "enemy_hero_dist_mm": self.enemy_hero_dist_mm,
+            "enemy_hero_cnt_screen": int(self.enemy_hero_cnt_screen),
+            "avg_enemy_hero_hp_ratio_screen": self.avg_enemy_hero_hp_ratio_screen,
+
+            "ally_hero_cnt_screen": int(self.ally_hero_cnt_screen),
+            "closest_enemy_hero_hp_ratio": self.closest_enemy_hero_hp_ratio,
+            "closest_enemy_hero_dist_px": self.closest_enemy_hero_dist_px,
+
+            "enemy_creep_near": bool(self.enemy_creep_near),
+            "enemy_creep_dist_screen": self.enemy_creep_dist_screen,
+            "enemy_creep_cnt_screen": int(self.enemy_creep_cnt_screen),
+
+            "ally_creep_near": bool(self.ally_creep_near),
+            "ally_creep_dist_screen": self.ally_creep_dist_screen,
+            "ally_creep_cnt_screen": int(self.ally_creep_cnt_screen),
+
+            "best_enemy_lasthit_hp_ratio": self.best_enemy_lasthit_hp_ratio,
+            "best_enemy_lasthit_dist_px": self.best_enemy_lasthit_dist_px,
+
+            "best_ally_deny_hp_ratio": self.best_ally_deny_hp_ratio,
+            "best_ally_deny_dist_px": self.best_ally_deny_dist_px,
+
+            "under_ally_tower": bool(self.under_ally_tower),
+            "ally_tower_dist_mm": self.ally_tower_dist_mm,
+
+            "near_enemy_tower": bool(self.near_enemy_tower),
+            "enemy_tower_dist_mm": self.enemy_tower_dist_mm,
+
+            "lane_key_known": bool(self.lane_key_known),
+            "last_action_delta": float(self.last_action_delta),
+            "lane_wave_seen": bool(self.lane_wave_seen),
+            "lane_wave_seen_delta": float(self.lane_wave_seen_delta),
+
+            "has_lasthit_target": bool(self.has_lasthit_target),
+            "has_lane_target": bool(self.has_lane_target),
+            "has_farm_target": bool(self.has_farm_target),
+            "has_moving_target": bool(self.has_moving_target),
+
+            "brain_state_name": self.brain_state_name,
+            "farm_phase_name": self.farm_phase_name,
+            "lane_farm_phase_name": self.lane_farm_phase_name,
+
+            "self_x_uv": self.self_x_uv,
+            "self_y_uv": self.self_y_uv,
+            "enemy_minus_ally_heroes": int(self.enemy_hero_cnt_screen) - int(self.ally_hero_cnt_screen),
+            "enemy_minus_ally_creeps": int(self.enemy_creep_cnt_screen) - int(self.ally_creep_cnt_screen),
+            "has_wave_clash": bool(self.enemy_creep_near and self.ally_creep_near),
+            "can_lasthit_enemy": bool(self.best_enemy_lasthit_hp_ratio is not None),
+            "can_deny_ally": bool(self.best_ally_deny_hp_ratio is not None),
+        }
+
 
 
 class Brain:
@@ -157,11 +261,14 @@ class Brain:
     Он не знает про окна в целом, только про свой hwnd + данные из Planner.
     """
 
-    def __init__(self, hwnd: int, planner: "Planner", logger=None):
+    def __init__(self, hwnd: int, planner: "Planner", logger=None,role: str = "unknown",):
         self.hwnd = hwnd
         self.pl = planner
         self.log = logger
         self.state = BrainState.IDLE
+        self.role = str(role).lower().strip() if role is not None else "unknown"
+        if not self.role:
+            self.role = "unknown"
 
         # время старта (для t_game)
         self.t0 = time.time()
@@ -174,18 +281,24 @@ class Brain:
         self._moving_radius: float = 5.0  # радиус "достаточно близко" (в тех же единицах)
         self.lane_offset_px: float = 80.0  # насколько пикселей отходить от линии по нормали
 
+        self._wait_start_target: Optional[Tuple[float, float]] = None
+        self._wait_start_click_cooldown: float = 1.0
+        self._wait_start_last_click_ts: float = 0.0
+
         # --------- FARMING state ---------
         self.farm_plan: FarmPlan = FarmPlan.JUNGLE_ONLY
         self.farm_lane_prob: float = 0.35   # шанс выбрать LANE_THEN_JUNGLE (если линия будет задана)
 
         self._farm_phase: FarmPhase = FarmPhase.PICK_TARGET
         self._farm_target_id: Optional[int] = None
+        self._farm_fight_camp_id: Optional[int] = None
+        self._farm_fight_started_near_target: bool = False
 
         self._camps: list[CampNode] = []
         self._camps_inited: bool = False
         self._camp_reset_minute: int = -1  # для ресета каждую минуту
 
-        self._farming_minimap_click_cooldown: float = 1.0  # сек
+        self._farming_minimap_click_cooldown: float = 5.0  # сек
         self._farming_last_minimap_click_ts: float = 0.0
 
         self.min_enemy_dist_px: float = 150.0
@@ -195,7 +308,7 @@ class Brain:
         self._lasthit_target_expire: float = 0.0  # safety timeout
 
         # --- attack (screen click) cooldown ---
-        self._attack_click_cooldown: float = 0.4  # сек, подстрой если надо
+        self._attack_click_cooldown: float = 1.5  # сек, подстрой если надо
         self._last_attack_click_ts: float = 0.0
 
         # --- lasthit / approach tuning ---
@@ -203,14 +316,14 @@ class Brain:
         self.lasthit_attack_hp: float = 0.25  # реально добивать при <= 0.25
         self.lasthit_attack_range_px: float = 150.0  # “мы в радиусе удара”
         self.lasthit_max_seek_px: float = 650.0  # дальше не рассматриваем
-        self.lasthit_cmd_cooldown: float = 0.4  # чтобы не спамить клики
+        self.lasthit_cmd_cooldown: float = 1  # чтобы не спамить клики
 
         self._manual_switch_last_ts: float = 0.0
         self._digit_prev_down: Dict[int, bool] = {d: False for d in range(1, 10)}
         self._manual_switch_cooldown: float = 0.20  # антидребезг
 
         # --- anti spam walk clicks ---
-        self.walk_cmd_cooldown: float = 0.30   # общий кулдаун на walk-команды
+        self.walk_cmd_cooldown: float = 0.50   # общий кулдаун на walk-команды
         self.walk_same_target_tol_px: float = 18.0  # "та же цель" для walk
 
         self._last_walk_ts: float = 0.0
@@ -219,38 +332,83 @@ class Brain:
         # --- LANING orientation ---
         self._lane_inited: bool = False
         self._lane_key: Optional[str] = None          # "lane_top" / "lane_mid" / "lane_bot"
-        self._lane_anchor_uv: Optional[Tuple[float, float]] = None  # точка 0..100 на линии у Т1
+        self._lane_anchor_uv: Optional[Tuple[float, float]] = None  # ����� 0..100 �� ����� � �1
+
+        # --- CatBoost action routing (stub) ---
 
 
+        self._catboost_model = None
+        self._brain_state_id_map: Dict[int, BrainState] = {
+            0: BrainState.FARMING_JUNGLE,
+            1: BrainState.FARMING_LANE,
+            2: BrainState.LANING,
+            3: BrainState.FIGHTING,
+            4: BrainState.RETREAT,
+            5: BrainState.IDLE,
+        }
+
+
+        self.catboost_dataset_flush_every: int = 100
+        self.catboost_dataset_csv_path: str = CATBOOST_DATASET_CSV_PATH
+        self.use_catboost_brain_state: bool = True
+        self._catboost_dataset_rows: List[Dict[str, Any]] = []
+        self.collect_catboost_dataset: bool = False
+
+        # --- lane farming FSM memory ---
+        self._lane_farm_phase: LaneFarmPhase = LaneFarmPhase.SELECT_SEGMENT
+        self._lane_target_uv: Optional[Tuple[float, float]] = None
+        self._lane_wave_seen: bool = False
+        self._lane_wave_last_seen_ts: float = 0.0
+        self._lane_phase_start_ts: float = 0.0
+
+        # --- lane farming tunables ---
+        self.lane_attach_uv: float = 5.0
+        self.lane_max_depth_frac: float = 0.45
+        self.lane_tower_margin: float = 0.03
+        self.lane_arrive_radius_uv: float = 5.0
+        self.lane_move_timeout: float = 15.0
+        self.lane_find_wave_timeout: float = 30.0
+        self.lane_wave_timeout: float = 22.0
+        self.lane_wave_clear_grace: float = 2.5
+        self._farm_no_creep_since_ts: float = 0.0
+        self._farm_arrived_at_camp_ts: float = 0.0
+        self._farm_cleared_confirm_delay: float = 1.2
+        self._farm_stuck_near_camp_timeout: float = 2.0
+        self._farm_near_camp_radius_uv: float = 6
 
     # --------- публичный метод ---------
     def tick_one(self, snap: "Snapshot"):
-        """
-        Один тик мозга.
-        Дополнительно: цифры 1..N (N = кол-во tick_{state}) переключают текущий state,
-        и, соответственно, то какой tick_{state} будет вызываться.
-        """
         c = snap.combined
 
-        # 1) senses
         senses = self._gather_senses(c)
 
-        # 2) ручное переключение state цифрами
-        states = list(BrainState)  # порядок как в Enum: IDLE, LANING, FARMING, MOVING, FIGHTING, DEAD, WAIT_START
+        states = list(BrainState)
         d = self._poll_digit_press(max_digit=len(states))
         if d is not None:
             new_state = states[d - 1]
             self._set_state(new_state)
             if self.log:
                 self.log.info(f"[BRAIN {hex(self.hwnd)}] manual switch: {d} -> {new_state.name}")
+        else:
 
-        # 3) выполняем тик по текущему state
+            # системные override-состояния
+            forced_state = self._get_forced_state(senses)
+            '''
+            if forced_state is not None:
+                self._set_state(forced_state)
+            elif self.use_catboost_brain_state:
+                if self._catboost_model is None:
+                    raise RuntimeError("use_catboost_brain_state=True, but CatBoost model is not loaded")
+
+                features = senses.to_catboost_features()
+                predicted_state = self._predict_brain_state_with_catboost(features)
+                self._set_state(predicted_state)
+            '''
+        self._collect_catboost_train_row(senses)
+
         self._tick_state(c, senses)
 
     def _tick_state(self, c: Dict[str, Any], s: Senses):
-        """
-        Диспетчер: в зависимости от self.state зовёт нужный _tick_*.
-        """
         st = self.state
 
         if st is BrainState.DEAD:
@@ -265,11 +423,17 @@ class Brain:
         elif st is BrainState.LANING:
             self._tick_laning(c, s)
 
-        elif st is BrainState.FARMING:
-            self._tick_farming(c, s)
+        elif st is BrainState.FARMING_JUNGLE:
+            self._tick_farming_jungle(c, s)
+
+        elif st is BrainState.FARMING_LANE:
+            self._tick_farming_lane(c, s)
 
         elif st is BrainState.FIGHTING:
             self._tick_fighting(c, s)
+
+        elif st is BrainState.RETREAT:
+            self._tick_retreat(c, s)
 
         elif st is BrainState.IDLE:
             self._tick_idle(c, s)
@@ -277,31 +441,6 @@ class Brain:
         else:
             if self.log:
                 self.log.warning(f"[BRAIN {hex(self.hwnd)}] unknown state: {st}")
-
-    def _update_state(self, s: Senses):
-        # смерть
-        if not s.alive:
-            self._set_state(BrainState.DEAD)
-            return
-
-        # до 1:50 ждём у T1
-        if s.t_game < 110:
-            if self.state != BrainState.MOVING:
-                self._set_state(BrainState.WAIT_START)
-            return
-
-        if s.enemy_creep_near and s.ally_creep_near:
-            self._set_state(BrainState.LANING)
-
-        # если рядом враг-герой — дерёмся
-        if s.enemy_hero_near and s.hp_ratio and s.hp_ratio > 0.5 and self.state != BrainState.FIGHTING:
-            self._set_state(BrainState.FIGHTING)
-            return
-
-        # если врагов нет, но есть крипы в лесу — FARMING
-        if s.enemy_creep_near and not s.enemy_hero_near:
-            self._set_state(BrainState.FARMING)
-            return
 
     def _gather_senses(self, c: Dict[str, Any]) -> Senses:
         alive = bool(c.get("alive", True))
@@ -324,16 +463,35 @@ class Brain:
 
         low_hp = hp_ratio is not None and hp_ratio < 0.3
 
-        # простые эвристики рядом/под башней
         enemy_hero_near, hero_dist_scr, hero_dist_mm = self._sense_enemy_hero_near(c)
         enemy_creep_near, enemy_creep_dist_scr = self._sense_enemy_creep_near(c)
         ally_creep_near, ally_creep_dist_scr = self._sense_ally_creep_near(c)
         under_ally_tower, ally_tower_dist_mm = self._sense_under_ally_tower(c)
         near_enemy_tower, enemy_tower_dist_mm = self._sense_near_enemy_tower(c)
 
-        # --- ПЕРЕНЕСЕНО ИЗ tick_laning ---
         enemy_cnt_screen = self._count_enemy_heroes_near_screen(c)
         avg_enemy_hp_screen = self._avg_enemy_hero_hp_ratio_screen(c)
+
+        ally_hero_cnt_screen = self._count_ally_heroes_near_screen(c)
+        closest_enemy_hero_hp_ratio, closest_enemy_hero_dist_px = self._closest_enemy_hero_features(c)
+
+        enemy_creep_cnt_screen = self._count_enemy_creeps_screen(c)
+        ally_creep_cnt_screen = self._count_ally_creeps_screen(c)
+
+        best_enemy_lasthit_hp_ratio, best_enemy_lasthit_dist_px = self._best_lasthit_features(
+            c, enemy=True, hp_threshold=0.5
+        )
+        best_ally_deny_hp_ratio, best_ally_deny_dist_px = self._best_lasthit_features(
+            c, enemy=False, hp_threshold=0.5
+        )
+
+        now = time.time()
+        last_action_delta = (now - self.last_action_ts) if self.last_action_ts > 0 else 9999.0
+        lane_wave_seen_delta = (now - self._lane_wave_last_seen_ts) if self._lane_wave_last_seen_ts > 0 else 9999.0
+
+        self_uv = self._get_self_uv(c)
+        self_x_uv = float(self_uv[0]) if self_uv is not None else None
+        self_y_uv = float(self_uv[1]) if self_uv is not None else None
 
         return Senses(
             alive=alive,
@@ -341,27 +499,58 @@ class Brain:
             hp_ratio=hp_ratio,
             low_hp=low_hp,
 
+            side=self._get_side(),
+            role=self._get_role(),
+
             enemy_hero_near=enemy_hero_near,
             enemy_hero_dist_screen=hero_dist_scr,
             enemy_hero_dist_mm=hero_dist_mm,
-
             enemy_hero_cnt_screen=enemy_cnt_screen,
             avg_enemy_hero_hp_ratio_screen=avg_enemy_hp_screen,
 
+            ally_hero_cnt_screen=ally_hero_cnt_screen,
+            closest_enemy_hero_hp_ratio=closest_enemy_hero_hp_ratio,
+            closest_enemy_hero_dist_px=closest_enemy_hero_dist_px,
+
             enemy_creep_near=enemy_creep_near,
             enemy_creep_dist_screen=enemy_creep_dist_scr,
+            enemy_creep_cnt_screen=enemy_creep_cnt_screen,
 
             ally_creep_near=ally_creep_near,
             ally_creep_dist_screen=ally_creep_dist_scr,
+            ally_creep_cnt_screen=ally_creep_cnt_screen,
+
+            best_enemy_lasthit_hp_ratio=best_enemy_lasthit_hp_ratio,
+            best_enemy_lasthit_dist_px=best_enemy_lasthit_dist_px,
+
+            best_ally_deny_hp_ratio=best_ally_deny_hp_ratio,
+            best_ally_deny_dist_px=best_ally_deny_dist_px,
 
             under_ally_tower=under_ally_tower,
             ally_tower_dist_mm=ally_tower_dist_mm,
 
             near_enemy_tower=near_enemy_tower,
             enemy_tower_dist_mm=enemy_tower_dist_mm,
-            landmarks=c.get("landmarks").get('data')
-        )
 
+            landmarks=((c.get("landmarks") or {}).get("data") if isinstance(c.get("landmarks"), dict) else None),
+
+            lane_key_known=bool(self._lane_key),
+            last_action_delta=float(last_action_delta),
+            lane_wave_seen=bool(self._lane_wave_seen),
+            lane_wave_seen_delta=float(lane_wave_seen_delta),
+
+            has_lasthit_target=bool(self._lasthit_target_key is not None),
+            has_lane_target=bool(self._lane_target_uv is not None),
+            has_farm_target=bool(self._farm_target_id is not None),
+            has_moving_target=bool(self._moving_point is not None),
+
+            brain_state_name=self.state.name.lower(),
+            farm_phase_name=self._farm_phase.name.lower() if self._farm_phase is not None else "none",
+            lane_farm_phase_name=self._lane_farm_phase.name.lower() if self._lane_farm_phase is not None else "none",
+
+            self_x_uv=self_x_uv,
+            self_y_uv=self_y_uv,
+        )
 
     @staticmethod
     @debug_log_result
@@ -433,6 +622,75 @@ class Brain:
 
         return mid, d, n, c_a, c_e
 
+    @debug_log_result
+    def _count_enemy_creeps_screen(self, c: Dict[str, Any]) -> int:
+        creeps = c.get("creeps", {})
+        enemy_creeps = creeps.get("enemy", [])
+        return len(enemy_creeps) if enemy_creeps else 0
+
+    @debug_log_result
+    def _count_ally_creeps_screen(self, c: Dict[str, Any]) -> int:
+        creeps = c.get("creeps", {})
+        ally_creeps = creeps.get("ally", [])
+        return len(ally_creeps) if ally_creeps else 0
+
+    @debug_log_result
+    def _closest_enemy_hero_features(
+            self,
+            c: Dict[str, Any],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        enemy_heroes = heroes.get("enemy", [])
+
+        if not self_heroes or not enemy_heroes:
+            return None, None
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+
+        best_dist: Optional[float] = None
+        best_hp: Optional[float] = None
+
+        for eb in enemy_heroes:
+            ex, ey = self._hpbar_center(eb)
+            dist = float(((ex - hx) ** 2 + (ey - hy) ** 2) ** 0.5)
+            hp_ratio = getattr(eb, "hp_ratio", None)
+
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_hp = float(hp_ratio) if hp_ratio is not None else None
+
+        return best_hp, best_dist
+
+    @debug_log_result
+    def _best_lasthit_features(
+            self,
+            c: Dict[str, Any],
+            *,
+            enemy: bool = True,
+            hp_threshold: float = 0.5,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        candidate = self._select_creep(c, hp_threshold=hp_threshold, enemy=enemy)
+        if candidate is None:
+            return None, None
+
+        cb, cx, cy = candidate
+        hp_ratio = getattr(cb, "hp_ratio", None)
+
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        if not self_heroes:
+            return (float(hp_ratio) if hp_ratio is not None else None), None
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+        dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
+
+        return (float(hp_ratio) if hp_ratio is not None else None), dist
+    @debug_log_result
+    def _count_ally_heroes_near_screen(self, c: Dict[str, Any]) -> int:
+        heroes = c.get("heroes", {})
+        ally_heroes = heroes.get("ally", [])
+        return len(ally_heroes) if ally_heroes else 0
     @debug_log_result
     def _compute_dist_to_enemy_hero(self, s: Senses) -> float:
         """
@@ -555,8 +813,49 @@ class Brain:
 
         return risk <= threshold
 
-    # --------- служебные ---------
-    # --- НОВОЕ: low-level чтение цифровых клавиш (Windows) ---
+    def _flush_catboost_dataset_to_csv(self, force: bool = False) -> None:
+        if not self._catboost_dataset_rows:
+            return
+
+        if (not force) and (len(self._catboost_dataset_rows) < self.catboost_dataset_flush_every):
+            return
+
+        rows = self._catboost_dataset_rows
+        self._catboost_dataset_rows = []
+
+        path = Path(self.catboost_dataset_csv_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # единый набор колонок
+        fieldnames: List[str] = []
+        for row in rows:
+            for key in row.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+        file_exists = path.exists() and path.stat().st_size > 0
+
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+
+            if not file_exists:
+                writer.writeheader()
+
+            for row in rows:
+                normalized_row = {k: row.get(k) for k in fieldnames}
+                writer.writerow(normalized_row)
+
+        if self.log:
+            self.log.info(
+                f"[BRAIN {hex(self.hwnd)}] flushed {len(rows)} catboost rows to {path}"
+            )
+
+    def flush_catboost_dataset_now(self) -> None:
+        self._flush_catboost_dataset_to_csv(force=True)
     def _vk_digit(self, d: int) -> int:
         # '1'..'9' => 0x31..0x39
         return 0x30 + d
@@ -610,12 +909,26 @@ class Brain:
             return float(me["x"]), float(me["y"])
         except Exception:
             return None
+    def _dump_catboost_dataset(self) -> List[Dict[str, Any]]:
+        return list(self._catboost_dataset_rows)
+
+    def _get_forced_state(self, s: Senses) -> Optional[BrainState]:
+
+        if not s.alive:
+            return BrainState.DEAD
+
+        if s.t_game < 110:
+            return BrainState.WAIT_START
+
+        return None
+    def _clear_catboost_dataset(self) -> None:
+        self._catboost_dataset_rows.clear()
 
     def _ensure_camps_inited(self, s: Senses) -> None:
         if self._camps_inited:
             return
 
-        root = s.landmarks
+        root = s.landmarks or {}
 
         key_to_kind = {
             "camp_small": CampKind.SMALL,
@@ -708,6 +1021,29 @@ class Brain:
         self.last_action_ts = now
         return True
 
+    def _compute_retreat_screen_point(
+            self,
+            c: Dict[str, Any],
+            from_screen_xy: Tuple[float, float],
+            *,
+            step_px: float = 140.0,
+    ) -> Optional[Tuple[int, int]]:
+        cur_uv = self._get_self_uv(c)
+        if cur_uv is None:
+            return None
+
+        base_uv = self._pick_fountain_point(c)
+        dx_uv = float(base_uv[0] - cur_uv[0])
+        dy_uv = float(base_uv[1] - cur_uv[1])
+
+        norm_uv = float((dx_uv * dx_uv + dy_uv * dy_uv) ** 0.5)
+        if norm_uv <= 1e-6:
+            return None
+
+        sx, sy = from_screen_xy
+        tx = int(round(float(sx) + dx_uv / norm_uv * step_px))
+        ty = int(round(float(sy) + dy_uv / norm_uv * step_px))
+        return tx, ty
     @debug_log_result
     def _compute_laning_point(self, c: Dict[str, Any], min_dist_to_enemy: float) -> Optional[tuple[int, int]]:
         heroes = c.get("heroes", {})
@@ -925,6 +1261,8 @@ class Brain:
         side = getattr(self.pl, "side", "radiant")
         return str(side).lower().strip()
 
+    def _get_role(self) -> str:
+        return self.role
     @debug_log_result
     def _reset_camps_if_needed(self, t_game: float) -> None:
         minute = int(max(0.0, float(t_game)) // 60.0)
@@ -933,6 +1271,12 @@ class Brain:
         self._camp_reset_minute = minute
         for camp in self._camps:
             camp.state = CampState.READY
+
+    def _reset_jungle_fight_runtime(self) -> None:
+        self._farm_fight_camp_id = None
+        self._farm_fight_started_near_target = False
+        self._farm_no_creep_since_ts = 0.0
+        self._farm_arrived_at_camp_ts = 0.0
 
     def _get_camp_by_id(self, camp_id: Optional[int]) -> Optional[CampNode]:
         if camp_id is None:
@@ -950,7 +1294,7 @@ class Brain:
         best = None
         best_d2 = 1e18
         for camp in self._camps:
-            if camp.state is CampState.CLEARED:
+            if camp.state is not CampState.READY:
                 continue
             if kind is not None and camp.kind is not kind:
                 continue
@@ -960,6 +1304,35 @@ class Brain:
                 best = camp
         return best
 
+    def _is_near_camp(self, cur: Optional[Tuple[float, float]], camp: CampNode, *,
+                      radius_uv: Optional[float] = None) -> bool:
+        if cur is None:
+            return False
+        r = self._farm_near_camp_radius_uv if radius_uv is None else float(radius_uv)
+        return _euclid2(cur, (camp.x, camp.y)) <= (r * r)
+
+    def _enemy_creeps_near_camp(
+            self,
+            c: Dict[str, Any],
+            s: Senses,
+            camp: CampNode,
+            *,
+            radius_uv: Optional[float] = None,
+    ) -> bool:
+        cur = self._get_self_uv(c)
+        if cur is None:
+            return False
+
+        r = self._farm_near_camp_radius_uv if radius_uv is None else float(radius_uv)
+        near_camp = _euclid2(cur, (camp.x, camp.y)) <= (r * r)
+
+        # если мы не рядом с camp — screen creeps не считаем крипами этого лагеря
+        if not near_camp:
+            return False
+
+        # если рядом с лагерем и на экране видны enemy creeps —
+        # считаем, что это крипы этого лагеря
+        return bool(s.enemy_creep_near)
     def _attack_enemy_creep_on_screen(self, c: Dict[str, Any]) -> bool:
         heroes = c.get("heroes", {})
         creeps = c.get("creeps", {})
@@ -984,7 +1357,7 @@ class Brain:
 
         cx, cy = best_xy
         return self._attack_on_screen_throttled(cx, cy, y_offset=10)
-    def goto_nearest_camp(
+    def _goto_nearest_camp(
         self,
         c: Dict[str, Any],
         *,
@@ -1012,7 +1385,7 @@ class Brain:
 
 
     @debug_log_result
-    def goto_nearest_lane(
+    def _goto_nearest_lane(
             self,
             c: Dict[str, Any],
             *,
@@ -1094,12 +1467,12 @@ class Brain:
         return 50.0, 50.0
 
     @debug_log_result
-    def goto_fountain(self, c: Dict[str, Any]) -> None:
+    def _goto_fountain(self, c: Dict[str, Any]) -> None:
         x, y = self._pick_fountain_point(c)
         self.pl.click_minimap_pct(self.hwnd, x, y, attack=False)
 
     @debug_log_result
-    def goto_nearest_tower(
+    def _goto_nearest_tower(
             self,
             c: Dict[str, Any],
             *,
@@ -1194,7 +1567,7 @@ class Brain:
         self,
         c: Dict[str, Any],
         *,
-        radius_uv: float = 5.0,
+        radius_uv: float = 4.0,
         only_alive: bool = True,
     ) -> tuple[bool, Optional[float]]:
         units = c.get("map", {})
@@ -1387,40 +1760,469 @@ class Brain:
         near = dist_min <= radius_uv
         return near, dist_min
 
+    def _collect_catboost_train_row(self, s: Senses) -> None:
+        if not self.collect_catboost_dataset:
+            return
+
+        row = s.to_catboost_features()
+        row["brain_state"] = self.state.name.lower()
+        row["ts"] = float(time.time())
+
+        self._catboost_dataset_rows.append(row)
+        self._flush_catboost_dataset_to_csv(force=False)
+
+    def _normalize_brain_state(self, raw_pred: Any) -> Optional[BrainState]:
+        if raw_pred is None:
+            return None
+
+        if isinstance(raw_pred, np.ndarray):
+            if raw_pred.size == 0:
+                return None
+            raw_pred = raw_pred.flatten()[0]
+
+        if isinstance(raw_pred, (list, tuple)):
+            if not raw_pred:
+                return None
+            raw_pred = raw_pred[0]
+
+        if isinstance(raw_pred, np.generic):
+            raw_pred = raw_pred.item()
+
+        if isinstance(raw_pred, (int, np.integer)):
+            return self._brain_state_id_map.get(int(raw_pred))
+
+        if isinstance(raw_pred, str):
+            key = raw_pred.strip().lower()
+            aliases = {
+                "farming_jungle": BrainState.FARMING_JUNGLE,
+                "farming_lane": BrainState.FARMING_LANE,
+                "laning": BrainState.LANING,
+                "fighting": BrainState.FIGHTING,
+                "retreat": BrainState.RETREAT,
+                "idle": BrainState.IDLE,
+            }
+            return aliases.get(key)
+
+        return None
+
+    def _predict_brain_state_with_catboost(self, features: Dict[str, Any]) -> BrainState:
+        if self._catboost_model is None:
+            raise RuntimeError("CatBoost model is not loaded")
+
+        raw_pred = None
+
+        try:
+            raw_pred = self._catboost_model.predict(features)
+        except Exception:
+            try:
+                raw_pred = self._catboost_model.predict([features])
+            except Exception as e:
+                raise RuntimeError(f"CatBoost prediction failed: {e}") from e
+
+        state = self._normalize_brain_state(raw_pred)
+        if state is None:
+            raise RuntimeError(f"CatBoost returned unsupported brain state: {raw_pred!r}")
+
+        return state
+
+
+
+
+    def _lane_landmarks_root(self, c: Dict[str, Any], s: Senses) -> Dict[str, Any]:
+        if isinstance(s.landmarks, dict):
+            return s.landmarks
+        lm = c.get("landmarks")
+        if isinstance(lm, dict):
+            data = lm.get("data")
+            if isinstance(data, dict):
+                return data
+            return lm
+        return {}
+
+    def _get_ally_creep_anchor_screen(self, c: Dict[str, Any], *, back_offset_px: float = 90.0) -> Optional[
+        Tuple[int, int]]:
+        creeps = c.get("creeps", {})
+        ally_creeps = creeps.get("ally", [])
+        enemy_creeps = creeps.get("enemy", [])
+
+        if not ally_creeps:
+            return None
+
+        ally_pts = np.array([self._hpbar_center(cb) for cb in ally_creeps], dtype=np.float32)
+
+        if len(enemy_creeps) >= 1:
+            enemy_pts = np.array([self._hpbar_center(cb) for cb in enemy_creeps], dtype=np.float32)
+        else:
+            enemy_pts = np.zeros((0, 2), dtype=np.float32)
+
+        mid, d, n, c_a, c_e = self._compromise_line(ally_pts, enemy_pts)
+
+        # фронт союзных крипов по нормали к линии
+        proj_allies = ally_pts @ n
+        front_allies = float(np.max(proj_allies))
+
+        # стоим чуть позади своей пачки
+        s_target = front_allies - float(back_offset_px)
+        s_base = float(np.dot(mid, n))
+        delta_s = s_target - s_base
+        target = mid + n * delta_s
+
+        tx = int(round(float(target[0])))
+        ty = int(round(float(target[1])))
+        return tx, ty
+    def _get_lane_polyline(self, c: Dict[str, Any], s: Senses, lane_key: str) -> List[Dict[str, float]]:
+        root = self._lane_landmarks_root(c, s)
+        arr = root.get(lane_key)
+        if isinstance(arr, list) and arr and isinstance(arr[0], list):
+            return arr[0]
+        if isinstance(arr, list):
+            return arr
+        return []
+
+    def _project_to_lane(
+        self,
+        poly: List[Dict[str, float]],
+        p: Tuple[float, float],
+    ) -> Optional[Tuple[Tuple[float, float], float, float]]:
+        if not poly:
+            return None
+
+        pts: List[Tuple[float, float]] = []
+        for node in poly:
+            try:
+                pts.append((float(node["x"]), float(node["y"])))
+            except Exception:
+                continue
+
+        if not pts:
+            return None
+        if len(pts) == 1:
+            dx = p[0] - pts[0][0]
+            dy = p[1] - pts[0][1]
+            return (pts[0], 0.0, dx * dx + dy * dy)
+
+        seg_lens: List[float] = []
+        total_len = 0.0
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            seg_len = float(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5)
+            seg_lens.append(seg_len)
+            total_len += seg_len
+
+        if total_len <= 1e-9:
+            dx = p[0] - pts[0][0]
+            dy = p[1] - pts[0][1]
+            return (pts[0], 0.0, dx * dx + dy * dy)
+
+        best_q = pts[0]
+        best_d2 = 1e18
+        best_t = 0.0
+        len_before = 0.0
+        px, py = p
+
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            abx, aby = bx - ax, by - ay
+            ab2 = abx * abx + aby * aby
+            if ab2 <= 1e-12:
+                len_before += seg_lens[i]
+                continue
+
+            apx, apy = px - ax, py - ay
+            t_seg = (apx * abx + apy * aby) / ab2
+            t_seg = max(0.0, min(1.0, t_seg))
+
+            qx = ax + t_seg * abx
+            qy = ay + t_seg * aby
+            dx = px - qx
+            dy = py - qy
+            d2 = dx * dx + dy * dy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_q = (qx, qy)
+                best_t = (len_before + seg_lens[i] * t_seg) / total_len
+
+            len_before += seg_lens[i]
+
+        return best_q, float(best_t), float(best_d2)
+
+    def _pick_nearest_ally_t1_uv(self, c: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        cur = self._get_self_uv(c)
+        if cur is None:
+            return None
+
+        towers = c.get("towers", {}).get("ally", []) or []
+        if not towers:
+            return None
+
+        t1_list = []
+        for t in towers:
+            tier = t.get("tier", None)
+            if tier is None or tier == 1:
+                t1_list.append(t)
+
+        if not t1_list:
+            t1_list = towers
+
+        best = None
+        best_d2 = 1e18
+        for t in t1_list:
+            try:
+                tx = float(t["x"])
+                ty = float(t["y"])
+            except Exception:
+                continue
+            d2 = _euclid2(cur, (tx, ty))
+            if d2 < best_d2:
+                best_d2 = d2
+                best = (tx, ty)
+
+        return best
+    def _point_at_progress(self, poly: List[Dict[str, float]], t: float) -> Optional[Tuple[float, float]]:
+        if not poly:
+            return None
+
+        pts: List[Tuple[float, float]] = []
+        for node in poly:
+            try:
+                pts.append((float(node["x"]), float(node["y"])))
+            except Exception:
+                continue
+
+        if not pts:
+            return None
+        if len(pts) == 1:
+            return pts[0]
+
+        t = max(0.0, min(1.0, float(t)))
+
+        seg_lens: List[float] = []
+        total_len = 0.0
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            seg_len = float(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5)
+            seg_lens.append(seg_len)
+            total_len += seg_len
+
+        if total_len <= 1e-9:
+            return pts[0]
+
+        target_len = t * total_len
+        walked = 0.0
+        for i in range(len(pts) - 1):
+            seg_len = seg_lens[i]
+            if seg_len <= 1e-12:
+                continue
+            if walked + seg_len >= target_len:
+                ratio = (target_len - walked) / seg_len
+                ax, ay = pts[i]
+                bx, by = pts[i + 1]
+                return ax + (bx - ax) * ratio, ay + (by - ay) * ratio
+            walked += seg_len
+
+        return pts[-1]
+
+    def _oriented_progress(self, raw_t: float, lane_reversed: bool) -> float:
+        raw_t = max(0.0, min(1.0, float(raw_t)))
+        return (1.0 - raw_t) if lane_reversed else raw_t
+
+    def _resolve_base_uv(self, c: Dict[str, Any], s: Senses, *, ally: bool) -> Optional[Tuple[float, float]]:
+        root = self._lane_landmarks_root(c, s)
+        my_side = self._get_side()
+        other_side = "dire" if my_side == "radiant" else "radiant"
+        side = my_side if ally else other_side
+
+        for key in (f"fountain_{side}", f"ancient_{side}"):
+            pt = self._extract_point_xy(root.get(key))
+            if pt is not None:
+                return pt
+        return None
+
+    def _lane_is_reversed(self, c: Dict[str, Any], s: Senses, poly: List[Dict[str, float]]) -> bool:
+        ally_base = self._resolve_base_uv(c, s, ally=True)
+        enemy_base = self._resolve_base_uv(c, s, ally=False)
+        if ally_base is None or enemy_base is None:
+            return False
+
+        proj_ally = self._project_to_lane(poly, ally_base)
+        proj_enemy = self._project_to_lane(poly, enemy_base)
+        if proj_ally is None or proj_enemy is None:
+            return False
+
+        _, t_ally, _ = proj_ally
+        _, t_enemy, _ = proj_enemy
+        return t_ally > t_enemy
+
+    def _front_tower_progresses(
+        self,
+        towers: List[Dict[str, Any]],
+        poly: List[Dict[str, float]],
+        *,
+        lane_reversed: bool,
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        out: List[Tuple[Dict[str, Any], float]] = []
+        for t in towers:
+            if not bool(t.get("alive", True)):
+                continue
+            try:
+                tx = float(t["x"])
+                ty = float(t["y"])
+            except Exception:
+                continue
+
+            proj = self._project_to_lane(poly, (tx, ty))
+            if proj is None:
+                continue
+
+            _, raw_t, dist2 = proj
+            if (dist2 ** 0.5) > self.lane_attach_uv:
+                continue
+
+            out.append((t, self._oriented_progress(raw_t, lane_reversed)))
+
+        return out
+
+    def _build_lane_target_between_front_towers(
+        self,
+        c: Dict[str, Any],
+        s: Senses,
+        lane_key: str,
+    ) -> Optional[Tuple[float, float]]:
+        poly = self._get_lane_polyline(c, s, lane_key)
+        if len(poly) < 2:
+            return None
+
+        lane_reversed = self._lane_is_reversed(c, s, poly)
+
+        towers = c.get("towers", {})
+        ally_towers = towers.get("ally", []) or []
+        enemy_towers = towers.get("enemy", []) or []
+
+        ally_progress = self._front_tower_progresses(ally_towers, poly, lane_reversed=lane_reversed)
+        enemy_progress = self._front_tower_progresses(enemy_towers, poly, lane_reversed=lane_reversed)
+
+        if not ally_progress or not enemy_progress:
+            return None
+
+        _, t_ally_front = max(ally_progress, key=lambda x: x[1])
+        _, t_enemy_front = min(enemy_progress, key=lambda x: x[1])
+
+        if t_enemy_front <= t_ally_front:
+            return None
+
+        seg = t_enemy_front - t_ally_front
+        t_target = t_ally_front + seg * 0.35
+        t_cap = t_ally_front + seg * self.lane_max_depth_frac
+        t_target = min(t_target, t_cap)
+
+        t_min = t_ally_front + self.lane_tower_margin
+        t_max = t_enemy_front - self.lane_tower_margin
+        if t_max <= t_min:
+            return None
+
+        t_target = max(t_target, t_min)
+        t_target = min(t_target, t_max)
+
+        raw_t = (1.0 - t_target) if lane_reversed else t_target
+        return self._point_at_progress(poly, raw_t)
+
+    def _reset_runtime_substates_on_death(self) -> None:
+        # base stateful action memory
+        self._moving_point = None
+
+        # lasthit
+        self._lasthit_target_key = None
+        self._lasthit_target_expire = 0.0
+
+        # jungle farm
+        self._farm_phase = FarmPhase.PICK_TARGET
+        self._farm_target_id = None
+
+        # lane farm
+        self._reset_lane_farm_memory()
+
+        # optional lane init memory
+        self._lane_inited = False
+        self._lane_key = None
+        self._lane_anchor_uv = None
+
+        # cooldown-ish memory
+        self._last_walk_target = None
+        self.last_action_ts = 0.0
+    def _reset_lane_farm_memory(self) -> None:
+        self._lane_target_uv = None
+        self._lane_wave_seen = False
+        self._lane_wave_last_seen_ts = 0.0
+        self._lane_phase_start_ts = 0.0
+        self._lane_farm_phase = LaneFarmPhase.SELECT_SEGMENT
+
+
+
+
+
     def _set_state(self, new_state: BrainState):
         if new_state is self.state:
             return
+
         if self.log:
             self.log.info(f"[BRAIN {hex(self.hwnd)}] {self.state.name} -> {new_state.name}")
+
+        old_state = self.state
         self.state = new_state
         self.last_action_ts = 0.0
 
+        if new_state is BrainState.DEAD and old_state is not BrainState.DEAD:
+            self._reset_runtime_substates_on_death()
+
+        if old_state is BrainState.DEAD and new_state is not BrainState.DEAD:
+            # после респавна стартуем чисто
+            self._reset_lane_farm_memory()
+            self._farm_phase = FarmPhase.PICK_TARGET
+            self._farm_target_id = None
+            self._lasthit_target_key = None
+            self._lasthit_target_expire = 0.0
+
     # --------- обработчики состояний (пока примитивные заглушки) ---------
     def _tick_dead(self, c: Dict[str, Any], s: Senses):
-        pass
+        if s.alive:
+            self._set_state(BrainState.IDLE)
 
-    def _tick_idle(self, c: Dict[str, Any], s: Senses):
+
+    def _tick_idle(self, c: Dict[str, Any], s: Senses) -> None:
         pass
 
     def _tick_laning(self, c: Dict[str, Any], s: Senses):
         """
         Лайнинг:
-          1) если есть активная цель для ластхита и она ещё жива — ждём (не даём новых команд).
-          2) иначе ищем крипа с низким HP:
-              - если крип < 0.5: решаем, можно ли сблизиться
-                  - если можно: подходим (walk) к крипу если далеко
-                  - если уже близко: атакуем
-              - если нельзя сближаться: ничего не делаем по этому крипу
-          3) если подходящих крипов нет — занимаем позицию по линии.
+          1) если есть активная цель для ластхита и она ещё жива — ждём.
+          2) если нет союзных крипов:
+             - под своей T1 можно безопасно бить enemy creeps
+             - иначе откатываемся к своей T1
+          3) если есть безопасный ластхит enemy creep — подходим/атакуем
+          4) иначе пробуем deny
+          5) если ни ластхит, ни deny не подходят — занимаем позицию по линии
         """
         now = time.time()
-        # если союзных крипов нет — не позиционируемся, просто бьём enemy creeps (если есть)
+
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        if not self_heroes:
+            return
+
+        # --- 0) если союзных крипов нет ---
         ally_creeps = c.get("creeps", {}).get("ally", [])
         if len(ally_creeps) == 0:
-            if s.enemy_creep_near:
-                # бей ближайшего (желательно через твою _attack_on_screen_throttled)
-                # можно использовать твою _attack_enemy_creep_on_screen, но лучше с cooldown:
-                self._attack_enemy_creep_on_screen(c)  # или заменишь на _attack_on_screen_throttled внутри
+            if s.enemy_creep_near and s.under_ally_tower:
+                self._attack_enemy_creep_on_screen(c)
+                return
+
+            t1_uv = self._pick_nearest_ally_t1_uv(c)
+            if t1_uv is not None:
+                tx, ty = t1_uv
+                self._minimap_click_throttled(tx, ty, cooldown=0.8)
             return
 
         # --- 1) если уже атакуем цель — ждём её смерти ---
@@ -1433,7 +2235,8 @@ class Brain:
                 if self.log:
                     self.log.debug("[BRAIN] lasthit: target gone, resume laning")
                 self._lasthit_target_key = None
-        # --- 1.5) ориентация в начале: выбрать линию и точку у T1, встать туда ---
+
+        # --- 1.5) инициализация линии / якоря у своей T1 ---
         if not self._lane_inited:
             cur_uv = self._get_self_uv(c) or (50.0, 50.0)
             lane_key = self._pick_nearest_lane_key(s, cur_uv)
@@ -1444,31 +2247,26 @@ class Brain:
                     self._lane_anchor_uv = anchor
                     self._lane_inited = True
 
-        # Если крипы ещё не видны, просто стоим на линии у T1 (любая из 3)
-        # (без лишней логики: пока нет крипов -> идём к якорю)
+        # Если крипов вообще не видно — идём к якорю линии
         if (not s.enemy_creep_near) and (not s.ally_creep_near):
             if self._lane_anchor_uv is not None:
                 ax, ay = self._lane_anchor_uv
-                self._minimap_click_throttled(ax, ay)   # уже с cooldown
+                self._minimap_click_throttled(ax, ay, cooldown=0.8)
             return
 
-        # --- 2) ищем крипа на ластхит ---
-        lasthit_candidate = self._select_creep(c, hp_threshold=0.5,enemy=True)
+        # Понадобится для fallback reposition
+        dist_to_enemy = self._compute_dist_to_enemy_hero(s)
+
+        # --- 2) пробуем ластхит enemy creep ---
+        lasthit_candidate = self._select_creep(c, hp_threshold=0.5, enemy=True)
 
         if lasthit_candidate is not None:
             cb, cx, cy = lasthit_candidate
             creep_hp = float(getattr(cb, "hp_ratio", 1.0))
 
-            # расстояние до крипа
-            heroes = c.get("heroes", {})
-            self_heroes = heroes.get("self", [])
-            if self_heroes:
-                hx, hy = self._hpbar_center(self_heroes[0])
-                dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
-            else:
-                dist = 9999.0
+            hx, hy = self._hpbar_center(self_heroes[0])
+            dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
 
-            # --- ТЕПЕРЬ БЕРЁМ ИЗ Senses ---
             enemy_cnt = s.enemy_hero_cnt_screen
             avg_enemy_hp = s.avg_enemy_hero_hp_ratio_screen
 
@@ -1480,57 +2278,59 @@ class Brain:
                 avg_enemy_hp=avg_enemy_hp,
             )
 
-            if not allow:
+            if allow:
+                attack_dist_px = 260.0
+
+                if dist > attack_dist_px:
+                    if self.log:
+                        self.log.debug(
+                            f"[BRAIN] lasthit: APPROACH creep at ({cx:.0f},{cy:.0f}) "
+                            f"dist={dist:.0f}px creep_hp={creep_hp:.2f}"
+                        )
+
+                    sent = self._walk_throttled(
+                        int(cx),
+                        int(cy) + 10,
+                        cooldown=self.lasthit_cmd_cooldown,
+                        tol_px=14.0,
+                        attack=False,
+                    )
+                    if sent and self.log:
+                        self.log.debug("[BRAIN] lasthit: walk command sent")
+                    return
+
+                if self.log:
+                    self.log.debug(
+                        f"[BRAIN] lasthit: ATTACK creep at ({cx:.0f},{cy:.0f}), "
+                        f"hp_ratio={creep_hp:.2f}"
+                    )
+
+                if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
+                    return
+
+                key = self._make_lasthit_key(cb, cx, cy)
+                self._lasthit_target_key = key
+                self._lasthit_target_expire = now + 1.5
+                self.last_action_ts = now
+                return
+            else:
                 if self.log:
                     self.log.debug(
                         f"[BRAIN] lasthit: SKIP (risk) creep_hp={creep_hp:.2f}, "
                         f"dist={dist:.0f}px, enemy_cnt={enemy_cnt}, avg_enemy_hp={avg_enemy_hp}"
                     )
-                return
+                # НЕ return — дальше идём в reposition / deny
 
-            # если можно — решаем: подойти или атаковать
-            attack_dist_px = 260.0
+        # --- 2.5) DENY: добивание своих ---
+        deny_candidate = self._select_creep(c, hp_threshold=0.3, enemy=False)
 
-            if dist > attack_dist_px:
-                if self.log:
-                    self.log.debug(
-                        f"[BRAIN] lasthit: APPROACH creep at ({cx:.0f},{cy:.0f}) "
-                        f"dist={dist:.0f}px creep_hp={creep_hp:.2f}"
-                    )
-                sent = self._walk_throttled(int(cx), int(cy) + 10, cooldown=self.lasthit_cmd_cooldown, tol_px=14.0)
-                if sent and self.log:
-                    self.log.debug("[BRAIN] lasthit: walk command sent")
-                return
-
-            if self.log:
-                self.log.debug(
-                    f"[BRAIN] lasthit: ATTACK creep at ({cx:.0f},{cy:.0f}), "
-                    f"hp_ratio={creep_hp:.2f}"
-                )
-
-            if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
-                return
-            key = self._make_lasthit_key(cb, cx, cy)
-            self._lasthit_target_key = key
-            self._lasthit_target_expire = now + 1.5
-            self.last_action_ts = now
-            return
-        # --- 2.5) DENY: добивание своих (аналогично ластхиту) ---
-        deny_candidate = self._select_creep(c, hp_threshold=0.3,enemy=False)
-
-        if deny_candidate is not None and lasthit_candidate is None:
+        if deny_candidate is not None:
             cb, cx, cy = deny_candidate
             creep_hp = float(getattr(cb, "hp_ratio", 1.0))
 
-            heroes = c.get("heroes", {})
-            self_heroes = heroes.get("self", [])
-            if self_heroes:
-                hx, hy = self._hpbar_center(self_heroes[0])
-                dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
-            else:
-                dist = 9999.0
+            hx, hy = self._hpbar_center(self_heroes[0])
+            dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
 
-            # allow — используем ту же эвристику сближения (без доп. логики)
             enemy_cnt = s.enemy_hero_cnt_screen
             avg_enemy_hp = s.avg_enemy_hero_hp_ratio_screen
 
@@ -1542,36 +2342,35 @@ class Brain:
                 avg_enemy_hp=avg_enemy_hp,
             )
 
-            if not allow:
+            if allow:
+                attack_dist_px = 260.0
+
+                if dist > attack_dist_px:
+                    self._walk_throttled(
+                        int(cx),
+                        int(cy) + 10,
+                        cooldown=self.lasthit_cmd_cooldown,
+                        tol_px=14.0,
+                        attack=False,
+                    )
+                    return
+
+                if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
+                    return
+
+                key = self._make_lasthit_key(cb, cx, cy)
+                self._lasthit_target_key = key
+                self._lasthit_target_expire = now + 1.5
+                self.last_action_ts = now
                 return
 
-            attack_dist_px = 260.0
-
-            if dist > attack_dist_px:
-                self._walk_throttled(
-                    int(cx), int(cy) + 10,
-                    cooldown=self.lasthit_cmd_cooldown,
-                    tol_px=14.0,
-                    attack=False
-                )
-                return
-
-            # удар по своему крипу (deny) — через общий cooldown
-            if not self._attack_on_screen_throttled(cx, cy, y_offset=10):
-                return
-
-            # можно использовать тот же механизм "ждём смерти цели",
-            # чтобы не спамить новую цель каждую миллисекунду
-            key = self._make_lasthit_key(cb, cx, cy)
-            self._lasthit_target_key = key
-            self._lasthit_target_expire = now + 1.5
-            self.last_action_ts = now
-            return
-
-        # --- 3) обычный лайнинг по линии ---
-        dist_to_enemy = self._compute_dist_to_enemy_hero(s)
+        # --- 3) обычный лайнинг по линии / reposition ---
         target = self._compute_laning_point(c, min_dist_to_enemy=dist_to_enemy)
         if target is None:
+            # fallback: если не смогли вычислить точку, хотя бы держимся у якоря линии
+            if self._lane_anchor_uv is not None:
+                ax, ay = self._lane_anchor_uv
+                self._minimap_click_throttled(ax, ay, cooldown=0.8)
             return
 
         tx, ty = target
@@ -1581,60 +2380,448 @@ class Brain:
 
         self._walk_throttled(tx, ty, cooldown=0.35, tol_px=22.0, attack=False)
 
-    def _tick_farming(self, c: Dict[str, Any], s: Senses):
-
-
-        # 1) кемпы из landmarks, которые уже в senses
+    def _tick_farming_jungle(self, c: Dict[str, Any], s: Senses) -> None:
         self._ensure_camps_inited(s)
         self._reset_camps_if_needed(s.t_game)
 
-        # если кемпов нет — нечего делать
         if not self._camps:
             return
 
-        # 2) если на экране есть enemy creeps — фармим/убиваем
-        if s.enemy_creep_near:
-            self._farm_phase = FarmPhase.FIGHT
-            self._attack_enemy_creep_on_screen(c)
-            return
+        now = time.time()
+        cur = self._get_self_uv(c)
 
-        # 3) если мы были в FIGHT, а крипов теперь нет — кемп зафармлен
+        # 1) если уже в бою
         if self._farm_phase is FarmPhase.FIGHT:
-            camp = self._get_camp_by_id(self._farm_target_id)
-            if camp is not None:
-                camp.state = CampState.CLEARED
-            self._farm_target_id = None
-            self._farm_phase = FarmPhase.PICK_TARGET
-
-        # 4) выбрать следующий кемп и идти на него
-        if self._farm_phase is FarmPhase.PICK_TARGET:
-            nxt = self._pick_next_ready_camp(c)  # ближайший READY
-            if nxt is None:
+            # пока крипы видны — продолжаем бой
+            if s.enemy_creep_near:
+                self._farm_no_creep_since_ts = 0.0
+                self._attack_enemy_creep_on_screen(c)
                 return
-            self._farm_target_id = nxt.camp_id
-            self._farm_phase = FarmPhase.MOVE_TO_TARGET
 
-        if self._farm_phase is FarmPhase.MOVE_TO_TARGET:
-            camp = self._get_camp_by_id(self._farm_target_id)
-            if camp is None:
+            # крипы пропали — подтверждаем окончание
+            if self._farm_no_creep_since_ts <= 0.0:
+                self._farm_no_creep_since_ts = now
+                return
+
+            if now - self._farm_no_creep_since_ts < self._farm_cleared_confirm_delay:
+                return
+
+            # если бой начался у target camp — считаем target camp очищенным
+            if self._farm_fight_started_near_target and self._farm_target_id is not None:
+                target_camp = self._get_camp_by_id(self._farm_target_id)
+                if target_camp is not None:
+                    target_camp.state = CampState.CLEARED
+                    if self.log:
+                        self.log.info(
+                            f"[BRAIN {hex(self.hwnd)}] jungle: target camp {target_camp.camp_id} cleared"
+                        )
+
+                self._farm_target_id = None
                 self._farm_phase = FarmPhase.PICK_TARGET
+                self._reset_jungle_fight_runtime()
                 return
 
-            # просто идём к кемпу по миникарте
-            self._minimap_click_throttled(camp.x, camp.y)
+            # если бой был не у target camp — просто возвращаемся к planned target
+            if self._farm_target_id is not None:
+                self._farm_phase = FarmPhase.MOVE_TO_TARGET
+            else:
+                self._farm_phase = FarmPhase.PICK_TARGET
 
+            self._reset_jungle_fight_runtime()
             return
+
+        # 2) выбираем target camp
+        if self._farm_phase is FarmPhase.PICK_TARGET:
+            if self._farm_target_id is None:
+                nxt = self._pick_next_ready_camp(c)
+                if nxt is None:
+                    return
+                self._farm_target_id = nxt.camp_id
+
+            self._farm_phase = FarmPhase.MOVE_TO_TARGET
+            self._reset_jungle_fight_runtime()
+
+        # 3) идём к target camp
+        if self._farm_phase is FarmPhase.MOVE_TO_TARGET:
+            target_camp = self._get_camp_by_id(self._farm_target_id)
+            if target_camp is None:
+                self._farm_target_id = None
+                self._farm_phase = FarmPhase.PICK_TARGET
+                self._reset_jungle_fight_runtime()
+                return
+
+            near_target_camp = self._is_near_camp(cur, target_camp)
+
+            # 3.1 если по пути увидели крипов — фармим, но target не забываем
+            if s.enemy_creep_near and not near_target_camp:
+                self._farm_phase = FarmPhase.FIGHT
+                self._farm_fight_started_near_target = False
+                self._farm_no_creep_since_ts = 0.0
+                self._farm_arrived_at_camp_ts = 0.0
+
+                if self.log:
+                    self.log.info(
+                        f"[BRAIN {hex(self.hwnd)}] jungle: route fight start (planned_target={self._farm_target_id})"
+                    )
+
+                self._attack_enemy_creep_on_screen(c)
+                return
+
+            # 3.2 если уже у target camp и там есть крипы — это target fight
+            if near_target_camp and s.enemy_creep_near:
+                self._farm_phase = FarmPhase.FIGHT
+                self._farm_fight_started_near_target = True
+                self._farm_no_creep_since_ts = 0.0
+                self._farm_arrived_at_camp_ts = 0.0
+
+                if self.log:
+                    self.log.info(
+                        f"[BRAIN {hex(self.hwnd)}] jungle: target fight start (target={target_camp.camp_id})"
+                    )
+
+                self._attack_enemy_creep_on_screen(c)
+                return
+
+            # 3.3 если пришли к camp, но там никого нет слишком долго — skip
+            if near_target_camp:
+                if self._farm_arrived_at_camp_ts <= 0.0:
+                    self._farm_arrived_at_camp_ts = now
+
+                if now - self._farm_arrived_at_camp_ts >= self._farm_stuck_near_camp_timeout:
+                    if self.log:
+                        self.log.info(
+                            f"[BRAIN {hex(self.hwnd)}] jungle: target camp {target_camp.camp_id} stuck timeout, skip"
+                        )
+
+                    target_camp.state = CampState.SKIPPED
+                    self._farm_target_id = None
+                    self._farm_phase = FarmPhase.PICK_TARGET
+                    self._reset_jungle_fight_runtime()
+                    return
+            else:
+                self._farm_arrived_at_camp_ts = 0.0
+
+            self._minimap_click_throttled(target_camp.x, target_camp.y)
+
+    def _tick_farming_lane(self, c: Dict[str, Any], s: Senses) -> None:
+        now = time.time()
+
+        if self._lane_farm_phase is LaneFarmPhase.SELECT_SEGMENT:
+            if self._lane_key is None:
+                cur_uv = self._get_self_uv(c) or (50.0, 50.0)
+                self._lane_key = self._pick_nearest_lane_key(s, cur_uv)
+
+            if self._lane_key is None:
+                self._lane_farm_phase = LaneFarmPhase.ABORT
+            else:
+                target_uv = self._build_lane_target_between_front_towers(c, s, self._lane_key)
+                if target_uv is None:
+                    self._lane_farm_phase = LaneFarmPhase.ABORT
+                else:
+                    self._lane_target_uv = target_uv
+                    self._lane_wave_seen = False
+                    self._lane_wave_last_seen_ts = 0.0
+                    self._lane_phase_start_ts = now
+                    self._lane_farm_phase = LaneFarmPhase.MOVE_TO_POINT
+
+        if self._lane_farm_phase is LaneFarmPhase.MOVE_TO_POINT:
+            if self._lane_target_uv is None:
+                self._lane_farm_phase = LaneFarmPhase.ABORT
+            else:
+                cur_uv = self._get_self_uv(c)
+                tx, ty = self._lane_target_uv
+
+                if cur_uv is not None:
+                    if _euclid2(cur_uv, (tx, ty)) <= (self.lane_arrive_radius_uv ** 2):
+                        self._lane_phase_start_ts = now
+                        self._lane_farm_phase = LaneFarmPhase.WAIT_OR_CLEAR_WAVE
+                    elif now - self._lane_phase_start_ts >= self.lane_move_timeout:
+                        self._lane_farm_phase = LaneFarmPhase.ABORT
+                    else:
+                        self._minimap_click_throttled(tx, ty)
+                else:
+                    if now - self._lane_phase_start_ts >= self.lane_move_timeout:
+                        self._lane_farm_phase = LaneFarmPhase.ABORT
+
+        if self._lane_farm_phase is LaneFarmPhase.WAIT_OR_CLEAR_WAVE:
+            if s.low_hp or s.near_enemy_tower:
+                self._lane_farm_phase = LaneFarmPhase.ABORT
+            else:
+                if s.enemy_creep_near:
+                    self._lane_wave_seen = True
+                    self._lane_wave_last_seen_ts = now
+
+                    enemy_creeps = c.get("creeps", {}).get("enemy", [])
+                    enemy_creep_count = len(enemy_creeps) if enemy_creeps else 0
+                    now_ts = time.time()
+
+                    # 1) если уже есть цель на ластхит — не залипаем вечно
+                    if self._lasthit_target_key is not None:
+                        if self._lasthit_target_still_present(c):
+                            # если это уже почти точно последний крип, даём возможность переиздать атаку раньше
+                            if enemy_creep_count <= 1 and now_ts >= (self._lasthit_target_expire - 0.35):
+                                self._lasthit_target_key = None
+                            elif now_ts < self._lasthit_target_expire:
+                                return
+                            else:
+                                self._lasthit_target_key = None
+                        else:
+                            self._lasthit_target_key = None
+
+                    # 2) сначала пробуем ластхит — особенно важно для 1 оставшегося крипа
+                    lasthit_candidate = self._select_creep(c, hp_threshold=0.6, enemy=True)
+                    if lasthit_candidate is not None:
+                        cb, cx, cy = lasthit_candidate
+
+                        heroes = c.get("heroes", {})
+                        self_heroes = heroes.get("self", [])
+                        dist = 9999.0
+                        if self_heroes:
+                            hx, hy = self._hpbar_center(self_heroes[0])
+                            dist = float(((cx - hx) ** 2 + (cy - hy) ** 2) ** 0.5)
+
+                        # для последнего крипа можно чуть агрессивнее заходить
+                        attack_dist_px = 290.0 if enemy_creep_count <= 1 else 260.0
+                        walk_tol = 12.0 if enemy_creep_count <= 1 else 14.0
+
+                        if dist > attack_dist_px:
+                            self._walk_throttled(
+                                int(cx),
+                                int(cy) + 10,
+                                cooldown=self.lasthit_cmd_cooldown,
+                                tol_px=walk_tol,
+                                attack=False,
+                            )
+                            return
+
+                        attacked = self._attack_on_screen_throttled(cx, cy, y_offset=10, cooldown=0.25)
+                        if attacked:
+                            self._lasthit_target_key = self._make_lasthit_key(cb, cx, cy)
+                            self._lasthit_target_expire = now_ts + 0.8
+                            self.last_action_ts = now_ts
+                            return
+
+                    # 3) только если last hit не нужен — держимся за своей пачкой
+                    if s.ally_creep_near and enemy_creep_count > 1:
+                        anchor = self._get_ally_creep_anchor_screen(c, back_offset_px=90.0)
+                        if anchor is not None:
+                            ax, ay = anchor
+                            if s.enemy_hero_near:
+                                self._walk_throttled(ax, ay, cooldown=0.45, tol_px=20.0, attack=False)
+                            else:
+                                self._walk_throttled(ax, ay, cooldown=0.35, tol_px=20.0, attack=False)
+
+                    # 4) если рядом вражеский герой — лишний раз не пушим
+                    if s.enemy_hero_near:
+                        return
+
+                    # 5) иначе просто бьём ближайшего enemy creep
+                    self._attack_enemy_creep_on_screen(c)
+                else:
+                    # если enemy creep нет, но ally creeps видны — идём за ними
+                    if s.ally_creep_near and not s.enemy_hero_near and not s.near_enemy_tower:
+                        anchor = self._get_ally_creep_anchor_screen(c, back_offset_px=-10.0)
+                        if anchor is not None:
+                            ax, ay = anchor
+                            self._walk_throttled(ax, ay, cooldown=0.35, tol_px=20.0, attack=False)
+
+                    if self._lane_wave_seen and (now - self._lane_wave_last_seen_ts >= self.lane_wave_clear_grace):
+                        self._lane_farm_phase = LaneFarmPhase.DONE
+
+                waited = now - self._lane_phase_start_ts
+                if waited >= self.lane_wave_timeout:
+                    self._lane_farm_phase = LaneFarmPhase.DONE
+                if (not self._lane_wave_seen) and (waited >= self.lane_find_wave_timeout):
+                    self._lane_farm_phase = LaneFarmPhase.DONE
+
+        if self._lane_farm_phase in (LaneFarmPhase.DONE, LaneFarmPhase.ABORT):
+            self._reset_lane_farm_memory()
 
     def _tick_fighting(self, c: Dict[str, Any], s: Senses):
-        pass
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        enemy_heroes = heroes.get("enemy", [])
 
-    def _tick_wait_start(self, c: Dict[str, Any], s: Senses):
-        if s.t_game > 110:
-            self._set_state(BrainState.IDLE)
+        if not self_heroes:
             return
 
-        if c.get("t_game") > 110:
+        # Если врагов не видно — ничего не делаем.
+        # Переключение состояния пусть решает внешний роутинг.
+        if not enemy_heroes:
+            return
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+
+        # Выбираем ближайшего врага
+        best_enemy = None
+        best_xy = None
+        best_dist = None
+
+        for eb in enemy_heroes:
+            ex, ey = self._hpbar_center(eb)
+            dist = float(((ex - hx) ** 2 + (ey - hy) ** 2) ** 0.5)
+
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_enemy = eb
+                best_xy = (ex, ey)
+
+        if best_enemy is None or best_xy is None or best_dist is None:
+            return
+
+        ex, ey = best_xy
+        my_hp = 1.0 if s.hp_ratio is None else max(0.0, min(1.0, float(s.hp_ratio)))
+        enemy_hp = getattr(best_enemy, "hp_ratio", None)
+        enemy_hp = None if enemy_hp is None else max(0.0, min(1.0, float(enemy_hp)))
+
+        enemy_cnt = s.enemy_hero_cnt_screen
+        under_ally_tower = s.under_ally_tower
+        near_enemy_tower = s.near_enemy_tower
+
+        # Базовые дистанции
+        attack_dist_px = 240.0
+        chase_dist_px = 420.0
+        safe_hold_dist_px = 320.0
+
+        # Под своей башней можно играть смелее
+        if under_ally_tower:
+            attack_dist_px = 270.0
+            chase_dist_px = 470.0
+            safe_hold_dist_px = 360.0
+
+        # Оценка риска без смены состояния
+        very_risky = False
+
+        if s.low_hp:
+            very_risky = True
+
+        if enemy_cnt >= 2 and my_hp < 0.65 and not under_ally_tower:
+            very_risky = True
+
+        if near_enemy_tower:
+            if enemy_hp is None:
+                very_risky = True
+            elif my_hp < 0.75 or enemy_hp > 0.35:
+                very_risky = True
+
+        if enemy_hp is not None and (my_hp + 0.15) < enemy_hp and not under_ally_tower:
+            very_risky = True
+
+        # Осторожный режим: не пушим, а просто держим дистанцию / кайтим назад
+        if very_risky:
+            # если враг слишком близко — немного отходим от него
+            if best_dist < safe_hold_dist_px:
+                dx = hx - ex
+                dy = hy - ey
+                norm = float((dx * dx + dy * dy) ** 0.5)
+
+                if norm > 1e-6:
+                    step = 90.0
+                    tx = int(round(hx + dx / norm * step))
+                    ty = int(round(hy + dy / norm * step))
+                    self._walk_throttled(tx, ty, cooldown=0.30, tol_px=18.0, attack=False)
+            return
+
+        # Если можем добить врага с низким hp — приоритетно бьём
+        if enemy_hp is not None and enemy_hp <= 0.25:
+            attacked = self._attack_on_screen_throttled(ex, ey, y_offset=10, cooldown=0.20)
+            if attacked:
+                self.last_action_ts = time.time()
+            return
+
+        # Если в радиусе атаки — атакуем
+        if best_dist <= attack_dist_px:
+            attacked = self._attack_on_screen_throttled(ex, ey, y_offset=10, cooldown=0.25)
+            if attacked:
+                self.last_action_ts = time.time()
+            return
+
+        # Если не в рейндже, но ещё разумно chase-ить — подходим
+        if best_dist <= chase_dist_px:
+            self._walk_throttled(
+                int(ex),
+                int(ey) + 10,
+                cooldown=0.30,
+                tol_px=18.0,
+                attack=False,
+            )
+            return
+
+        # Слишком далеко — не спамим лишние команды
+        return
+
+    def _tick_retreat(self, c: Dict[str, Any], s: Senses) -> None:
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        enemy_heroes = heroes.get("enemy", [])
+
+        if not self_heroes:
+            return
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+        my_hp = 1.0 if s.hp_ratio is None else max(0.0, min(1.0, float(s.hp_ratio)))
+
+        best_enemy_xy = None
+        best_enemy_dist = None
+        for eb in enemy_heroes:
+            ex, ey = self._hpbar_center(eb)
+            dist = float(((ex - hx) ** 2 + (ey - hy) ** 2) ** 0.5)
+            if best_enemy_dist is None or dist < best_enemy_dist:
+                best_enemy_dist = dist
+                best_enemy_xy = (ex, ey)
+
+        panic_dist_px = 260.0
+        danger_dist_px = 420.0
+
+        # 1. Если враг реально близко — retreat only by screen, без minimap в этот тик.
+        if best_enemy_xy is not None and best_enemy_dist is not None and best_enemy_dist <= panic_dist_px:
+            retreat_pt = self._compute_retreat_screen_point(c, (hx, hy), step_px=170.0)
+            if retreat_pt is not None:
+                tx, ty = retreat_pt
+                sent = self._walk_throttled(
+                    tx,
+                    ty,
+                    cooldown=0.20,
+                    tol_px=14.0,
+                    attack=False,
+                )
+                if sent:
+                    return
+
+        # 2. Если враг ещё рядом, но не в panic range — тоже не смешиваем с minimap.
+        if best_enemy_xy is not None and best_enemy_dist is not None and best_enemy_dist <= danger_dist_px:
+            retreat_pt = self._compute_retreat_screen_point(c, (hx, hy), step_px=120.0)
+            if retreat_pt is not None:
+                tx, ty = retreat_pt
+                sent = self._walk_throttled(
+                    tx,
+                    ty,
+                    cooldown=0.30,
+                    tol_px=16.0,
+                    attack=False,
+                )
+                if sent:
+                    return
+
+        # 3. Если стоим под своей башней и враг уже не давит — не спамим.
+        if s.under_ally_tower and (best_enemy_dist is None or best_enemy_dist > 320.0):
+            return
+
+        # 4. Только когда непосредственной screen-угрозы нет — retreat по minimap к базе.
+        fountain_x, fountain_y = self._pick_fountain_point(c)
+        minimap_cd = 0.5 if my_hp <= 0.20 else 0.9
+
+        self._minimap_click_throttled(
+            fountain_x,
+            fountain_y,
+            cooldown=minimap_cd,
+        )
+
+    def _tick_wait_start(self, c: Dict[str, Any], s: Senses):
+        if c.get("t_game", 0) > 110:
+            self._wait_start_target = None
             self._set_state(BrainState.IDLE)
+            return
 
         units = c.get("map", {})
         self_units = units.get("self", [])
@@ -1649,13 +2836,11 @@ class Brain:
             return
 
         towers = c.get("towers", {}).get("ally", [])
-
         if not towers:
             return
 
         t1_list = []
         for t in towers:
-
             tier = t.get("tier", None)
             if tier is None or tier == 1:
                 t1_list.append(t)
@@ -1663,44 +2848,54 @@ class Brain:
         if not t1_list:
             t1_list = towers
 
-        R2 = self._moving_radius * self._moving_radius
-        close_any = False
+        # если цель ещё не выбрана — выбираем один раз ближайшую T1
+        if self._wait_start_target is None:
+            best = None
+            best_d2 = 1e18
 
-        for t in t1_list:
-            try:
-                tx = float(t["x"])
-                ty = float(t["y"])
-            except Exception:
-                continue
-            if self._dist2_uv(me_x, me_y, tx, ty) <= R2:
-                close_any = True
-                break
+            for t in t1_list:
+                try:
+                    tx = float(t["x"])
+                    ty = float(t["y"])
+                except Exception:
+                    continue
 
-        if close_any:
+                d2 = self._dist2_uv(me_x, me_y, tx, ty)
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = (tx, ty)
+
+            if best is None:
+                return
+
+            self._wait_start_target = best
+
             if self.log:
-                self.log.info(f"[BRAIN {hex(self.hwnd)}] WAIT_START: already near T1")
+                self.log.info(
+                    f"[BRAIN {hex(self.hwnd)}] WAIT_START: selected T1 target "
+                    f"({best[0]:.1f}, {best[1]:.1f})"
+                )
+
+        tx, ty = self._wait_start_target
+
+        # если уже дошли — просто стоим
+        r2 = self._moving_radius * self._moving_radius
+        if self._dist2_uv(me_x, me_y, tx, ty) <= r2:
+            if self.log:
+                self.log.debug(f"[BRAIN {hex(self.hwnd)}] WAIT_START: already near selected T1")
             return
 
-        import random
+        now = time.time()
+        if now - self._wait_start_last_click_ts >= self._wait_start_click_cooldown:
+            self.pl.click_minimap_pct(self.hwnd, tx + 1, ty + 1, attack=False)
+            self._wait_start_last_click_ts = now
+            self.last_action_ts = now
 
-        t_target = random.choice(t1_list)
-        try:
-            tx = float(t_target["x"])
-            ty = float(t_target["y"])
-        except Exception:
-            return
-
-        self._moving_point = (tx, ty)
-
-
-        if self.log:
-            self.log.debug(
-                f"[BRAIN {hex(self.hwnd)}] WAIT_START: too far from T1, "
-                f"moving to ({tx:.1f},{ty:.1f})"
-            )
-
-        self.pl.click_minimap_pct(self.hwnd, tx + 1, ty + 1, attack=False)
-        self.last_action_ts = time.time()
+            if self.log:
+                self.log.debug(
+                    f"[BRAIN {hex(self.hwnd)}] WAIT_START: moving to selected T1 "
+                    f"({tx:.1f}, {ty:.1f})"
+                )
 
     def _tick_moving(self, c: Dict[str, Any], s: Senses):
         if self._moving_point is None:
