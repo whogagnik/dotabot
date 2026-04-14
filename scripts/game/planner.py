@@ -600,7 +600,7 @@ class Planner:
             return
 
         self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=0, force_fg=force_fg)
-        self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=10, force_fg=force_fg)
+        self._press_vk_for_hwnd(hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=0, force_fg=force_fg)
         self._last_center_ts_by_hwnd[hwnd] = now
 
     def _stabilize_creeps_for_hwnd(
