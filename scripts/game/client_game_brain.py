@@ -2719,12 +2719,12 @@ class Brain:
                     step = 90.0
                     tx = int(round(hx + dx / norm * step))
                     ty = int(round(hy + dy / norm * step))
-                    self._walk_throttled(tx, ty, cooldown=0.30, tol_px=18.0, attack=False)
+                    self._walk_throttled(tx, ty, cooldown=1, tol_px=18.0, attack=False)
             return
 
         # Если можем добить врага с низким hp — приоритетно бьём
         if enemy_hp is not None and enemy_hp <= 0.25:
-            attacked = self._attack_on_screen_throttled(ex, ey, y_offset=10, cooldown=0.20)
+            attacked = self._attack_on_screen_throttled(ex, ey, y_offset=10, cooldown=1)
             if attacked:
                 self.last_action_ts = time.time()
             return

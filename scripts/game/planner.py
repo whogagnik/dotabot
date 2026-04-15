@@ -880,7 +880,7 @@ class Planner:
         t_total = (perf_counter() - t_total0) * 1000.0
 
         if self.log:
-            self.log.info(
+            self.log.debug(
                 f"[TIMERS] hwnd={hex(hwnd)} "
                 f"dev={t_dev:.2f}ms "
                 f"mm_infer={t_infer_mm:.2f}ms "
