@@ -111,7 +111,11 @@ class LaneFarmPhase(Enum):
     DONE = auto()
     ABORT = auto()
 
-
+class RetreatPhase(Enum):
+    GO_BEHIND_ALLY = auto()
+    BUILD_PATH = auto()
+    FOLLOW_PATH = auto()
+    DIRECT_TO_FOUNTAIN = auto()
 
 class BrainState(Enum):
     IDLE = auto()
@@ -150,6 +154,11 @@ class Senses:
     ally_hero_cnt_screen: int
     closest_enemy_hero_hp_ratio: Optional[float]
     closest_enemy_hero_dist_px: Optional[float]
+
+    closest_enemy_hero_mm_dist: Optional[float]
+
+    closest_ally_hero_dist_px: Optional[float]
+    closest_ally_hero_mm_dist: Optional[float]
 
     enemy_creep_near: bool
     enemy_creep_dist_screen: Optional[float]
@@ -206,9 +215,13 @@ class Senses:
             "enemy_hero_cnt_screen": int(self.enemy_hero_cnt_screen),
             "avg_enemy_hero_hp_ratio_screen": self.avg_enemy_hero_hp_ratio_screen,
 
+
             "ally_hero_cnt_screen": int(self.ally_hero_cnt_screen),
             "closest_enemy_hero_hp_ratio": self.closest_enemy_hero_hp_ratio,
             "closest_enemy_hero_dist_px": self.closest_enemy_hero_dist_px,
+            "closest_enemy_hero_mm_dist": self.closest_enemy_hero_mm_dist,
+            "closest_ally_hero_dist_px": self.closest_ally_hero_dist_px,
+            "closest_ally_hero_mm_dist": self.closest_ally_hero_mm_dist,
 
             "enemy_creep_near": bool(self.enemy_creep_near),
             "enemy_creep_dist_screen": self.enemy_creep_dist_screen,
@@ -376,6 +389,34 @@ class Brain:
         self._farm_stuck_near_camp_timeout: float = 2.0
         self._farm_near_camp_radius_uv: float = 6
 
+        # --- retreat runtime ---
+        self._retreat_phase: RetreatPhase = RetreatPhase.DIRECT_TO_FOUNTAIN
+        self._retreat_enter_ts: float = 0.0
+        self._retreat_phase_ts: float = 0.0
+
+        self._retreat_enemy_memory_until: float = 0.0
+
+        # tunables
+        self.retreat_enemy_memory_sec: float = 2.0
+        self.retreat_ally_screen_radius_px: float = 320.0
+        self.retreat_ally_mm_radius_uv: float = 10.0
+        self.retreat_anchor_timeout: float = 1.0
+        self.retreat_anchor_backstep_px: float = 120.0
+        self.retreat_screen_step_px: float = 160.0
+        self.retreat_arc_side_uv: float = 8.0
+        self.retreat_arc_forward_uv: float = 14.0
+        self.retreat_enemy_path_corridor_uv: float = 6.0
+
+        # --- retreat path ---
+        self._retreat_path_uv: List[Tuple[float, float]] = []
+        self._retreat_path_idx: int = 0
+        self._retreat_path_built_ts: float = 0.0
+
+        self.retreat_path_arrive_radius_uv: float = 3.0
+        self.retreat_path_rebuild_sec: float = 0.8
+        self.retreat_path_points: int = 6
+        self.retreat_path_side_offset_uv: float = 10.0
+        self.retreat_path_forward_gain_uv: float = 10.0
     # --------- публичный метод ---------
     def tick_one(self, snap: "Snapshot"):
         c = snap.combined
@@ -475,6 +516,10 @@ class Brain:
         ally_hero_cnt_screen = self._count_ally_heroes_near_screen(c)
         closest_enemy_hero_hp_ratio, closest_enemy_hero_dist_px = self._closest_enemy_hero_features(c)
 
+        closest_enemy_hero_mm_dist = self._closest_enemy_hero_mm_dist(c)
+        closest_ally_hero_dist_px = self._closest_ally_hero_dist_px(c)
+        closest_ally_hero_mm_dist = self._closest_ally_hero_mm_dist(c)
+
         enemy_creep_cnt_screen = self._count_enemy_creeps_screen(c)
         ally_creep_cnt_screen = self._count_ally_creeps_screen(c)
 
@@ -511,6 +556,10 @@ class Brain:
             ally_hero_cnt_screen=ally_hero_cnt_screen,
             closest_enemy_hero_hp_ratio=closest_enemy_hero_hp_ratio,
             closest_enemy_hero_dist_px=closest_enemy_hero_dist_px,
+            closest_enemy_hero_mm_dist=closest_enemy_hero_mm_dist,
+
+            closest_ally_hero_dist_px=closest_ally_hero_dist_px,
+            closest_ally_hero_mm_dist=closest_ally_hero_mm_dist,
 
             enemy_creep_near=enemy_creep_near,
             enemy_creep_dist_screen=enemy_creep_dist_scr,
@@ -691,6 +740,50 @@ class Brain:
         heroes = c.get("heroes", {})
         ally_heroes = heroes.get("ally", [])
         return len(ally_heroes) if ally_heroes else 0
+    def _compute_arc_waypoint_to_fountain(
+        self,
+        c: Dict[str, Any],
+        enemy_uv: Tuple[float, float],
+        fountain_uv: Tuple[float, float],
+    ) -> Optional[Tuple[float, float]]:
+        cur = self._get_self_uv(c)
+        if cur is None:
+            return None
+
+        cx, cy = cur
+        fx, fy = fountain_uv
+        ex, ey = enemy_uv
+
+        dx = fx - cx
+        dy = fy - cy
+        dn = float((dx * dx + dy * dy) ** 0.5)
+        if dn <= 1e-6:
+            return None
+
+        ux = dx / dn
+        uy = dy / dn
+
+        vex = ex - cx
+        vey = ey - cy
+
+        forward = vex * ux + vey * uy
+        if forward <= 0.0:
+            return None
+
+        nx = -uy
+        ny = ux
+        side = vex * nx + vey * ny
+
+        if abs(side) > self.retreat_enemy_path_corridor_uv:
+            return None
+
+        sign = -1.0 if side > 0.0 else 1.0
+        wx = cx + ux * self.retreat_arc_forward_uv + nx * sign * self.retreat_arc_side_uv
+        wy = cy + uy * self.retreat_arc_forward_uv + ny * sign * self.retreat_arc_side_uv
+
+        wx = max(0.0, min(100.0, wx))
+        wy = max(0.0, min(100.0, wy))
+        return (wx, wy)
     @debug_log_result
     def _compute_dist_to_enemy_hero(self, s: Senses) -> float:
         """
@@ -909,8 +1002,7 @@ class Brain:
             return float(me["x"]), float(me["y"])
         except Exception:
             return None
-    def _dump_catboost_dataset(self) -> List[Dict[str, Any]]:
-        return list(self._catboost_dataset_rows)
+
 
     def _get_forced_state(self, s: Senses) -> Optional[BrainState]:
 
@@ -1021,29 +1113,7 @@ class Brain:
         self.last_action_ts = now
         return True
 
-    def _compute_retreat_screen_point(
-            self,
-            c: Dict[str, Any],
-            from_screen_xy: Tuple[float, float],
-            *,
-            step_px: float = 140.0,
-    ) -> Optional[Tuple[int, int]]:
-        cur_uv = self._get_self_uv(c)
-        if cur_uv is None:
-            return None
 
-        base_uv = self._pick_fountain_point(c)
-        dx_uv = float(base_uv[0] - cur_uv[0])
-        dy_uv = float(base_uv[1] - cur_uv[1])
-
-        norm_uv = float((dx_uv * dx_uv + dy_uv * dy_uv) ** 0.5)
-        if norm_uv <= 1e-6:
-            return None
-
-        sx, sy = from_screen_xy
-        tx = int(round(float(sx) + dx_uv / norm_uv * step_px))
-        ty = int(round(float(sy) + dy_uv / norm_uv * step_px))
-        return tx, ty
     @debug_log_result
     def _compute_laning_point(self, c: Dict[str, Any], min_dist_to_enemy: float) -> Optional[tuple[int, int]]:
         heroes = c.get("heroes", {})
@@ -1259,6 +1329,7 @@ class Brain:
         Side хранится в Planner (как в твоём planner.py).
         """
         side = getattr(self.pl, "side", "radiant")
+
         return str(side).lower().strip()
 
     def _get_role(self) -> str:
@@ -1271,7 +1342,33 @@ class Brain:
         self._camp_reset_minute = minute
         for camp in self._camps:
             camp.state = CampState.READY
+    def _retreat_point_behind_ally(
+        self,
+        ally_xy: Tuple[float, float],
+        enemy_xy: Optional[Tuple[float, float]],
+        self_xy: Tuple[float, float],
+        *,
+        step_px: Optional[float] = None,
+    ) -> Tuple[int, int]:
+        ax, ay = ally_xy
+        hx, hy = self_xy
+        step = self.retreat_anchor_backstep_px if step_px is None else float(step_px)
 
+        if enemy_xy is not None:
+            ex, ey = enemy_xy
+            vx = ax - ex
+            vy = ay - ey
+        else:
+            vx = ax - hx
+            vy = ay - hy
+
+        norm = float((vx * vx + vy * vy) ** 0.5)
+        if norm <= 1e-6:
+            return int(round(ax)), int(round(ay))
+
+        tx = ax + vx / norm * step
+        ty = ay + vy / norm * step
+        return int(round(tx)), int(round(ty))
     def _reset_jungle_fight_runtime(self) -> None:
         self._farm_fight_camp_id = None
         self._farm_fight_started_near_target = False
@@ -1311,28 +1408,7 @@ class Brain:
         r = self._farm_near_camp_radius_uv if radius_uv is None else float(radius_uv)
         return _euclid2(cur, (camp.x, camp.y)) <= (r * r)
 
-    def _enemy_creeps_near_camp(
-            self,
-            c: Dict[str, Any],
-            s: Senses,
-            camp: CampNode,
-            *,
-            radius_uv: Optional[float] = None,
-    ) -> bool:
-        cur = self._get_self_uv(c)
-        if cur is None:
-            return False
 
-        r = self._farm_near_camp_radius_uv if radius_uv is None else float(radius_uv)
-        near_camp = _euclid2(cur, (camp.x, camp.y)) <= (r * r)
-
-        # если мы не рядом с camp — screen creeps не считаем крипами этого лагеря
-        if not near_camp:
-            return False
-
-        # если рядом с лагерем и на экране видны enemy creeps —
-        # считаем, что это крипы этого лагеря
-        return bool(s.enemy_creep_near)
     def _attack_enemy_creep_on_screen(self, c: Dict[str, Any]) -> bool:
         heroes = c.get("heroes", {})
         creeps = c.get("creeps", {})
@@ -1357,82 +1433,8 @@ class Brain:
 
         cx, cy = best_xy
         return self._attack_on_screen_throttled(cx, cy, y_offset=10)
-    def _goto_nearest_camp(
-        self,
-        c: Dict[str, Any],
-        *,
-        camp_kind: CampKind = CampKind.SMALL,
-        from_pos: Optional[Tuple[float, float]] = None,
-        attack: bool = True,
-    ) -> None:
-        cur = self._get_self_uv(c) or (from_pos if from_pos is not None else (50.0, 50.0))
-        # используем уже инициализированные кемпы
-        # (если хочешь — можно дергать _ensure_camps_inited(s) из tick_farming, а тут не надо)
-        best = None
-        best_d2 = 1e18
-        for camp in self._camps:
-            if camp.kind is not camp_kind:
-                continue
-            d2 = _euclid2(cur, (camp.x, camp.y))
-            if d2 < best_d2:
-                best_d2 = d2
-                best = camp
-        if best is None:
-            return
-        self.pl.click_minimap_pct(self.hwnd, best.x + 1, best.y + 1, attack=attack)
 
 
-
-
-    @debug_log_result
-    def _goto_nearest_lane(
-            self,
-            c: Dict[str, Any],
-            *,
-            from_pos: Optional[Tuple[float, float]] = None,
-            attack: bool = False,
-    ) -> None:
-        """
-        Идём на ближайшую линию (top/mid/bot), НЕ указывая имя.
-        """
-
-        cur = self._get_self_uv(c)
-        if cur is None:
-            cur = from_pos if from_pos is not None else (50.0, 50.0)
-
-        root = self._get_landmarks(c)
-        lane_keys = ["lane_top", "lane_mid", "lane_bot"]
-
-        candidates: List[Tuple[str, List[Dict[str, float]]]] = []
-        for k in lane_keys:
-            arr = root.get(k, [])
-            # формат: lane_*: [[{x,y}, ...]]
-            if isinstance(arr, list) and arr and isinstance(arr[0], list) and arr[0]:
-                candidates.append((k, arr[0]))
-
-        if not candidates:
-            if self.log:
-                self.log.debug("[LANE] no lane polylines in landmarks")
-            return
-
-        best_lane = None
-        best_q = None
-        best_d2 = 1e18
-
-        for lname, poly in candidates:
-            qx, qy, d2 = _closest_point_on_polyline(poly, cur)
-            if d2 < best_d2:
-                best_d2 = d2
-                best_q = (qx, qy)
-                best_lane = lname
-
-        if best_q is None:
-            return
-
-        self.pl.click_minimap_pct(self.hwnd, best_q[0], best_q[1], attack=attack)
-
-        if self.log:
-            self.log.debug(f"[LANE] hwnd={hex(self.hwnd)} -> {best_lane} @ ({best_q[0]:.1f},{best_q[1]:.1f})")
 
     def _extract_point_xy(self, obj: Any) -> Optional[Tuple[float, float]]:
         """
@@ -1455,7 +1457,7 @@ class Brain:
         """
         Приоритет: fountain_<side> -> ancient_<side> -> (50,50)
         """
-        root = self._get_landmarks(c)
+        root = self._get_landmarks(c)['data']
         side = self._get_side()
 
         for key in (f"fountain_{side}", f"ancient_{side}"):
@@ -1465,52 +1467,6 @@ class Brain:
                 return pt
 
         return 50.0, 50.0
-
-    @debug_log_result
-    def _goto_fountain(self, c: Dict[str, Any]) -> None:
-        x, y = self._pick_fountain_point(c)
-        self.pl.click_minimap_pct(self.hwnd, x, y, attack=False)
-
-    @debug_log_result
-    def _goto_nearest_tower(
-            self,
-            c: Dict[str, Any],
-            *,
-            ally_or_enemy: str = "enemy",
-            only_alive: bool = True,
-            attack: bool = False,
-    ) -> None:
-        """
-        Находим ближайшую (живую) башню ally_or_enemy к текущей позиции self и кликаем по ней.
-        """
-        ally_or_enemy = (ally_or_enemy or "enemy").strip().lower()
-        if ally_or_enemy not in ("ally", "enemy"):
-            ally_or_enemy = "enemy"
-
-        tws = c.get("towers", {}).get(ally_or_enemy, [])
-        if not tws:
-            return
-
-        cur = self._get_self_uv(c) or (50.0, 50.0)
-
-        best = None
-        best_d2 = 1e18
-        for t in tws:
-            if only_alive and not bool(t.get("alive", True)):
-                continue
-            try:
-                px, py = float(t["x"]), float(t["y"])
-            except Exception:
-                continue
-            d2 = _euclid2(cur, (px, py))
-            if d2 < best_d2:
-                best_d2 = d2
-                best = (px, py)
-
-        if best is None:
-            return
-
-        self.pl.click_minimap_pct(self.hwnd, best[0] + 1, best[1] + 1, attack=attack)
 
     @debug_log_result
     def _select_creep(
@@ -1760,6 +1716,115 @@ class Brain:
         near = dist_min <= radius_uv
         return near, dist_min
 
+
+    @debug_log_result
+    def _nearest_enemy_screen_xy(self, c: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        enemy_heroes = heroes.get("enemy", [])
+
+        if not self_heroes or not enemy_heroes:
+            return None
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+
+        best_xy: Optional[Tuple[float, float]] = None
+        best_d2 = 1e18
+
+        for eb in enemy_heroes:
+            ex, ey = self._hpbar_center(eb)
+            d2 = (ex - hx) * (ex - hx) + (ey - hy) * (ey - hy)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_xy = (float(ex), float(ey))
+
+        return best_xy
+    def _should_anchor_behind_ally(self, s: Senses) -> bool:
+        if s.closest_ally_hero_dist_px is not None:
+            return s.closest_ally_hero_dist_px <= self.retreat_ally_screen_radius_px
+
+        if s.closest_ally_hero_mm_dist is not None:
+            return s.closest_ally_hero_mm_dist <= self.retreat_ally_mm_radius_uv
+
+        return False
+    @debug_log_result
+    def _closest_enemy_hero_mm_dist(self, c: Dict[str, Any]) -> Optional[float]:
+        units = c.get("map", {})
+        self_units = units.get("self", [])
+        enemy_units = units.get("enemy", [])
+
+        if not self_units or not enemy_units:
+            return None
+
+        try:
+            me = self_units[0]
+            mx = float(me["x"])
+            my = float(me["y"])
+        except Exception:
+            return None
+
+        best: Optional[float] = None
+        for e in enemy_units:
+            try:
+                ex = float(e["x"])
+                ey = float(e["y"])
+            except Exception:
+                continue
+            d = float(((ex - mx) ** 2 + (ey - my) ** 2) ** 0.5)
+            if best is None or d < best:
+                best = d
+
+        return best
+
+    @debug_log_result
+    def _closest_ally_hero_dist_px(self, c: Dict[str, Any]) -> Optional[float]:
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        ally_heroes = heroes.get("ally", [])
+
+        if not self_heroes or not ally_heroes:
+            return None
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+
+        best: Optional[float] = None
+        for ab in ally_heroes:
+            ax, ay = self._hpbar_center(ab)
+            d = float(((ax - hx) ** 2 + (ay - hy) ** 2) ** 0.5)
+            if best is None or d < best:
+                best = d
+
+        return best
+
+    @debug_log_result
+    def _closest_ally_hero_mm_dist(self, c: Dict[str, Any]) -> Optional[float]:
+        units = c.get("map", {})
+        self_units = units.get("self", [])
+        ally_units = units.get("ally", [])
+
+        if not self_units or not ally_units:
+            return None
+
+        try:
+            me = self_units[0]
+            mx = float(me["x"])
+            my = float(me["y"])
+        except Exception:
+            return None
+
+        best: Optional[float] = None
+        for a in ally_units:
+            try:
+                ax = float(a["x"])
+                ay = float(a["y"])
+            except Exception:
+                continue
+            d = float(((ax - mx) ** 2 + (ay - my) ** 2) ** 0.5)
+            if best is None or d < best:
+                best = d
+
+        return best
+
     def _collect_catboost_train_row(self, s: Senses) -> None:
         if not self.collect_catboost_dataset:
             return
@@ -1771,6 +1836,52 @@ class Brain:
         self._catboost_dataset_rows.append(row)
         self._flush_catboost_dataset_to_csv(force=False)
 
+    @debug_log_result
+    def _nearest_enemy_uv(self, c: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        cur = self._get_self_uv(c)
+        if cur is None:
+            return None
+
+        enemy_units = c.get("map", {}).get("enemy", [])
+        if not enemy_units:
+            return None
+
+        best_xy: Optional[Tuple[float, float]] = None
+        best_d2 = 1e18
+
+        for e in enemy_units:
+            try:
+                ex = float(e["x"])
+                ey = float(e["y"])
+            except Exception:
+                continue
+
+            d2 = _euclid2(cur, (ex, ey))
+            if d2 < best_d2:
+                best_d2 = d2
+                best_xy = (ex, ey)
+
+        return best_xy
+    def _nearest_ally_hero_screen_xy(self, c: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        heroes = c.get("heroes", {})
+        self_heroes = heroes.get("self", [])
+        ally_heroes = heroes.get("ally", [])
+
+        if not self_heroes or not ally_heroes:
+            return None
+
+        hx, hy = self._hpbar_center(self_heroes[0])
+        best_xy = None
+        best_d2 = 1e18
+
+        for ab in ally_heroes:
+            ax, ay = self._hpbar_center(ab)
+            d2 = (ax - hx) * (ax - hx) + (ay - hy) * (ay - hy)
+            if d2 < best_d2:
+                best_d2 = d2
+                best_xy = (float(ax), float(ay))
+
+        return best_xy
     def _normalize_brain_state(self, raw_pred: Any) -> Optional[BrainState]:
         if raw_pred is None:
             return None
@@ -1805,28 +1916,136 @@ class Brain:
 
         return None
 
-    def _predict_brain_state_with_catboost(self, features: Dict[str, Any]) -> BrainState:
-        if self._catboost_model is None:
-            raise RuntimeError("CatBoost model is not loaded")
+    def _build_retreat_path_uv(
+            self,
+            c: Dict[str, Any],
+            *,
+            enemy_uv: Optional[Tuple[float, float]],
+            fountain_uv: Tuple[float, float],
+    ) -> List[Tuple[float, float]]:
+        cur = self._get_self_uv(c)
+        if cur is None:
+            return [fountain_uv]
 
-        raw_pred = None
+        sx, sy = cur
+        fx, fy = fountain_uv
 
-        try:
-            raw_pred = self._catboost_model.predict(features)
-        except Exception:
-            try:
-                raw_pred = self._catboost_model.predict([features])
-            except Exception as e:
-                raise RuntimeError(f"CatBoost prediction failed: {e}") from e
+        dx = fx - sx
+        dy = fy - sy
+        dist_sf = float((dx * dx + dy * dy) ** 0.5)
+        if dist_sf <= 1e-6:
+            return [fountain_uv]
 
-        state = self._normalize_brain_state(raw_pred)
-        if state is None:
-            raise RuntimeError(f"CatBoost returned unsupported brain state: {raw_pred!r}")
+        ux = dx / dist_sf
+        uy = dy / dist_sf
 
-        return state
+        # нормаль к линии self -> fountain
+        nx = -uy
+        ny = ux
 
+        # сторону выбираем ОТ врага
+        side_sign = 1.0
+        if enemy_uv is not None:
+            ex, ey = enemy_uv
+            vex = ex - sx
+            vey = ey - sy
+            side = vex * nx + vey * ny
+            side_sign = -1.0 if side > 0.0 else 1.0
 
+        side_off = max(8.0, float(self.retreat_path_side_offset_uv))
+        fwd1 = max(8.0, float(self.retreat_path_forward_gain_uv) * 0.8)
+        fwd2 = max(14.0, float(self.retreat_path_forward_gain_uv) * 1.8)
+        fwd3 = max(22.0, float(self.retreat_path_forward_gain_uv) * 2.8)
 
+        # 1) резко уйти вбок от опасной линии
+        p1 = (
+            sx + nx * side_sign * (side_off * 1.35),
+            sy + ny * side_sign * (side_off * 1.35),
+        )
+
+        # 2) двигаться вперёд, оставаясь на безопасной стороне
+        p2 = (
+            sx + ux * fwd1 + nx * side_sign * (side_off * 1.45),
+            sy + uy * fwd1 + ny * side_sign * (side_off * 1.45),
+        )
+
+        p3 = (
+            sx + ux * fwd2 + nx * side_sign * (side_off * 1.15),
+            sy + uy * fwd2 + ny * side_sign * (side_off * 1.15),
+        )
+
+        # 3) только ближе к концу начинаем возвращаться к фонтану
+        p4 = (
+            sx + ux * fwd3 + nx * side_sign * (side_off * 0.45),
+            sy + uy * fwd3 + ny * side_sign * (side_off * 0.45),
+        )
+
+        ctrl = [p1, p2, p3, p4, (fx, fy)]
+
+        pts: List[Tuple[float, float]] = []
+        min_gap2 = 2.0 * 2.0
+
+        for pt in ctrl:
+            x = max(0.0, min(100.0, float(pt[0])))
+            y = max(0.0, min(100.0, float(pt[1])))
+
+            # не добавляем точки слишком близко к текущей позиции
+            if _euclid2((sx, sy), (x, y)) < (self.retreat_path_arrive_radius_uv * self.retreat_path_arrive_radius_uv):
+                continue
+
+            if pts and _euclid2(pts[-1], (x, y)) < min_gap2:
+                continue
+
+            pts.append((x, y))
+
+        if not pts or _euclid2(pts[-1], (fx, fy)) > 1.0:
+            pts.append((float(fx), float(fy)))
+
+        return pts
+
+    def _follow_retreat_path(self, c: Dict[str, Any]) -> bool:
+        cur = self._get_self_uv(c)
+        if cur is None:
+            return False
+
+        if not self._retreat_path_uv:
+            return False
+
+        # пропускаем только реально достигнутые точки
+        while self._retreat_path_idx < len(self._retreat_path_uv):
+            tx, ty = self._retreat_path_uv[self._retreat_path_idx]
+            if _euclid2(cur, (tx, ty)) <= (self.retreat_path_arrive_radius_uv ** 2):
+                self._retreat_path_idx += 1
+            else:
+                break
+
+        # весь путь завершён
+        if self._retreat_path_idx >= len(self._retreat_path_uv):
+            return False
+
+        tx, ty = self._retreat_path_uv[self._retreat_path_idx]
+
+        sent = self._minimap_click_throttled(tx, ty, cooldown=0.35)
+        if sent:
+            return True
+
+        now = time.time()
+        if (now - self._farming_last_minimap_click_ts) > 0.65:
+            self.pl.click_minimap_pct(self.hwnd, tx, ty, attack=False)
+            self._farming_last_minimap_click_ts = now
+            self.last_action_ts = now
+            return True
+
+        # даже если клик сейчас не ушёл, путь всё ещё активен
+        return True
+    def _should_rebuild_retreat_path(self, now: float) -> bool:
+        if not self._retreat_path_uv:
+            return True
+        if self._retreat_path_idx >= len(self._retreat_path_uv):
+            return True
+        if now - self._retreat_path_built_ts >= self.retreat_path_rebuild_sec:
+            return True
+        return False
 
     def _lane_landmarks_root(self, c: Dict[str, Any], s: Senses) -> Dict[str, Any]:
         if isinstance(s.landmarks, dict):
@@ -2152,6 +2371,16 @@ class Brain:
         # cooldown-ish memory
         self._last_walk_target = None
         self.last_action_ts = 0.0
+
+        self._retreat_phase = RetreatPhase.DIRECT_TO_FOUNTAIN
+        self._retreat_enter_ts = 0.0
+        self._retreat_phase_ts = 0.0
+        self._retreat_enemy_memory_until = 0.0
+
+        self._retreat_path_uv = []
+        self._retreat_path_idx = 0
+        self._retreat_path_built_ts = 0.0
+
     def _reset_lane_farm_memory(self) -> None:
         self._lane_target_uv = None
         self._lane_wave_seen = False
@@ -2173,6 +2402,15 @@ class Brain:
         old_state = self.state
         self.state = new_state
         self.last_action_ts = 0.0
+        if new_state is BrainState.RETREAT and old_state is not BrainState.RETREAT:
+            now = time.time()
+            self._retreat_enter_ts = now
+            self._retreat_phase_ts = now
+            self._retreat_enemy_memory_until = 0.0
+            self._retreat_phase = RetreatPhase.GO_BEHIND_ALLY
+            self._retreat_path_uv = []
+            self._retreat_path_idx = 0
+            self._retreat_path_built_ts = 0.0
 
         if new_state is BrainState.DEAD and old_state is not BrainState.DEAD:
             self._reset_runtime_substates_on_death()
@@ -2185,7 +2423,7 @@ class Brain:
             self._lasthit_target_key = None
             self._lasthit_target_expire = 0.0
 
-    # --------- обработчики состояний (пока примитивные заглушки) ---------
+
     def _tick_dead(self, c: Dict[str, Any], s: Senses):
         if s.alive:
             self._set_state(BrainState.IDLE)
@@ -2751,71 +2989,136 @@ class Brain:
         return
 
     def _tick_retreat(self, c: Dict[str, Any], s: Senses) -> None:
+        now = time.time()
+
         heroes = c.get("heroes", {})
         self_heroes = heroes.get("self", [])
-        enemy_heroes = heroes.get("enemy", [])
-
         if not self_heroes:
             return
 
         hx, hy = self._hpbar_center(self_heroes[0])
-        my_hp = 1.0 if s.hp_ratio is None else max(0.0, min(1.0, float(s.hp_ratio)))
 
-        best_enemy_xy = None
-        best_enemy_dist = None
-        for eb in enemy_heroes:
-            ex, ey = self._hpbar_center(eb)
-            dist = float(((ex - hx) ** 2 + (ey - hy) ** 2) ** 0.5)
-            if best_enemy_dist is None or dist < best_enemy_dist:
-                best_enemy_dist = dist
-                best_enemy_xy = (ex, ey)
+        if s.enemy_hero_dist_screen is not None or s.enemy_hero_dist_mm is not None:
+            self._retreat_enemy_memory_until = now + self.retreat_enemy_memory_sec
 
-        panic_dist_px = 260.0
-        danger_dist_px = 420.0
+        enemy_on_screen = s.enemy_hero_dist_screen is not None
+        enemy_on_minimap = s.enemy_hero_dist_mm is not None
+        threat_recent = now <= self._retreat_enemy_memory_until
 
-        # 1. Если враг реально близко — retreat only by screen, без minimap в этот тик.
-        if best_enemy_xy is not None and best_enemy_dist is not None and best_enemy_dist <= panic_dist_px:
-            retreat_pt = self._compute_retreat_screen_point(c, (hx, hy), step_px=170.0)
-            if retreat_pt is not None:
-                tx, ty = retreat_pt
-                sent = self._walk_throttled(
-                    tx,
-                    ty,
-                    cooldown=0.20,
-                    tol_px=14.0,
-                    attack=False,
-                )
-                if sent:
-                    return
+        fountain_uv = self._pick_fountain_point(c)
 
-        # 2. Если враг ещё рядом, но не в panic range — тоже не смешиваем с minimap.
-        if best_enemy_xy is not None and best_enemy_dist is not None and best_enemy_dist <= danger_dist_px:
-            retreat_pt = self._compute_retreat_screen_point(c, (hx, hy), step_px=120.0)
-            if retreat_pt is not None:
-                tx, ty = retreat_pt
-                sent = self._walk_throttled(
-                    tx,
-                    ty,
-                    cooldown=0.30,
-                    tol_px=16.0,
-                    attack=False,
-                )
-                if sent:
-                    return
+        # 1) одноразово спрятаться за ally
+        if self._retreat_phase is RetreatPhase.GO_BEHIND_ALLY:
+            done = False
 
-        # 3. Если стоим под своей башней и враг уже не давит — не спамим.
-        if s.under_ally_tower and (best_enemy_dist is None or best_enemy_dist > 320.0):
+            if self._should_anchor_behind_ally(s):
+                ally_xy = self._nearest_ally_hero_screen_xy(c)
+                if ally_xy is not None:
+                    enemy_xy = self._nearest_enemy_screen_xy(c) if enemy_on_screen else None
+                    tx, ty = self._retreat_point_behind_ally(
+                        ally_xy=ally_xy,
+                        enemy_xy=enemy_xy,
+                        self_xy=(hx, hy),
+                    )
+
+                    self._walk_throttled(
+                        tx,
+                        ty,
+                        cooldown=0.15,
+                        tol_px=10.0,
+                        attack=False,
+                    )
+
+                    d2 = (tx - hx) * (tx - hx) + (ty - hy) * (ty - hy)
+                    if d2 <= (28.0 * 28.0) or (now - self._retreat_phase_ts) >= self.retreat_anchor_timeout:
+                        done = True
+                else:
+                    done = True
+            else:
+                done = True
+
+            if done:
+                self._retreat_phase = RetreatPhase.BUILD_PATH
+                self._retreat_phase_ts = now
+
             return
 
-        # 4. Только когда непосредственной screen-угрозы нет — retreat по minimap к базе.
-        fountain_x, fountain_y = self._pick_fountain_point(c)
-        minimap_cd = 0.5 if my_hp <= 0.20 else 0.9
+        # 2) если враг на экране — уходим screen-walk, миникарту не трогаем
+        if enemy_on_screen:
+            enemy_xy = self._nearest_enemy_screen_xy(c)
+            if enemy_xy is not None:
+                ex, ey = enemy_xy
+                dx = hx - ex
+                dy = hy - ey
+                norm = float((dx * dx + dy * dy) ** 0.5)
+                if norm > 1e-6:
+                    tx = int(round(hx + dx / norm * self.retreat_screen_step_px))
+                    ty = int(round(hy + dy / norm * self.retreat_screen_step_px))
+                    sent = self._walk_throttled(
+                        tx,
+                        ty,
+                        cooldown=0.15,
+                        tol_px=10.0,
+                        attack=False,
+                    )
+                    if not sent and (now - self._last_walk_ts) > 0.22:
+                        self.pl.click_on_screen_walk(self.hwnd, tx, ty, attack=False)
+                        self._last_walk_ts = now
+                        self._last_walk_target = (tx, ty)
+                        self.last_action_ts = now
 
-        self._minimap_click_throttled(
-            fountain_x,
-            fountain_y,
-            cooldown=minimap_cd,
+            # после screen retreat хотим потом идти по path, а не напрямую
+            self._retreat_phase = RetreatPhase.BUILD_PATH
+            return
+
+        # 3) build path
+        if self._retreat_phase is RetreatPhase.BUILD_PATH:
+            enemy_uv = self._nearest_enemy_uv(c) if (enemy_on_minimap or threat_recent) else None
+            self._retreat_path_uv = self._build_retreat_path_uv(
+                c,
+                enemy_uv=enemy_uv,
+                fountain_uv=fountain_uv,
+            )
+            self._retreat_path_idx = 0
+            self._retreat_path_built_ts = now
+
+            if self._retreat_path_uv:
+                self._retreat_phase = RetreatPhase.FOLLOW_PATH
+            else:
+                self._retreat_phase = RetreatPhase.DIRECT_TO_FOUNTAIN
+
+        # 4) follow path
+        if self._retreat_phase is RetreatPhase.FOLLOW_PATH:
+            # если путь пуст или устарел — перестраиваем, а не бежим сразу в фонтан
+            if self._should_rebuild_retreat_path(now):
+                self._retreat_phase = RetreatPhase.BUILD_PATH
+                return
+
+            active = self._follow_retreat_path(c)
+
+            # если путь ещё активен — продолжаем по нему
+            if active:
+                return
+
+            # только если путь реально закончился — можно идти напрямую
+            self._retreat_phase = RetreatPhase.DIRECT_TO_FOUNTAIN
+            self._retreat_phase_ts = now
+
+        # 5) rebuild if needed
+        if self._retreat_phase is RetreatPhase.BUILD_PATH:
+            return self._tick_retreat(c, s)
+
+        # 6) fallback direct fountain
+        self._retreat_phase = RetreatPhase.DIRECT_TO_FOUNTAIN
+        sent = self._minimap_click_throttled(
+            fountain_uv[0],
+            fountain_uv[1],
+            cooldown=0.55,
         )
+        if not sent and (now - self._farming_last_minimap_click_ts) > 0.75:
+            self.pl.click_minimap_pct(self.hwnd, fountain_uv[0], fountain_uv[1], attack=False)
+            self._farming_last_minimap_click_ts = now
+            self.last_action_ts = now
 
     def _tick_wait_start(self, c: Dict[str, Any], s: Senses):
         if c.get("t_game", 0) > 110:

@@ -1015,7 +1015,7 @@ class Planner:
         # возвращаем курсор назад
         if ox is not None and oy is not None:
             time.sleep(0.015)
-            win32api.SetCursorPos((ox, oy))
+            #win32api.SetCursorPos((ox, oy))
 
 
 
@@ -1179,8 +1179,16 @@ def visualize_full_frame(pl: "Planner",
             f"[VIS] frame {W}x{H}, heroes E/A/S={heroes_counts['enemy']}/{heroes_counts['ally']}/{heroes_counts['self']}, "
             f"creeps E/A={creeps_counts['enemy']}/{creeps_counts['ally']}, fps={fps:.1f}"
         )
+    img = cv2.resize(
+        img,
+        None,
+        fx=2.0,
+        fy=2.0,
+        interpolation=cv2.INTER_NEAREST,
+    )
 
     return img
+
 
 
 
@@ -1198,7 +1206,7 @@ if __name__ == "__main__":
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S"
     )
-    log = logging.getLogger("planner-demo")
+    log = logging.getLogger("SteamManager")
 
     # --- hwnd по PID ---
 
