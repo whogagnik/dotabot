@@ -238,6 +238,30 @@ class Account:
         self.mafile_path = path
         self.mafile_data = data
 
+    def _manual_login_without_mafile(self, hwnd: int) -> int:
+        """
+        Fallback для аккаунтов без mafile:
+        фокусируем окно, вводим логин/пароль и жмем Enter.
+        """
+        try:
+            _force_foreground(hwnd)
+            time.sleep(0.2)
+            p.hotkey("ctrl", "a")
+            p.press("backspace")
+            p.write(self.username, interval=0.01)
+            p.press("tab")
+            p.hotkey("ctrl", "a")
+            p.press("backspace")
+            p.write(self.password, interval=0.01)
+            p.press("enter")
+            self.set_status("scanning")
+            self.logger.info(f"{self.username}: login/password submitted (no mafile).")
+            return 0
+        except Exception as e:
+            self.logger.error(f"{self.username}: no-mafile login failed: {e}")
+            self.set_status("error")
+            return 1
+
     # ---------- process tree ----------
     def _proc_tree_pids(self) -> List[int]:
         res: List[int] = []
@@ -660,9 +684,8 @@ class Account:
                 self.set_status("error")
                 return 1
             if not self.mafile_path:
-                self.logger.error(f"{self.username}: нет maFile")
-                self.set_status("error")
-                return 1
+                self.logger.warning(f"{self.username}: maFile отсутствует, fallback на login/password")
+                return self._manual_login_without_mafile(hwnd)
 
             env = os.environ.copy()
             env.setdefault("ZBAR_DEBUG", "0")
