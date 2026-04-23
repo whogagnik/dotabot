@@ -6,15 +6,14 @@ import time
 import logging
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 
 from scripts.host.app.gui_handler import GuiHandler
-from scripts.host.app.controller import HostController
+from scripts.host.orchestrator.host_controller import HostController
 from scripts.host.core.config import DEFAULT_MAFILES_DIR
-from scripts.host.core.account import Account
 
 
 _HOST_CONTROLLER: Optional[HostController] = None
@@ -29,12 +28,10 @@ def get_host_controller() -> HostController:
 def make_logger(gui_text: tk.Text) -> logging.Logger:
     logger = logging.getLogger("SteamHost")
     logger.setLevel(logging.INFO)
-
     for h in list(logger.handlers):
         logger.removeHandler(h)
 
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
-
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
@@ -44,7 +41,6 @@ def make_logger(gui_text: tk.Text) -> logging.Logger:
     gh.setLevel(logging.INFO)
     gh.setFormatter(fmt)
     logger.addHandler(gh)
-
     logger.propagate = False
     return logger
 
@@ -54,21 +50,13 @@ class App(tk.Tk):
         super().__init__()
         self.title("Host Orchestrator")
         self.geometry("1200x760")
-        self.minsize(1000, 600)
         self.configure(bg="#2c2f33")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(
-            self,
-            height=10,
-            bg="#1e2124",
-            fg="#d6d6d6",
-            insertbackground="#ffffff",
-            font=("Consolas", 10),
-        )
+        self.log_text = tk.Text(self, height=10, bg="#1e2124", fg="#d6d6d6", insertbackground="#ffffff", font=("Consolas", 10))
         self.log_text.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
         self.log_text.configure(state="disabled")
 
@@ -78,16 +66,13 @@ class App(tk.Tk):
         global _HOST_CONTROLLER
         _HOST_CONTROLLER = self.controller
 
-        self._selected: Dict[str, bool] = {}
         self._row_status: Dict[str, str] = {}
-
         self._tick_thread: Optional[threading.Thread] = None
         self._tick_stop = threading.Event()
 
         self._build_top()
         self._build_mid()
         self._build_bottom()
-
         self.after(1000, self._refresh_vm_table_loop)
 
     def _build_top(self):
@@ -117,7 +102,7 @@ class App(tk.Tk):
         left = tk.Frame(mid, bg="#2c2f33")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-        self.acc_tree = ttk.Treeview(left, columns=("login", "ma", "status"), show="headings", selectmode="none")
+        self.acc_tree = ttk.Treeview(left, columns=("login", "ma", "status"), show="headings")
         self.acc_tree.heading("login", text="Login")
         self.acc_tree.heading("ma", text="maFile")
         self.acc_tree.heading("status", text="Status")
@@ -125,20 +110,14 @@ class App(tk.Tk):
         self.acc_tree.column("ma", width=80, anchor="center")
         self.acc_tree.column("status", width=220, anchor="w")
         self.acc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.acc_tree.bind("<Button-1>", self.on_tree_click)
 
         right = tk.Frame(mid, bg="#23272a", bd=1, relief="solid")
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         right.grid_rowconfigure(1, weight=1)
         right.grid_columnconfigure(0, weight=1)
-
         tk.Label(right, text="VM / Session", bg="#23272a", fg="#ffffff", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 6))
 
-        self.vm_tree = ttk.Treeview(
-            right,
-            columns=("vm_id", "status", "cap", "accounts", "hwnds", "planner"),
-            show="headings",
-        )
+        self.vm_tree = ttk.Treeview(right, columns=("vm_id", "status", "cap", "accounts", "hwnds", "planner"), show="headings")
         self.vm_tree.heading("vm_id", text="VM")
         self.vm_tree.heading("status", text="Status")
         self.vm_tree.heading("cap", text="Cap")
@@ -151,14 +130,10 @@ class App(tk.Tk):
         bottom = tk.Frame(self, bg="#2c2f33")
         bottom.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 10))
 
-        tk.Button(bottom, text="Select all", command=self.select_all, bg="#99aab5", fg="#2c2f33", relief="flat", width=14).grid(row=0, column=0, padx=4)
-        tk.Button(bottom, text="Clear", command=self.clear_selection, bg="#99aab5", fg="#2c2f33", relief="flat", width=14).grid(row=0, column=1, padx=4)
-
         self.start_btn = tk.Button(bottom, text="Start", command=self.start_pipeline, bg="#5865f2", fg="white", relief="flat", width=18)
         self.stop_btn = tk.Button(bottom, text="Stop", command=self.stop_pipeline, bg="#f04747", fg="white", relief="flat", width=18)
-
-        self.start_btn.grid(row=0, column=2, padx=12)
-        self.stop_btn.grid(row=0, column=3, padx=4)
+        self.start_btn.grid(row=0, column=0, padx=12)
+        self.stop_btn.grid(row=0, column=1, padx=4)
 
     def set_status(self, username: str, status: str):
         self._row_status[username] = status
@@ -169,25 +144,12 @@ class App(tk.Tk):
         if not path:
             return
 
-        accounts: List[Account] = []
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or ":" not in line:
-                    continue
-                login, password = line.split(":", 1)
-                acc = Account(login, password, self.logger, None, self.set_status)
-                accounts.append(acc)
-
-        self.controller.load_accounts(accounts)
-        self._selected = {a.username: False for a in accounts}
+        self.controller.load_accounts_from_txt(path)
         self.refresh_accounts_table()
 
     def scan_mafiles(self):
-        folder = self.ma_dir_var.get().strip()
-        if not folder:
-            folder = str(DEFAULT_MAFILES_DIR.resolve())
-            self.ma_dir_var.set(folder)
+        folder = self.ma_dir_var.get().strip() or str(DEFAULT_MAFILES_DIR.resolve())
+        self.ma_dir_var.set(folder)
         Path(folder).mkdir(parents=True, exist_ok=True)
 
         self.controller.build_mafile_index(folder)
@@ -196,10 +158,9 @@ class App(tk.Tk):
 
     def on_pick_ma_folder(self):
         folder = filedialog.askdirectory(title="Папка с .maFile/.json")
-        if not folder:
-            return
-        self.ma_dir_var.set(folder)
-        self.scan_mafiles()
+        if folder:
+            self.ma_dir_var.set(folder)
+            self.scan_mafiles()
 
     def start_pipeline(self):
         self.controller.batch_size = int(self.batch_size_var.get())
@@ -228,61 +189,21 @@ class App(tk.Tk):
         self._tick_stop.set()
         self.logger.info("Pipeline stopped")
 
-    def select_all(self):
-        for a in self.controller.accounts:
-            self._selected[a.username] = True
-        self.refresh_accounts_table()
-
-    def clear_selection(self):
-        for a in self.controller.accounts:
-            self._selected[a.username] = False
-        self.refresh_accounts_table()
-
     def refresh_accounts_table(self):
         self.acc_tree.delete(*self.acc_tree.get_children())
         for a in self.controller.accounts:
-            sel = self._selected.get(a.username, False)
-            self.acc_tree.insert(
-                "",
-                tk.END,
-                iid=a.username,
-                values=(
-                    f"{'✓' if sel else '□'}  {a.username}",
-                    "✔" if a.mafile_data else "✖",
-                    self._row_status.get(a.username, getattr(a, "status", "idle")),
-                ),
-            )
+            self.acc_tree.insert("", tk.END, iid=a.username, values=(a.username, "✔" if a.mafile_data else "✖", self._row_status.get(a.username, getattr(a, "status", "idle"))))
 
     def refresh_vm_table(self):
         self.vm_tree.delete(*self.vm_tree.get_children())
         for row in self.controller.get_vm_rows():
-            self.vm_tree.insert(
-                "",
-                tk.END,
-                iid=row["vm_id"],
-                values=(
-                    row["vm_id"],
-                    row["status"],
-                    row["capacity"],
-                    row["accounts"],
-                    row["hwnds"],
-                    "yes" if row["planner"] else "no",
-                ),
-            )
+            self.vm_tree.insert("", tk.END, iid=row["vm_id"], values=(row["vm_id"], row["status"], row["capacity"], row["accounts"], row["hwnds"], "yes" if row["planner"] else "no"))
 
     def _refresh_vm_table_loop(self):
         try:
             self.refresh_vm_table()
         finally:
             self.after(1000, self._refresh_vm_table_loop)
-
-    def on_tree_click(self, event):
-        row_id = self.acc_tree.identify_row(event.y)
-        if not row_id:
-            return
-        self._selected[row_id] = not self._selected.get(row_id, False)
-        self.refresh_accounts_table()
-        return "break"
 
     def on_close(self):
         self._tick_stop.set()
@@ -296,5 +217,4 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    app = App()
-    app.mainloop()
+    App().mainloop()
