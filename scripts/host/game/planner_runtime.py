@@ -5,7 +5,7 @@ from threading import RLock
 from typing import Dict, Optional
 
 from scripts.host.game.planner import Planner
-from scripts.host.core.django_service import DjangoPlannerBridge
+from scripts.host.core.django_planner_service import DjangoPlannerBridge
 
 
 @dataclass
