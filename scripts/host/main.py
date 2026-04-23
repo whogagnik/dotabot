@@ -12,17 +12,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 
 from scripts.host.app.gui_handler import GuiHandler
-from scripts.host.app.controller import HostController, set_host_controller
+from scripts.host.app.controller import HostController, get_host_controller, set_host_controller
 from scripts.host.core.config import DEFAULT_MAFILES_DIR
-
-
-_HOST_CONTROLLER: Optional[HostController] = None
-
-
-def get_host_controller() -> HostController:
-    if _HOST_CONTROLLER is None:
-        raise RuntimeError("HostController is not initialized")
-    return _HOST_CONTROLLER
 
 
 def make_logger(gui_text: tk.Text) -> logging.Logger:
@@ -62,11 +53,8 @@ class App(tk.Tk):
 
         self.logger = make_logger(self.log_text)
         self.controller = HostController(self.logger, self.set_status)
-        self.controller.ensure_django_started()
-
-        global _HOST_CONTROLLER
-        _HOST_CONTROLLER = self.controller
         set_host_controller(self.controller)
+        self.controller.ensure_django_started()
 
         self._row_status: Dict[str, str] = {}
         self._tick_thread: Optional[threading.Thread] = None
