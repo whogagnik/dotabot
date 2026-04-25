@@ -32,7 +32,7 @@ class VmClient:
             debug=DEBUG,
         )
         self.capture = DotaCapture()
-        self.executor = CommandExecutor()
+        self.executor = CommandExecutor(capture=self.capture, api=self.api)
         self._running = True
 
     # ---------------------------------------------------------
@@ -68,37 +68,10 @@ class VmClient:
         )
 
     # ---------------------------------------------------------
-    # special commands
+    # command execution
     # ---------------------------------------------------------
 
-    def _handle_capture_frame(self, command: dict) -> dict:
-        payload = command.get("payload") or {}
-        hwnd = payload.get("hwnd")
-        if hwnd is None:
-            raise ValueError("capture_frame requires hwnd")
-        hwnd = int(hwnd)
-
-        frame_rgb = self.capture.grab_window_rgb(hwnd)
-        if frame_rgb is None:
-            raise RuntimeError(f"capture returned None for hwnd={hwnd}")
-
-        submit_resp = self.api.submit_frame_raw(
-            hwnd=hwnd,
-            frame_rgb=frame_rgb,
-        )
-
-        return {
-            "capture_sent": True,
-            "hwnd": hwnd,
-            "submit_response": submit_resp,
-        }
-
     def _execute_command(self, command: dict) -> dict:
-        cmd_type = str(command["type"])
-
-        if cmd_type == "capture_frame":
-            return self._handle_capture_frame(command)
-
         return self.executor.execute(command)
 
     # ---------------------------------------------------------

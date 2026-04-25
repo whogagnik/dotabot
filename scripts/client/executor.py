@@ -18,7 +18,7 @@ import win32process
 from PIL import Image
 
 
-EXECUTOR_VERSION = "executor_dynamic_window_sizes_capture_desktop_v1"
+EXECUTOR_VERSION = "executor_capture_frame_unique_dota_pid_v3"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -44,10 +44,10 @@ class HostCommandType:
 
 
 def _desktop_bounds() -> dict[str, int]:
-    left = win32api.GetSystemMetrics(76)    # SM_XVIRTUALSCREEN
-    top = win32api.GetSystemMetrics(77)     # SM_YVIRTUALSCREEN
-    width = win32api.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
-    height = win32api.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+    left = win32api.GetSystemMetrics(76)
+    top = win32api.GetSystemMetrics(77)
+    width = win32api.GetSystemMetrics(78)
+    height = win32api.GetSystemMetrics(79)
 
     return {
         "left": int(left),
@@ -223,13 +223,17 @@ def _get_client_rect(hwnd: int) -> tuple[int, int, int, int]:
 
 
 class CommandExecutor:
-    def __init__(self):
+    def __init__(self, capture: Any = None, api: Any = None):
         print(f"[EXECUTOR] loaded version: {EXECUTOR_VERSION}")
+
+        self.capture = capture
+        self.api = api
 
         self._proc_pid_by_account: dict[str, int] = {}
         self._launch_ts_by_account: dict[str, float] = {}
         self._login_hwnd_by_account: dict[str, int] = {}
         self._dota_hwnd_by_account: dict[str, int] = {}
+        self._dota_pid_by_account: dict[str, int] = {}
 
     # ---------------------------------------------------------
     # helpers
@@ -363,6 +367,7 @@ class CommandExecutor:
     def _find_any_dota_window(
         self,
         exclude_hwnds: set[int],
+        exclude_pids: set[int],
         *,
         min_create_ts: Optional[float],
     ) -> Optional[tuple[int, int]]:
@@ -373,17 +378,26 @@ class CommandExecutor:
 
             if result is not None:
                 return
-            if hwnd in exclude_hwnds:
-                return
-            if not win32gui.IsWindowVisible(hwnd):
+
+            hwnd_i = int(hwnd)
+
+            if hwnd_i in exclude_hwnds:
                 return
 
-            pid = _window_pid(hwnd)
+            if not win32gui.IsWindowVisible(hwnd_i):
+                return
+
+            pid = _window_pid(hwnd_i)
             if not pid:
                 return
 
+            pid_i = int(pid)
+
+            if pid_i in exclude_pids:
+                return
+
             try:
-                proc = psutil.Process(pid)
+                proc = psutil.Process(pid_i)
                 pname = (proc.name() or "").lower()
                 create_ts = float(proc.create_time())
             except Exception:
@@ -392,10 +406,18 @@ class CommandExecutor:
             if pname != "dota2.exe":
                 return
 
-            if min_create_ts is not None and create_ts < (min_create_ts - 5.0):
+            if min_create_ts is not None and create_ts < float(min_create_ts):
                 return
 
-            result = (int(hwnd), int(pid))
+            try:
+                title = (win32gui.GetWindowText(hwnd_i) or "").strip().lower()
+            except Exception:
+                title = ""
+
+            if title and "dota" not in title and "дота" not in title:
+                return
+
+            result = (hwnd_i, pid_i)
 
         try:
             win32gui.EnumWindows(cb, None)
@@ -515,59 +537,97 @@ class CommandExecutor:
         deadline = time.time() + (timeout_ms / 1000.0)
 
         exclude_hwnds = {
-            int(x) for k, x in self._dota_hwnd_by_account.items()
-            if k != account_login
+            int(x)
+            for x in payload.get("exclude_hwnds", [])
+            if x is not None
         }
 
-        min_create_ts = self._launch_ts_by_account.get(account_login)
+        exclude_pids = {
+            int(x)
+            for x in payload.get("exclude_pids", [])
+            if x is not None
+        }
+
+        for login, hwnd in self._dota_hwnd_by_account.items():
+            if login != account_login and hwnd is not None:
+                exclude_hwnds.add(int(hwnd))
+
+        for login, pid in self._dota_pid_by_account.items():
+            if login != account_login and pid is not None:
+                exclude_pids.add(int(pid))
+
+        min_create_ts = payload.get("min_create_ts")
+        if min_create_ts is None:
+            min_create_ts = self._launch_ts_by_account.get(account_login)
+        else:
+            min_create_ts = float(min_create_ts)
 
         while time.time() < deadline:
             tree_pids = self._proc_tree_pids(account_login)
 
             for pid in tree_pids:
+                pid_i = int(pid)
+
+                if pid_i in exclude_pids:
+                    continue
+
                 try:
-                    proc = psutil.Process(pid)
+                    proc = psutil.Process(pid_i)
                     if (proc.name() or "").lower() != "dota2.exe":
                         continue
 
-                    hwnd = _find_main_window_for_pid(pid)
-                    if hwnd and hwnd not in exclude_hwnds:
-                        self._dota_hwnd_by_account[account_login] = int(hwnd)
+                    hwnd = _find_main_window_for_pid(pid_i)
+                    if hwnd and int(hwnd) not in exclude_hwnds:
+                        hwnd_i = int(hwnd)
+
+                        self._dota_hwnd_by_account[account_login] = hwnd_i
+                        self._dota_pid_by_account[account_login] = pid_i
+
                         return self._result_ok(
                             found=True,
-                            hwnd=int(hwnd),
-                            pid=int(pid),
+                            hwnd=hwnd_i,
+                            pid=pid_i,
                             account_login=account_login,
                             source="tree",
-                            window_info=_window_info(int(hwnd)),
+                            exclude_pids=sorted(exclude_pids),
+                            exclude_hwnds=sorted(exclude_hwnds),
+                            window_info=_window_info(hwnd_i),
                         )
                 except Exception:
                     continue
 
-            if min_create_ts is not None:
-                any_dota = self._find_any_dota_window(
-                    exclude_hwnds=exclude_hwnds,
+            any_dota = self._find_any_dota_window(
+                exclude_hwnds=exclude_hwnds,
+                exclude_pids=exclude_pids,
+                min_create_ts=min_create_ts,
+            )
+            if any_dota is not None:
+                hwnd, pid = any_dota
+
+                self._dota_hwnd_by_account[account_login] = int(hwnd)
+                self._dota_pid_by_account[account_login] = int(pid)
+
+                return self._result_ok(
+                    found=True,
+                    hwnd=int(hwnd),
+                    pid=int(pid),
+                    account_login=account_login,
+                    source="global_fallback_unique_pid_guarded",
                     min_create_ts=min_create_ts,
+                    exclude_pids=sorted(exclude_pids),
+                    exclude_hwnds=sorted(exclude_hwnds),
+                    window_info=_window_info(int(hwnd)),
                 )
-                if any_dota is not None:
-                    hwnd, pid = any_dota
-                    self._dota_hwnd_by_account[account_login] = int(hwnd)
-                    return self._result_ok(
-                        found=True,
-                        hwnd=int(hwnd),
-                        pid=int(pid),
-                        account_login=account_login,
-                        source="global_fallback_create_time_guarded",
-                        min_create_ts=min_create_ts,
-                        window_info=_window_info(int(hwnd)),
-                    )
 
             time.sleep(0.25)
 
         return self._result_ok(
             found=False,
             hwnd=None,
+            pid=None,
             account_login=account_login,
+            exclude_pids=sorted(exclude_pids),
+            exclude_hwnds=sorted(exclude_hwnds),
         )
 
     # ---------------------------------------------------------
@@ -803,16 +863,84 @@ class CommandExecutor:
         time.sleep(max(0, duration_ms) / 1000.0)
         return self._result_ok(duration_ms=duration_ms)
 
+    def capture_frame(self, payload: dict[str, Any]) -> dict[str, Any]:
+        import numpy as np
+
+        hwnd = int(payload["hwnd"])
+        purpose = str(payload.get("purpose", ""))
+
+        if self.capture is None:
+            raise RuntimeError("CommandExecutor.capture is not initialized")
+
+        frame_rgb = self.capture.grab_window_rgb(hwnd)
+
+        if frame_rgb is None:
+            return self._result_ok(
+                capture_sent=False,
+                hwnd=hwnd,
+                purpose=purpose,
+                error=f"capture returned None for hwnd={hwnd}",
+            )
+
+        if not isinstance(frame_rgb, np.ndarray):
+            return self._result_ok(
+                capture_sent=False,
+                hwnd=hwnd,
+                purpose=purpose,
+                error=f"capture returned non-numpy frame for hwnd={hwnd}",
+            )
+
+        if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
+            return self._result_ok(
+                capture_sent=False,
+                hwnd=hwnd,
+                purpose=purpose,
+                error=f"invalid frame shape={getattr(frame_rgb, 'shape', None)}",
+            )
+
+        if frame_rgb.dtype != np.uint8:
+            frame_rgb = frame_rgb.astype(np.uint8, copy=False)
+
+        if not frame_rgb.flags["C_CONTIGUOUS"]:
+            frame_rgb = np.ascontiguousarray(frame_rgb)
+
+        height, width = frame_rgb.shape[:2]
+
+        img = Image.fromarray(frame_rgb, mode="RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", compress_level=0)
+
+        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        submit_response = {
+            "ok": True,
+            "skipped": True,
+            "reason": "frame_returned_in_ack",
+        }
+
+        return self._result_ok(
+            capture_sent=True,
+            hwnd=hwnd,
+            purpose=purpose,
+            width=int(width),
+            height=int(height),
+            format="png",
+            image_b64=image_b64,
+            submit_response=submit_response,
+            ts=time.time(),
+        )
+
     def capture_desktop(self, payload: dict[str, Any]) -> dict[str, Any]:
         img = p.screenshot()
         width, height = img.size
 
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=70)
+        img.save(buf, format="PNG", compress_level=0)
 
         return self._result_ok(
             width=int(width),
             height=int(height),
+            format="png",
             image_b64=base64.b64encode(buf.getvalue()).decode("ascii"),
             desktop=_desktop_bounds(),
         )
@@ -825,6 +953,8 @@ class CommandExecutor:
         cmd_type = str(command["type"])
         payload = dict(command.get("payload") or {})
 
+        if cmd_type == "capture_frame":
+            return self.capture_frame(payload)
         if cmd_type == "capture_desktop":
             return self.capture_desktop(payload)
 
@@ -858,9 +988,9 @@ class CommandExecutor:
             return self.sleep_cmd(payload)
         if cmd_type == HostCommandType.CAPTURE_DESKTOP:
             return self.capture_desktop(payload)
-        if cmd_type == HostCommandType.LOG:
-            return self._result_ok()
         if cmd_type == HostCommandType.CAPTURE_FRAME:
+            return self.capture_frame(payload)
+        if cmd_type == HostCommandType.LOG:
             return self._result_ok()
 
         raise ValueError(f"Unknown command type: {cmd_type}")

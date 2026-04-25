@@ -110,43 +110,116 @@ class StartMmDota2:
     # ---------------------------------------------------------
 
     def _load_templates(self) -> Dict[str, Optional[np.ndarray]]:
-        png = {
-            "dota": os.path.join(self.images_root, "lobby", "dota.png"),
-            "self": os.path.join(self.images_root, "lobby", "self.png"),
+        """
+        Загружает все картинки из images/* рекурсивно.
 
-            "add_party": os.path.join(self.images_root, "lobby", "add-party.png"),
-            "id_field_ru": os.path.join(self.images_root, "lobby", "id-field-ru.png"),
-            "id_field_eng": os.path.join(self.images_root, "lobby", "id-field-eng.png"),
-            "search_ru": os.path.join(self.images_root, "lobby", "search-ru.png"),
-            "search_eng": os.path.join(self.images_root, "lobby", "search-eng.png"),
-            "add": os.path.join(self.images_root, "lobby", "add.png"),
-            "accept_invite_ru": os.path.join(self.images_root, "lobby", "accept-invite-ru.png"),
-            "accept_invite_eng": os.path.join(self.images_root, "lobby", "accept-invite-eng.png"),
+        Пример ключей:
+          images/lobby/dota.png                 -> lobby_dota
+          images/lobby/close-welcome-ru.png     -> lobby_close_welcome_ru
+          images/game/detect-radiant.png        -> game_detect_radiant
+          images/steam/continue_anyway_ru.png   -> steam_continue_anyway_ru
 
-            "detect_radiant": os.path.join(self.images_root, "game", "detect-radiant.png"),
-            "detect_dire": os.path.join(self.images_root, "game", "detect-dire.png"),
+        Также добавляет алиасы для старого кода:
+          dota -> lobby_dota
+          close_welcome_ru -> lobby_close_welcome_ru
+        """
+        out: Dict[str, Optional[np.ndarray]] = {}
 
-            "play": os.path.join(self.images_root, "lobby", "play.png"),
-            "continue": os.path.join(self.images_root, "lobby", "continue.png"),
+        valid_ext = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
-            "lock_in_ru": os.path.join(self.images_root, "game", "lock-in-ru.png"),
-            "inventory": os.path.join(self.images_root, "game", "inventory.png"),
+        root_abs = os.path.abspath(self.images_root)
 
-            "close_welcome_ru": os.path.join(self.images_root, "game", "close-welcome-ru.png"),
-            "close_welcome_ru2": os.path.join(self.images_root, "game", "close-welcome-ru2.png"),
-            "close_welcome_en": os.path.join(self.images_root, "game", "close-welcome-en.png"),
+        if not os.path.isdir(root_abs):
+            self.log.warning(f"[MM] images_root not found: {root_abs}")
+            return out
+
+        for root, _, files in os.walk(root_abs):
+            for filename in files:
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in valid_ext:
+                    continue
+
+                path = os.path.join(root, filename)
+
+                rel = os.path.relpath(path, root_abs)
+                rel_no_ext = os.path.splitext(rel)[0]
+
+                # lobby/close-welcome-ru -> lobby_close_welcome_ru
+                key = (
+                    rel_no_ext
+                    .replace("\\", "_")
+                    .replace("/", "_")
+                    .replace("-", "_")
+                    .replace(" ", "_")
+                    .lower()
+                )
+
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+                if img is None or img.size == 0:
+                    self.log.warning(f"[MM] failed to load template: {path}")
+                    out[key] = None
+                    continue
+
+                out[key] = img
+
+        # Алиасы под текущий код.
+        aliases = {
+            # lobby
+            "dota": "lobby_dota",
+            "self": "lobby_self",
+
+            "add_party": "lobby_add_party",
+            "id_field_ru": "lobby_id_field_ru",
+            "id_field_eng": "lobby_id_field_eng",
+            "search_ru": "lobby_search_ru",
+            "search_eng": "lobby_search_eng",
+            "add": "lobby_add",
+
+            "accept_invite_ru": "lobby_accept_invite_ru",
+            "accept_invite_eng": "lobby_accept_invite_eng",
+
+            "play": "lobby_play",
+            "continue": "lobby_continue",
+
+            "queue": "lobby_queue",
+            "ok": "lobby_ok",
+            "rank": "lobby_rank",
+            "friend_id": "lobby_friend_id",
+
+            "close_welcome_ru": "lobby_close_welcome_ru",
+            "close_welcome_ru2": "lobby_close_welcome_ru2",
+
+            # game
+            "detect_radiant": "game_detect_radiant",
+            "detect_dire": "game_detect_dire",
+            "lock_in_ru": "game_lock_in_ru",
+            "lock_in": "game_lock_in",
+            "inventory": "game_inventory",
+            "shop_search": "game_shop_search",
+
+            # steam
+            "avast_warrning": "steam_avast_warrning",
+            "cancel_ru": "steam_cancel_ru",
+            "continue_anyway_ru": "steam_continue_anyway_ru",
         }
 
-        out: Dict[str, Optional[np.ndarray]] = {}
-        for key, path in png.items():
-            if os.path.exists(path):
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                out[key] = img if img is not None and img.size else None
-            else:
-                out[key] = None
+        for alias, real_key in aliases.items():
+            if alias not in out and real_key in out:
+                out[alias] = out[real_key]
 
-        loaded = [k for k, v in out.items() if v is not None]
-        self.log.info(f"[MM] loaded templates: {loaded}")
+        loaded = sorted([k for k, v in out.items() if v is not None])
+        missing_aliases = sorted([
+            alias for alias, real_key in aliases.items()
+            if alias not in out or out.get(alias) is None
+        ])
+
+        self.log.info(f"[MM] loaded templates count={len(loaded)}")
+        self.log.info(f"[MM] loaded templates keys={loaded}")
+
+        if missing_aliases:
+            self.log.warning(f"[MM] missing alias templates={missing_aliases}")
+
         return out
 
     # ---------------------------------------------------------
@@ -281,6 +354,7 @@ class StartMmDota2:
         confidence: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         tpl = self._templates.get(key)
+
         if tpl is None:
             return None
 
@@ -486,6 +560,8 @@ class StartMmDota2:
 
     def _tick_close_first_run_popup(self, state: VmMmState, hwnd: int) -> bool:
         frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+        cv2.imshow("frame", frame)
+        cv2.waitKey(1)
         if frame is None:
             if self._enqueue_capture(state.vm_id, hwnd, purpose="close_first_run_popup"):
                 state.inflight = True
@@ -497,9 +573,9 @@ class StartMmDota2:
             [
                 "close_welcome_ru",
                 "close_welcome_ru2",
-                "close_welcome_en",
+                "accept_reward_ru"
             ],
-            confidence=0.82,
+            confidence=0.87,
         )
 
         if hit is None:
@@ -530,11 +606,18 @@ class StartMmDota2:
                     state.inflight = True
                 return False
 
-            hit_dota = self._match(frame, "dota")
+            # 1) Сначала закрываем welcome/first-run окна.
+            # Даже если dota.png уже виден на фоне, окно ещё НЕ готово.
+            popup_closed = self._tick_close_first_run_popup(state, hwnd)
+            if popup_closed:
+                return False
+
+            # 2) Только после отсутствия popup ищем dota.png.
+            hit_dota = self._match(frame, "dota", confidence=0.75)
             if hit_dota is not None:
                 w.dota_ready = True
 
-                hit_self = self._match(frame, "self", confidence=0.82)
+                hit_self = self._match(frame, "self", confidence=0.75)
                 if hit_self is not None:
                     w.self_found = True
 
@@ -544,12 +627,7 @@ class StartMmDota2:
                 )
                 continue
 
-            popup_closed = self._tick_close_first_run_popup(state, hwnd)
-            if popup_closed:
-                return False
-
-            # Кадр есть, но dota.png нет и popup не найден.
-            # Запрашиваем свежий кадр, иначе будем вечно смотреть старый cached frame.
+            # 3) Не нашли ни popup, ни dota — берём новый кадр.
             if self._enqueue_capture(state.vm_id, hwnd, purpose="wait_dota_ready_refresh"):
                 state.inflight = True
 

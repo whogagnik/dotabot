@@ -91,6 +91,7 @@ class VmAccountState:
 
     dota_window_found: bool = False
     dota_hwnd: Optional[int] = None
+    dota_pid: Optional[int] = None
     dota_find_in_progress: bool = False
     last_dota_find_ts: float = 0.0
 
@@ -172,7 +173,6 @@ class Controller:
         self.app_id = APP_ID_DOTA
         self.launch_opts = list(DOTA_LAUNCH_OPTS)
 
-        # fallback values only
         self.screen_w = 1920
         self.screen_h = 1080
         self.dota_window_w = 820
@@ -269,39 +269,6 @@ class Controller:
         self.logger.info(f"Loaded steam templates: {len(templates)}")
         return templates
 
-    def _get_latest_frame_rgb(self, vm_id: str, hwnd: int) -> Optional[np.ndarray]:
-        entry = planner_runtime.get_entry(vm_id)
-        if entry is None:
-            return None
-
-        try:
-            frame = entry.bridge.get_latest_frame(hwnd)
-        except Exception:
-            return None
-
-        if frame is None:
-            return None
-
-        arr = getattr(frame, "image_rgb", None)
-        if arr is None:
-            arr = getattr(frame, "frame_rgb", None)
-        if arr is None:
-            arr = getattr(frame, "image", None)
-        if arr is None:
-            return None
-
-        if not isinstance(arr, np.ndarray):
-            return None
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            return None
-        if arr.dtype != np.uint8:
-            try:
-                arr = arr.astype(np.uint8)
-            except Exception:
-                return None
-
-        return arr
-
     def _store_desktop_frame_from_result(self, vm_id: str, result: Optional[dict]) -> None:
         if not result:
             return
@@ -373,7 +340,6 @@ class Controller:
         data = {
             "steam_path": self.steam_path,
             "accounts": [acc.to_state_dict() for acc in self.accounts],
-            # Runtime VM/window state intentionally not saved.
             "vms": [],
         }
 
@@ -580,6 +546,24 @@ class Controller:
             if not acc.dota_window_found or acc.dota_hwnd is None:
                 return acc
         return None
+
+    def _used_dota_hwnds(self, vm: VmState, except_username: Optional[str] = None) -> List[int]:
+        out: List[int] = []
+        for acc in vm.assigned_accounts:
+            if except_username and acc.username == except_username:
+                continue
+            if acc.dota_hwnd is not None:
+                out.append(int(acc.dota_hwnd))
+        return out
+
+    def _used_dota_pids(self, vm: VmState, except_username: Optional[str] = None) -> List[int]:
+        out: List[int] = []
+        for acc in vm.assigned_accounts:
+            if except_username and acc.username == except_username:
+                continue
+            if acc.dota_pid is not None:
+                out.append(int(acc.dota_pid))
+        return out
 
     def _friend_ids_for_vm(self, vm: VmState) -> List[Optional[str]]:
         by_username = {acc.username: acc for acc in self.accounts}
@@ -788,23 +772,48 @@ class Controller:
 
                     if found and hwnd is not None:
                         hwnd_i = int(hwnd)
+                        pid_i = None if pid is None else int(pid)
 
-                        owner = None
+                        owner_hwnd = None
+                        owner_pid = None
+
                         for other in vm.assigned_accounts:
-                            if other.username != acc.username and other.dota_hwnd == hwnd_i:
-                                owner = other.username
-                                break
+                            if other.username == acc.username:
+                                continue
 
-                        if owner is not None:
+                            if other.dota_hwnd is not None and int(other.dota_hwnd) == hwnd_i:
+                                owner_hwnd = other.username
+
+                            if (
+                                pid_i is not None
+                                and other.dota_pid is not None
+                                and int(other.dota_pid) == pid_i
+                            ):
+                                owner_pid = other.username
+
+                        if owner_hwnd is not None:
                             self.logger.warning(
                                 f"{vm.vm_id}: rejected duplicate dota hwnd={hwnd_i} "
-                                f"for {acc.username}, already owned by {owner}"
+                                f"for {acc.username}, already owned by {owner_hwnd}"
                             )
                             acc.dota_window_found = False
                             acc.dota_hwnd = None
+                            acc.dota_pid = None
+
+                        elif owner_pid is not None:
+                            self.logger.warning(
+                                f"{vm.vm_id}: rejected duplicate dota pid={pid_i} "
+                                f"for {acc.username}, already owned by {owner_pid}; "
+                                f"source={source}"
+                            )
+                            acc.dota_window_found = False
+                            acc.dota_hwnd = None
+                            acc.dota_pid = None
+
                         else:
                             acc.dota_window_found = True
                             acc.dota_hwnd = hwnd_i
+                            acc.dota_pid = pid_i
 
                             window_info = (cmd.result or {}).get("window_info") or {}
                             window_rect = window_info.get("window_rect") or {}
@@ -818,17 +827,18 @@ class Controller:
                             vm.desktop_width = int(desktop.get("width") or vm.desktop_width or self.screen_w)
                             vm.desktop_height = int(desktop.get("height") or vm.desktop_height or self.screen_h)
 
-                            if acc.dota_hwnd not in vm.dota_hwnds:
-                                vm.dota_hwnds.append(acc.dota_hwnd)
+                            if hwnd_i not in vm.dota_hwnds:
+                                vm.dota_hwnds.append(hwnd_i)
 
                             self.logger.info(
                                 f"{vm.vm_id}: dota found -> {acc.username} "
-                                f"hwnd={acc.dota_hwnd} pid={pid} source={source} "
+                                f"hwnd={hwnd_i} pid={pid_i} source={source} "
                                 f"outer={win_w}x{win_h} desktop={vm.desktop_width}x{vm.desktop_height}"
                             )
                     else:
                         acc.dota_window_found = False
                         acc.dota_hwnd = None
+                        acc.dota_pid = None
 
             elif cmd.type == HostCommandType.MOVE_WINDOW:
                 pass
@@ -854,7 +864,6 @@ class Controller:
             if self._has_inflight_for_account(vm, acc.username):
                 continue
 
-            # 1) strict sequential launch
             if not acc.launched:
                 if acc.launch_sent:
                     continue
@@ -874,7 +883,6 @@ class Controller:
                 self.logger.info(f"{vm.vm_id}: launch_process -> {acc.username}")
                 continue
 
-            # 2) find login window
             if not acc.login_window_found or acc.login_hwnd is None:
                 now = time.time()
                 if acc.login_find_in_progress:
@@ -896,7 +904,6 @@ class Controller:
                 self.logger.info(f"{vm.vm_id}: find_login_window -> {acc.username}")
                 continue
 
-            # 3) auth
             if not acc.auth_done:
                 if acc.has_mafile:
                     now = time.time()
@@ -992,7 +999,6 @@ class Controller:
                 self.logger.info(f"{vm.vm_id}: manual auth queued -> {acc.username}")
                 continue
 
-            # 4) wait Dota + continuously dismiss desktop-level popups
             if not acc.dota_window_found or acc.dota_hwnd is None:
                 now = time.time()
 
@@ -1054,6 +1060,9 @@ class Controller:
                     {
                         "account_login": acc.username,
                         "timeout_ms": 2500,
+                        "exclude_hwnds": self._used_dota_hwnds(vm, except_username=acc.username),
+                        "exclude_pids": self._used_dota_pids(vm, except_username=acc.username),
+                        "min_create_ts": acc.last_launch_ts,
                     },
                 )
                 acc.dota_find_in_progress = True
@@ -1143,15 +1152,37 @@ class Controller:
                 continue
 
             expected = len(vm.assigned_accounts)
-            account_hwnds = [acc.dota_hwnd for acc in vm.assigned_accounts if acc.dota_hwnd is not None]
-            unique_hwnds = set(int(x) for x in account_hwnds)
+
+            account_hwnds = [
+                acc.dota_hwnd
+                for acc in vm.assigned_accounts
+                if acc.dota_hwnd is not None
+            ]
+
+            account_pids = [
+                acc.dota_pid
+                for acc in vm.assigned_accounts
+                if acc.dota_pid is not None
+            ]
 
             if len(account_hwnds) != expected:
                 continue
 
-            if len(unique_hwnds) != expected:
+            if len(set(int(x) for x in account_hwnds)) != expected:
                 self.logger.warning(
-                    f"{vm.vm_id}: duplicate dota hwnds detected, block planner: {account_hwnds}"
+                    f"{vm.vm_id}: duplicate dota hwnds detected, block MM/planner: {account_hwnds}"
+                )
+                continue
+
+            if len(account_pids) != expected:
+                self.logger.warning(
+                    f"{vm.vm_id}: not all dota pids known, block MM/planner: {account_pids}"
+                )
+                continue
+
+            if len(set(int(x) for x in account_pids)) != expected:
+                self.logger.warning(
+                    f"{vm.vm_id}: duplicate dota pids detected, block MM/planner: {account_pids}"
                 )
                 continue
 
@@ -1167,17 +1198,24 @@ class Controller:
             if not vm.windows_arranged:
                 self.arrange_dota_windows(vm)
                 continue
-            if self.mm_starter is not None:
 
+            if self.mm_starter is not None:
                 friend_ids = self._friend_ids_for_vm(vm)
 
                 vm.status = VmStatus.MM_PREPARE
+
                 mm_ready = self.mm_starter.tick_one(
                     vm_id=vm.vm_id,
                     hwnds=vm.dota_hwnds,
                     friend_ids=friend_ids,
                 )
-                if not mm_ready:
+
+                mm_stage_after = self.mm_starter.get_stage(vm.vm_id)
+
+                if not mm_ready or mm_stage_after != "done":
+                    self.logger.info(
+                        f"{vm.vm_id}: MM not ready yet, stage={mm_stage_after}"
+                    )
                     continue
 
             roles = vm.roles or (["unknown"] * len(vm.dota_hwnds))
@@ -1258,6 +1296,11 @@ class Controller:
                     "arranged": vm.windows_arranged,
                     "desktop": f"{vm.desktop_width}x{vm.desktop_height}",
                     "sizes": str(vm.dota_window_sizes),
+                    "dota_pids": [
+                        acc.dota_pid
+                        for acc in vm.assigned_accounts
+                        if acc.dota_pid is not None
+                    ],
                 }
             )
         return rows
