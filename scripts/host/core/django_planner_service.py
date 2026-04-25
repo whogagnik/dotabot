@@ -19,10 +19,10 @@ class InMemoryFrame:
 class DjangoPlannerBridge:
     """
     На каждый hwnd держим:
-    - processing_frame: кадр, который сейчас обрабатывается / уже обработан и ждёт завершения своих команд
+    - processing_frame: кадр, который сейчас обрабатывается planner / уже обработан, но его команды ещё не завершены
     - latest_frame: самый свежий присланный кадр, ожидающий обработки
 
-    Старые промежуточные latest-кадры затираются.
+    Старые latest-кадры всегда затираются.
     """
 
     def __init__(self, vm_id: str):
@@ -38,7 +38,7 @@ class DjangoPlannerBridge:
         self._commands_by_hwnd: Dict[int, Deque[dict]] = defaultdict(deque)
 
     # ------------------------------------------------------------------
-    # frames
+    # frame lifecycle
     # ------------------------------------------------------------------
 
     def _make_frame(self, frame_rgb: np.ndarray, ts_client: float) -> InMemoryFrame:
@@ -58,10 +58,11 @@ class DjangoPlannerBridge:
     def store_frame_rgb(self, *, hwnd: int, frame_rgb: np.ndarray, ts_client: float) -> int:
         """
         Новый кадр всегда становится latest_frame.
-        Если там уже был старый latest_frame, он затирается.
+        Если там уже был старый latest_frame — он затирается.
         processing_frame не трогаем.
         """
         hwnd = int(hwnd)
+
         with self._lock:
             frame = self._make_frame(frame_rgb, ts_client)
             self._latest_frame_by_hwnd[hwnd] = frame
@@ -73,6 +74,12 @@ class DjangoPlannerBridge:
             frame = self._processing_frame_by_hwnd.get(hwnd)
             return None if frame is None else frame.frame_id
 
+    def get_latest_frame_id(self, hwnd: int) -> Optional[int]:
+        hwnd = int(hwnd)
+        with self._lock:
+            frame = self._latest_frame_by_hwnd.get(hwnd)
+            return None if frame is None else frame.frame_id
+
     def has_pending_commands(self, hwnd: int) -> bool:
         hwnd = int(hwnd)
         with self._lock:
@@ -81,13 +88,14 @@ class DjangoPlannerBridge:
 
     def acquire_frame_for_processing(self, hwnd: int) -> Optional[int]:
         """
-        Возвращает frame_id кадра, который надо сейчас обрабатывать.
+        Возвращает frame_id кадра, который надо использовать planner'у сейчас.
 
         Логика:
         - если processing_frame уже есть, возвращаем его
-        - иначе берем latest_frame и переносим в processing_frame
+        - иначе берём latest_frame и переносим в processing_frame
         """
         hwnd = int(hwnd)
+
         with self._lock:
             processing = self._processing_frame_by_hwnd.get(hwnd)
             if processing is not None:
@@ -100,6 +108,27 @@ class DjangoPlannerBridge:
             self._processing_frame_by_hwnd[hwnd] = latest
             self._latest_frame_by_hwnd[hwnd] = None
             return latest.frame_id
+
+    def release_processing_frame_if_done(self, hwnd: int) -> bool:
+        """
+        Освобождаем processing_frame только если для hwnd больше нет команд.
+        """
+        hwnd = int(hwnd)
+
+        with self._lock:
+            q = self._commands_by_hwnd.get(hwnd)
+            if q:
+                return False
+
+            if self._processing_frame_by_hwnd.get(hwnd) is not None:
+                self._processing_frame_by_hwnd[hwnd] = None
+                return True
+
+            return False
+
+    # ------------------------------------------------------------------
+    # frame getters
+    # ------------------------------------------------------------------
 
     def get_frame_rgb(self, hwnd: int, frame_id: int) -> Optional[np.ndarray]:
         hwnd = int(hwnd)
@@ -137,29 +166,13 @@ class DjangoPlannerBridge:
 
             return None
 
-    def release_processing_frame_if_done(self, hwnd: int) -> bool:
-        """
-        Освобождаем processing_frame только когда по hwnd больше нет команд.
-        """
-        hwnd = int(hwnd)
-        with self._lock:
-            q = self._commands_by_hwnd.get(hwnd)
-            if q:
-                return False
-
-            if self._processing_frame_by_hwnd.get(hwnd) is not None:
-                self._processing_frame_by_hwnd[hwnd] = None
-                return True
-
-            return False
-
     # ------------------------------------------------------------------
-    # planner-facing compatibility
+    # planner compatibility API
     # ------------------------------------------------------------------
 
     def get_last_frame_id(self, hwnd: int) -> Optional[int]:
         """
-        Для planner: получить frame_id кадра, который надо сейчас использовать.
+        Для planner: получить frame_id кадра, который сейчас надо использовать.
         """
         return self.acquire_frame_for_processing(hwnd)
 
@@ -179,7 +192,13 @@ class DjangoPlannerBridge:
     # commands
     # ------------------------------------------------------------------
 
-    def push_command(self, hwnd: int, command_type: str, payload: Dict[str, Any], frame_id: Optional[int] = None) -> dict:
+    def push_command(
+        self,
+        hwnd: int,
+        command_type: str,
+        payload: Dict[str, Any],
+        frame_id: Optional[int] = None,
+    ) -> dict:
         hwnd = int(hwnd)
 
         with self._lock:
@@ -226,3 +245,29 @@ class DjangoPlannerBridge:
 
         self.release_processing_frame_if_done(hwnd)
         return True
+
+    # ------------------------------------------------------------------
+    # debug / admin helpers
+    # ------------------------------------------------------------------
+
+    def clear_hwnd_state(self, hwnd: int) -> None:
+        hwnd = int(hwnd)
+        with self._lock:
+            self._processing_frame_by_hwnd.pop(hwnd, None)
+            self._latest_frame_by_hwnd.pop(hwnd, None)
+            self._commands_by_hwnd.pop(hwnd, None)
+
+    def dump_hwnd_state(self, hwnd: int) -> dict:
+        hwnd = int(hwnd)
+        with self._lock:
+            processing = self._processing_frame_by_hwnd.get(hwnd)
+            latest = self._latest_frame_by_hwnd.get(hwnd)
+            q = list(self._commands_by_hwnd.get(hwnd, ()))
+
+            return {
+                "hwnd": hwnd,
+                "processing_frame_id": None if processing is None else processing.frame_id,
+                "latest_frame_id": None if latest is None else latest.frame_id,
+                "queued_commands": len(q),
+                "command_ids": [int(x["id"]) for x in q],
+            }
