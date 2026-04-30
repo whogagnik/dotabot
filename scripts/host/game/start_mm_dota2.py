@@ -178,7 +178,7 @@ class StartMmDota2:
 
             "accept_invite_ru": "lobby_accept_invite_ru",
             "accept_invite_eng": "lobby_accept_invite_eng",
-
+            "accept_reward_ru": "lobby_accept_reward_ru",
             "play": "lobby_play",
             "continue": "lobby_continue",
 

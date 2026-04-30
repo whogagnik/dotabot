@@ -18,7 +18,7 @@ import win32process
 from PIL import Image
 
 
-EXECUTOR_VERSION = "executor_capture_frame_unique_dota_pid_v3"
+EXECUTOR_VERSION = "executor_real_dota_window_filter_v4"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -59,8 +59,30 @@ def _desktop_bounds() -> dict[str, int]:
     }
 
 
+def _window_pid(hwnd: int) -> Optional[int]:
+    try:
+        return win32process.GetWindowThreadProcessId(hwnd)[1]
+    except Exception:
+        return None
+
+
 def _window_info(hwnd: int) -> dict[str, Any]:
     wl, wt, wr, wb = win32gui.GetWindowRect(hwnd)
+
+    try:
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+    except Exception:
+        title = ""
+
+    try:
+        class_name = (win32gui.GetClassName(hwnd) or "").strip()
+    except Exception:
+        class_name = ""
+
+    try:
+        pid = _window_pid(hwnd)
+    except Exception:
+        pid = None
 
     try:
         cl, ct, cr, cb = win32gui.GetClientRect(hwnd)
@@ -81,6 +103,9 @@ def _window_info(hwnd: int) -> dict[str, Any]:
 
     return {
         "hwnd": int(hwnd),
+        "pid": None if pid is None else int(pid),
+        "title": title,
+        "class_name": class_name,
         "window_rect": {
             "x": int(wl),
             "y": int(wt),
@@ -96,23 +121,79 @@ def _window_info(hwnd: int) -> dict[str, Any]:
     }
 
 
-def _window_pid(hwnd: int) -> Optional[int]:
+def _is_real_dota_window(hwnd: int, pid: Optional[int] = None) -> bool:
     try:
-        return win32process.GetWindowThreadProcessId(hwnd)[1]
+        hwnd_i = int(hwnd)
+
+        if not win32gui.IsWindow(hwnd_i):
+            return False
+        if not win32gui.IsWindowVisible(hwnd_i):
+            return False
+
+        owner_pid = _window_pid(hwnd_i)
+        if owner_pid is None:
+            return False
+
+        if pid is not None and int(owner_pid) != int(pid):
+            return False
+
+        try:
+            proc = psutil.Process(int(owner_pid))
+            pname = (proc.name() or "").lower()
+        except Exception:
+            return False
+
+        if pname != "dota2.exe":
+            return False
+
+        title = (win32gui.GetWindowText(hwnd_i) or "").strip().lower()
+        class_name = (win32gui.GetClassName(hwnd_i) or "").strip().lower()
+
+        if "avast" in title or "sandbox" in title:
+            return False
+        if "avast" in class_name or "sandbox" in class_name:
+            return False
+
+        if "dota" not in title and "дота" not in title:
+            return False
+
+        wl, wt, wr, wb = win32gui.GetWindowRect(hwnd_i)
+        ww = int(wr - wl)
+        wh = int(wb - wt)
+
+        try:
+            cl, ct, cr, cb = win32gui.GetClientRect(hwnd_i)
+            cw = int(cr - cl)
+            ch = int(cb - ct)
+        except Exception:
+            cw = ww
+            ch = wh
+
+        if ww < 500 or wh < 350:
+            return False
+        if cw < 500 or ch < 350:
+            return False
+
+        desktop = _desktop_bounds()
+        if ww > int(desktop["width"] * 0.75) or wh > int(desktop["height"] * 0.75):
+            return False
+
+        return True
     except Exception:
-        return None
+        return False
 
 
 def _find_main_window_for_pid(pid: int) -> Optional[int]:
-    result = None
+    candidates: list[tuple[int, int, str, str]] = []
 
     def cb(hwnd, _):
-        nonlocal result
-        if result is not None:
-            return
         if not win32gui.IsWindowVisible(hwnd):
             return
-        if _window_pid(hwnd) != pid:
+
+        if _window_pid(hwnd) != int(pid):
+            return
+
+        if not _is_real_dota_window(int(hwnd), int(pid)):
             return
 
         try:
@@ -120,17 +201,29 @@ def _find_main_window_for_pid(pid: int) -> Optional[int]:
         except Exception:
             title = ""
 
-        if title:
-            result = hwnd
-        elif result is None:
-            result = hwnd
+        try:
+            class_name = (win32gui.GetClassName(hwnd) or "").strip()
+        except Exception:
+            class_name = ""
+
+        try:
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            area = int(r - l) * int(b - t)
+        except Exception:
+            area = 0
+
+        candidates.append((area, int(hwnd), title, class_name))
 
     try:
         win32gui.EnumWindows(cb, None)
     except Exception:
         return None
 
-    return result
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    return int(candidates[0][1])
 
 
 def _login_window_title_match(hwnd: int) -> bool:
@@ -371,14 +464,9 @@ class CommandExecutor:
         *,
         min_create_ts: Optional[float],
     ) -> Optional[tuple[int, int]]:
-        result: Optional[tuple[int, int]] = None
+        candidates: list[tuple[int, int, int, float]] = []
 
         def cb(hwnd, _):
-            nonlocal result
-
-            if result is not None:
-                return
-
             hwnd_i = int(hwnd)
 
             if hwnd_i in exclude_hwnds:
@@ -409,22 +497,28 @@ class CommandExecutor:
             if min_create_ts is not None and create_ts < float(min_create_ts):
                 return
 
-            try:
-                title = (win32gui.GetWindowText(hwnd_i) or "").strip().lower()
-            except Exception:
-                title = ""
-
-            if title and "dota" not in title and "дота" not in title:
+            if not _is_real_dota_window(hwnd_i, pid_i):
                 return
 
-            result = (hwnd_i, pid_i)
+            try:
+                l, t, r, b = win32gui.GetWindowRect(hwnd_i)
+                area = int(r - l) * int(b - t)
+            except Exception:
+                area = 0
+
+            candidates.append((area, hwnd_i, pid_i, create_ts))
 
         try:
             win32gui.EnumWindows(cb, None)
         except Exception:
             return None
 
-        return result
+        if not candidates:
+            return None
+
+        candidates.sort(reverse=True)
+        _, hwnd, pid, _ = candidates[0]
+        return int(hwnd), int(pid)
 
     # ---------------------------------------------------------
     # process commands
@@ -577,7 +671,11 @@ class CommandExecutor:
                         continue
 
                     hwnd = _find_main_window_for_pid(pid_i)
-                    if hwnd and int(hwnd) not in exclude_hwnds:
+                    if (
+                        hwnd
+                        and int(hwnd) not in exclude_hwnds
+                        and _is_real_dota_window(int(hwnd), pid_i)
+                    ):
                         hwnd_i = int(hwnd)
 
                         self._dota_hwnd_by_account[account_login] = hwnd_i
@@ -612,7 +710,7 @@ class CommandExecutor:
                     hwnd=int(hwnd),
                     pid=int(pid),
                     account_login=account_login,
-                    source="global_fallback_unique_pid_guarded",
+                    source="global_fallback_real_dota_window_guarded",
                     min_create_ts=min_create_ts,
                     exclude_pids=sorted(exclude_pids),
                     exclude_hwnds=sorted(exclude_hwnds),

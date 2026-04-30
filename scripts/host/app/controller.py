@@ -905,6 +905,7 @@ class Controller:
                 continue
 
             if not acc.auth_done:
+                
                 if acc.has_mafile:
                     now = time.time()
                     if acc.auth_capture_fail_count >= 3:
