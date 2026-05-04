@@ -96,6 +96,7 @@ class StartMmDota2:
         self.images_root = images_root
         self.confidence = float(confidence)
 
+        start_game_step: int = 0
         self._vm: Dict[str, VmMmState] = {}
         self._templates = self._load_templates()
 
@@ -179,7 +180,12 @@ class StartMmDota2:
             "accept_invite_ru": "lobby_accept_invite_ru",
             "accept_invite_eng": "lobby_accept_invite_eng",
             "accept_reward_ru": "lobby_accept_reward_ru",
-            "play": "lobby_play",
+            "play_eng": "lobby_play_eng",
+            "play_ru": "lobby_play_ru",
+            'public_ru': 'lobby_public_ru',
+            'selected_all_pick': 'lobby_selected_all_pick',
+            'unselected_all_pick': 'lobby_unselected_all_pick',
+            'hit_search_game' : 'lobby_hit_search_game',
             "continue": "lobby_continue",
 
             "queue": "lobby_queue",
@@ -688,7 +694,7 @@ class StartMmDota2:
                 search_hit = self._find_any(frame, ["search_ru", "search_eng"])
                 if search_hit:
                     self._enqueue_click(state.vm_id, leader, search_hit["x"], search_hit["y"])
-
+                time.sleep(3)
                 add_hit = self._match(frame, "add")
                 if add_hit:
                     self._enqueue_click(state.vm_id, leader, add_hit["x"], add_hit["y"])
@@ -793,26 +799,93 @@ class StartMmDota2:
                 state.inflight = True
             return False
 
-        hit_play = self._match(frame, "play")
-        if hit_play:
-            self._enqueue_focus(state.vm_id, leader)
-            self._enqueue_click(state.vm_id, leader, hit_play["x"], hit_play["y"])
-            state.inflight = True
-            state.start_game_done = True
-            self.log.info(f"[MM] {state.vm_id}: start_game_stub clicked play")
+        # step 0: Play
+        if state.start_game_step == 0:
+            hit = self._find_any(frame, ["play_ru", "play_eng"], confidence=0.80)
+            if hit:
+                self._enqueue_focus(state.vm_id, leader)
+                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"])
+                state.inflight = True
+                state.start_game_step = 1
+                self._clear_frame(state.vm_id, leader)
+                self.log.info(f"[MM] {state.vm_id}: clicked play by {hit['key']}")
+                return False
+
+            if self._enqueue_capture(state.vm_id, leader, purpose="start_game_find_play"):
+                state.inflight = True
             return False
 
-        hit_continue = self._match(frame, "continue")
-        if hit_continue:
-            self._enqueue_focus(state.vm_id, leader)
-            self._enqueue_click(state.vm_id, leader, hit_continue["x"], hit_continue["y"])
-            state.inflight = True
-            state.start_game_done = True
-            self.log.info(f"[MM] {state.vm_id}: start_game_stub clicked continue")
+        # step 1: Public / normal game section
+        if state.start_game_step == 1:
+            hit = self._find_any(frame, ["public_ru", "public_eng"], confidence=0.80)
+            if hit:
+                self._enqueue_focus(state.vm_id, leader)
+                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"])
+                state.inflight = True
+                state.start_game_step = 2
+                self._clear_frame(state.vm_id, leader)
+                self.log.info(f"[MM] {state.vm_id}: clicked public by {hit['key']}")
+                return False
+
+            # если public уже выбран/не нужен, через пару секунд идём дальше
+            if time.time() - state.last_stage_ts > 2.0:
+                state.start_game_step = 2
+                self._clear_frame(state.vm_id, leader)
+                return False
+
+            if self._enqueue_capture(state.vm_id, leader, purpose="start_game_find_public"):
+                state.inflight = True
+            return False
+
+        # step 2: All Pick
+        if state.start_game_step == 2:
+            hit = self._match(
+                frame,"unselected_all_pick",
+            )
+            if hit:
+                self._enqueue_focus(state.vm_id, leader)
+                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"])
+                state.inflight = True
+                state.start_game_step = 3
+                self._clear_frame(state.vm_id, leader)
+                self.log.info(f"[MM] {state.vm_id}: clicked all pick by {hit['key']}")
+                return False
+
+            # если режим уже выбран, идём дальше
+            if time.time() - state.last_stage_ts > 4.0:
+                state.start_game_step = 3
+                self._clear_frame(state.vm_id, leader)
+                return False
+
+            if self._enqueue_capture(state.vm_id, leader, purpose="start_game_find_all_pick"):
+                state.inflight = True
+            return False
+
+        # step 3: Search game / Find match
+        if state.start_game_step == 3:
+            hit = self._find_any(
+                frame,
+                [
+                    "search_game_ru",
+                    "search_game_eng",
+                ],
+                confidence=0.80,
+            )
+            if hit:
+                self._enqueue_focus(state.vm_id, leader)
+                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"])
+                state.inflight = True
+                state.start_game_done = True
+                self._clear_frame(state.vm_id, leader)
+                self.log.info(f"[MM] {state.vm_id}: clicked search game by {hit['key']}")
+                return False
+
+            if self._enqueue_capture(state.vm_id, leader, purpose="start_game_find_search"):
+                state.inflight = True
             return False
 
         state.start_game_done = True
-        self.log.info(f"[MM] {state.vm_id}: start_game_stub no action needed")
+        self.log.info(f"[MM] {state.vm_id}: start_game_stub done")
         return False
 
     def _tick_pick_heroes_stub(self, state: VmMmState) -> bool:
