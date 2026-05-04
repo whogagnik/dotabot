@@ -172,6 +172,8 @@ class Controller:
         self.steam_path = r"C:\Program Files (x86)\Steam\steam.exe"
         self.app_id = APP_ID_DOTA
         self.launch_opts = list(DOTA_LAUNCH_OPTS)
+        self.find_login_window_timeout_sec = 30.0
+        self.find_dota_window_timeout_sec = 2.5
 
         self.screen_w = 1920
         self.screen_h = 1080
