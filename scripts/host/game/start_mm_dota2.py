@@ -560,8 +560,8 @@ class StartMmDota2:
 
     def _tick_close_first_run_popup(self, state: VmMmState, hwnd: int) -> bool:
         frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
-        cv2.imshow("frame", frame)
-        cv2.waitKey(1)
+
+
         if frame is None:
             if self._enqueue_capture(state.vm_id, hwnd, purpose="close_first_run_popup"):
                 state.inflight = True
@@ -682,6 +682,7 @@ class StartMmDota2:
             if field_hit and friend_ids and len(friend_ids) > 1 and friend_ids[1]:
                 self._enqueue_focus(state.vm_id, leader)
                 self._enqueue_click(state.vm_id, leader, field_hit["x"], field_hit["y"])
+                time.sleep(1)
                 self._enqueue_write(state.vm_id, leader, str(friend_ids[1]), clear_before=True)
 
                 search_hit = self._find_any(frame, ["search_ru", "search_eng"])

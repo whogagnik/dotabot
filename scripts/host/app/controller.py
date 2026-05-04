@@ -953,6 +953,7 @@ class Controller:
                         "hwnd": int(acc.login_hwnd),
                     },
                 )
+                time.sleep(5)
                 self._push_command(
                     vm,
                     HostCommandType.WRITE_TEXT,

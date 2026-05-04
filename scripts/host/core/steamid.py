@@ -13,7 +13,7 @@ def steamid64_to_steamid3(steamid64: str | int) -> str:
 
     if account_id <= 0:
         raise ValueError("Некорректный steamid64")
-
+    print(account_id)
     return str(account_id)
 def get_steamid64(username: str, password: str) -> str:
     client = SteamClient()
