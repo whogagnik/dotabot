@@ -63,6 +63,7 @@ class VmMmState:
     inflight: bool = False
 
     party_search_done: bool = False
+    party_search_clicked: bool = False
     party_add_done: bool = False
     party_accept_done: bool = False
 
@@ -687,22 +688,26 @@ class StartMmDota2:
             field_hit = self._find_any(frame, ["id_field_ru", "id_field_eng"])
             if field_hit and friend_ids and len(friend_ids) > 1 and friend_ids[1]:
                 self._enqueue_focus(state.vm_id, leader)
-                self._enqueue_click(state.vm_id, leader, field_hit["x"], field_hit["y"])
-                time.sleep(1)
-                self._enqueue_write(state.vm_id, leader, str(friend_ids[1]), clear_before=True)
 
-                search_hit = self._find_any(frame, ["search_ru", "search_eng"])
-                if search_hit:
-                    self._enqueue_click(state.vm_id, leader, search_hit["x"], search_hit["y"])
-                time.sleep(3)
+                if not state.party_search_clicked:
+                    self._enqueue_click(state.vm_id, leader, field_hit["x"], field_hit["y"])
+                    time.sleep(1)
+                    self._enqueue_write(state.vm_id, leader, str(friend_ids[1]), clear_before=True)
+
+                    search_hit = self._find_any(frame, ["search_ru", "search_eng"])
+                    if search_hit:
+                        self._enqueue_click(state.vm_id, leader, search_hit["x"], search_hit["y"])
+                        state.party_search_clicked = True
+                        if self._enqueue_capture(state.vm_id, leader, purpose="build_party_after_search"):
+                            state.inflight = True
+                        return False
+
                 add_hit = self._match(frame, "add")
-
                 if add_hit:
                     self._enqueue_click(state.vm_id, leader, add_hit["x"], add_hit["y"])
-
-                state.inflight = True
-                state.party_add_done = True
-                return False
+                    state.inflight = True
+                    state.party_add_done = True
+                    return False
 
             # Если friend_id нет — пока считаем party_add_done, чтобы не зависать.
             if not friend_ids or len(friend_ids) <= 1 or not friend_ids[1]:
