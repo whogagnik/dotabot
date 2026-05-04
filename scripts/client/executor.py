@@ -930,12 +930,23 @@ class CommandExecutor:
             p.press("backspace")
             time.sleep(0.05)
 
-        win32clipboard.OpenClipboard()
-        try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-        finally:
-            win32clipboard.CloseClipboard()
+        clip_err = None
+        for _ in range(5):
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+                finally:
+                    win32clipboard.CloseClipboard()
+                clip_err = None
+                break
+            except Exception as e:
+                clip_err = e
+                time.sleep(0.05)
+
+        if clip_err is not None:
+            raise clip_err
 
         time.sleep(0.05)
         p.hotkey("ctrl", "v")
