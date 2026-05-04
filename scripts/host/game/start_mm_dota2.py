@@ -696,6 +696,7 @@ class StartMmDota2:
                     self._enqueue_click(state.vm_id, leader, search_hit["x"], search_hit["y"])
                 time.sleep(3)
                 add_hit = self._match(frame, "add")
+
                 if add_hit:
                     self._enqueue_click(state.vm_id, leader, add_hit["x"], add_hit["y"])
 
