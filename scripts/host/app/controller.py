@@ -172,6 +172,8 @@ class Controller:
         self.steam_path = r"C:\Program Files (x86)\Steam\steam.exe"
         self.app_id = APP_ID_DOTA
         self.launch_opts = list(DOTA_LAUNCH_OPTS)
+        self.find_login_window_timeout_sec = 30.0
+        self.find_dota_window_timeout_sec = 2.5
 
         self.screen_w = 1920
         self.screen_h = 1080
@@ -895,7 +897,7 @@ class Controller:
                     HostCommandType.FIND_LOGIN_WINDOW,
                     {
                         "account_login": acc.username,
-                        "timeout_ms": 30000,
+                        "timeout_ms": int(self.find_login_window_timeout_sec * 1000),
                     },
                 )
                 acc.login_find_in_progress = True
@@ -1060,7 +1062,7 @@ class Controller:
                     HostCommandType.FIND_DOTA_WINDOW,
                     {
                         "account_login": acc.username,
-                        "timeout_ms": 2500,
+                        "timeout_ms": int(self.find_dota_window_timeout_sec * 1000),
                         "exclude_hwnds": self._used_dota_hwnds(vm, except_username=acc.username),
                         "exclude_pids": self._used_dota_pids(vm, except_username=acc.username),
                         "min_create_ts": acc.last_launch_ts,
