@@ -109,6 +109,26 @@ class PlannerApiClient:
         data = resp.json()
         self._log(f"ack_command <- {data}")
         return data
+    def _sanitize_for_log(self, value: Any) -> Any:
+        try:
+            if isinstance(value, dict):
+                out: dict[str, Any] = {}
+                for k, v in value.items():
+                    key = str(k)
+                    if key in {"image_b64", "frame_b64"}:
+                        out[key] = f"<base64 {len(v or '')} chars>"
+                    elif key in {"raw", "bytes"} and isinstance(v, (bytes, bytearray)):
+                        out[key] = f"<bytes {len(v)}>"
+                    else:
+                        out[key] = self._sanitize_for_log(v)
+                return out
+            if isinstance(value, list):
+                return [self._sanitize_for_log(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(self._sanitize_for_log(v) for v in value)
+            return value
+        except Exception:
+            return "<unserializable>"
 
     def send_log(
         self,
@@ -130,7 +150,7 @@ class PlannerApiClient:
             "payload": payload or {},
         }
 
-        self._log(f"send_log -> {body}")
+        self._log(f"send_log -> {self._sanitize_for_log(body)}")
         resp = self.session.post(
             f"{self.base_url}/planner/log",
             json=body,
@@ -138,7 +158,7 @@ class PlannerApiClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        self._log(f"send_log <- {data}")
+        self._log(f"send_log -> {self._sanitize_for_log(data)}")
         return data
 
     def submit_frame_raw(
