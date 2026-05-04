@@ -895,7 +895,7 @@ class Controller:
                     HostCommandType.FIND_LOGIN_WINDOW,
                     {
                         "account_login": acc.username,
-                        "timeout_ms": 30000,
+                        "timeout_ms": int(FIND_LOGIN_WINDOW_TIMEOUT_SEC * 1000),
                     },
                 )
                 acc.login_find_in_progress = True
@@ -1060,7 +1060,7 @@ class Controller:
                     HostCommandType.FIND_DOTA_WINDOW,
                     {
                         "account_login": acc.username,
-                        "timeout_ms": 2500,
+                        "timeout_ms": int(FIND_DOTA_WINDOW_TIMEOUT_SEC * 1000),
                         "exclude_hwnds": self._used_dota_hwnds(vm, except_username=acc.username),
                         "exclude_pids": self._used_dota_pids(vm, except_username=acc.username),
                         "min_create_ts": acc.last_launch_ts,
