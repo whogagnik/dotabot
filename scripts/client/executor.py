@@ -577,7 +577,11 @@ class CommandExecutor:
 
     def find_login_window(self, payload: dict[str, Any]) -> dict[str, Any]:
         account_login = str(payload.get("account_login", ""))
-        timeout_ms = int(payload.get("timeout_ms", 30000))
+        timeout_sec = float(payload.get("timeout_sec", 0.0))
+        if timeout_sec > 0:
+            timeout_ms = int(timeout_sec * 1000)
+        else:
+            timeout_ms = int(payload.get("timeout_ms", 30000))
         deadline = time.time() + (timeout_ms / 1000.0)
 
         while time.time() < deadline:
@@ -627,7 +631,11 @@ class CommandExecutor:
 
     def find_dota_window(self, payload: dict[str, Any]) -> dict[str, Any]:
         account_login = str(payload.get("account_login", ""))
-        timeout_ms = int(payload.get("timeout_ms", 2500))
+        timeout_sec = float(payload.get("timeout_sec", 0.0))
+        if timeout_sec > 0:
+            timeout_ms = int(timeout_sec * 1000)
+        else:
+            timeout_ms = int(payload.get("timeout_ms", 2500))
         deadline = time.time() + (timeout_ms / 1000.0)
 
         exclude_hwnds = {
