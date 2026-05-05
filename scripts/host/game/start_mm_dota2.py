@@ -657,7 +657,7 @@ class StartMmDota2:
         friend_ids: Optional[List[Optional[str]]],
     ) -> bool:
         if state.party_built:
-            state.stage = MmStage.DETECT_SIDE
+            state.stage = MmStage.START_GAME
             state.last_stage_ts = time.time()
             return False
 
@@ -725,31 +725,37 @@ class StartMmDota2:
             return False
 
         if not state.party_accept_done:
-            accepted_any = False
+            member_hwnds = state.hwnds[1:]
+            if not member_hwnds:
+                state.party_accept_done = True
+            else:
+                pending_accept = False
 
-            for hwnd in state.hwnds[1:]:
-                frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
-                if frame is None:
+                for hwnd in member_hwnds:
+                    if state.windows[hwnd].invite_accepted:
+                        continue
+
+                    frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+                    if frame is None:
+                        if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
+                            state.inflight = True
+                        pending_accept = True
+                        continue
+
+                    hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
+                    if hit:
+                        self._enqueue_focus(state.vm_id, hwnd)
+                        self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
+                        state.windows[hwnd].invite_accepted = True
+                        state.inflight = True
+                        return False
+
                     if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
                         state.inflight = True
-                    return False
+                    pending_accept = True
 
-                hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
-                print(hit)
-                if hit:
-                    self._enqueue_focus(state.vm_id, hwnd)
-                    self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
-                    state.windows[hwnd].invite_accepted = True
-                    accepted_any = True
-                    state.inflight = True
-                    return False
-                else:
-                    self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite")
-                    state.inflight = True
-                    return False
-
-            if accepted_any:
-                state.party_accept_done = True
+                if not pending_accept and all(state.windows[hwnd].invite_accepted for hwnd in member_hwnds):
+                    state.party_accept_done = True
 
         state.party_built = True
         state.stage = MmStage.START_GAME
