@@ -1001,6 +1001,7 @@ class Controller:
                     },
                 )
                 acc.auth_started = True
+                acc.auth_done = True
                 vm.status = VmStatus.LOGIN
                 self.logger.info(f"{vm.vm_id}: manual auth queued -> {acc.username}")
                 continue
@@ -1013,7 +1014,13 @@ class Controller:
                 if acc.popup_capture_requested:
                     continue
                 if acc.dota_find_in_progress:
-                    continue
+                    if now - acc.last_dota_find_ts > (self.find_dota_window_timeout_sec + 1.0):
+                        acc.dota_find_in_progress = False
+                        self.logger.warning(
+                            f"{vm.vm_id}: find_dota_window timed out locally -> {acc.username}; reset polling lock"
+                        )
+                    else:
+                        continue
 
                 match = self._find_desktop_steam_popup_match(vm.vm_id)
 
