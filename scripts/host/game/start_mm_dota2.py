@@ -657,7 +657,7 @@ class StartMmDota2:
         friend_ids: Optional[List[Optional[str]]],
     ) -> bool:
         if state.party_built:
-            state.stage = MmStage.DETECT_SIDE
+            state.stage = MmStage.START_GAME
             state.last_stage_ts = time.time()
             return False
 
@@ -735,7 +735,6 @@ class StartMmDota2:
                     return False
 
                 hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
-                print(hit)
                 if hit:
                     self._enqueue_focus(state.vm_id, hwnd)
                     self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
