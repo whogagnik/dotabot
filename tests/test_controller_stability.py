@@ -294,6 +294,76 @@ class ControllerStabilityTests(unittest.TestCase):
             controller_mod.HostCommandType.FIND_DOTA_WINDOW,
         )
 
+    def test_empty_process_tree_after_auth_resets_for_relaunch(self):
+        vm, acc = self.add_vm_account(has_mafile=False)
+        acc.launched = True
+        acc.login_window_found = True
+        acc.login_hwnd = 100
+        acc.auth_done = True
+        acc.dota_wait_started_ts = time.time() - 30
+        acc.last_dota_find_ts = time.time()
+        acc.popup_capture_requested = True
+        self.controller._desktop_frames[vm.vm_id] = object()
+        self.controller._desktop_frame_ts[vm.vm_id] = time.time()
+
+        cmd = controller_mod.VmCommand(
+            id=1,
+            type=controller_mod.HostCommandType.FIND_DOTA_WINDOW,
+            payload={"account_login": "alice"},
+            created_ts=time.time(),
+            status="done",
+            result={
+                "found": False,
+                "hwnd": None,
+                "pid": None,
+                "tree_pids": [],
+                "process_tree_alive": False,
+            },
+        )
+
+        self.controller._handle_command_result(vm, cmd)
+
+        self.assertFalse(acc.launched)
+        self.assertFalse(acc.auth_done)
+        self.assertFalse(acc.popup_capture_requested)
+        self.assertEqual(acc.last_dota_find_ts, 0.0)
+        self.assertNotIn(vm.vm_id, self.controller._desktop_frames)
+
+        self.controller.drive_vm_bootstrap()
+
+        self.assertEqual(len(vm.command_queue), 1)
+        self.assertEqual(
+            vm.command_queue[0].type,
+            controller_mod.HostCommandType.LAUNCH_PROCESS,
+        )
+
+    def test_wait_dota_timeout_resets_before_desktop_capture_loop(self):
+        vm, acc = self.add_vm_account(has_mafile=False)
+        acc.launched = True
+        acc.login_window_found = True
+        acc.login_hwnd = 100
+        acc.auth_done = True
+        acc.dota_wait_started_ts = time.time() - (
+            self.controller.dota_wait_timeout_sec + 1
+        )
+        acc.last_dota_find_ts = time.time() - 30
+        acc.last_popup_scan_ts = time.time() - 30
+
+        self.controller.drive_vm_bootstrap()
+
+        self.assertEqual(vm.command_queue, [])
+        self.assertFalse(acc.launched)
+        self.assertFalse(acc.auth_done)
+        self.assertEqual(acc.dota_wait_fail_count, 1)
+
+        self.controller.drive_vm_bootstrap()
+
+        self.assertEqual(len(vm.command_queue), 1)
+        self.assertEqual(
+            vm.command_queue[0].type,
+            controller_mod.HostCommandType.LAUNCH_PROCESS,
+        )
+
     def test_window_arrangement_waits_for_all_acks(self):
         vm = self.controller.register_vm()
         vm.dota_hwnds = [10, 20]
