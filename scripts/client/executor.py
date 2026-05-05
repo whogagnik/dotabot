@@ -18,7 +18,7 @@ import win32process
 from PIL import Image
 
 
-EXECUTOR_VERSION = "executor_real_dota_window_filter_v4"
+EXECUTOR_VERSION = "executor_real_dota_window_filter_v5"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -287,6 +287,24 @@ def _force_foreground(hwnd: int) -> None:
             time.sleep(0.06)
         except Exception:
             pass
+
+
+def _require_live_window(hwnd: Optional[int], purpose: str) -> int:
+    if hwnd is None:
+        raise ValueError(f"{purpose} requires hwnd or account_login mapping")
+
+    hwnd_i = int(hwnd)
+    try:
+        if not win32gui.IsWindow(hwnd_i):
+            raise ValueError(f"{purpose} hwnd is no longer valid: {hwnd_i}")
+        if not win32gui.IsWindowVisible(hwnd_i):
+            raise ValueError(f"{purpose} hwnd is not visible: {hwnd_i}")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"{purpose} hwnd validation failed: {hwnd_i}: {e}") from e
+
+    return hwnd_i
 
 
 def _switch_keyboard_layout_en() -> None:
@@ -583,9 +601,11 @@ class CommandExecutor:
         else:
             timeout_ms = int(payload.get("timeout_ms", 30000))
         deadline = time.time() + (timeout_ms / 1000.0)
+        last_tree_pids: list[int] = []
 
         while time.time() < deadline:
             pids = set(self._proc_tree_pids(account_login))
+            last_tree_pids = sorted(int(x) for x in pids)
 
             if not pids:
                 time.sleep(0.4)
@@ -599,7 +619,8 @@ class CommandExecutor:
                     found=True,
                     hwnd=int(found),
                     account_login=account_login,
-                    tree_pids=sorted(int(x) for x in pids),
+                    tree_pids=last_tree_pids,
+                    process_tree_alive=bool(last_tree_pids),
                 )
 
             self._handle_blockers_prelogin_once(account_login)
@@ -616,7 +637,8 @@ class CommandExecutor:
                     found=True,
                     hwnd=fallback,
                     account_login=account_login,
-                    tree_pids=sorted(int(x) for x in pids),
+                    tree_pids=last_tree_pids,
+                    process_tree_alive=bool(last_tree_pids),
                     steamwebhelper_hwnds=[int(x) for x in steam_hwnds],
                     fallback_used=True,
                 )
@@ -627,6 +649,8 @@ class CommandExecutor:
             found=False,
             hwnd=None,
             account_login=account_login,
+            tree_pids=last_tree_pids,
+            process_tree_alive=bool(last_tree_pids),
         )
 
     def find_dota_window(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -664,8 +688,11 @@ class CommandExecutor:
         else:
             min_create_ts = float(min_create_ts)
 
+        last_tree_pids: list[int] = []
+
         while time.time() < deadline:
             tree_pids = self._proc_tree_pids(account_login)
+            last_tree_pids = [int(x) for x in tree_pids]
 
             for pid in tree_pids:
                 pid_i = int(pid)
@@ -695,6 +722,8 @@ class CommandExecutor:
                             pid=pid_i,
                             account_login=account_login,
                             source="tree",
+                            tree_pids=last_tree_pids,
+                            process_tree_alive=bool(last_tree_pids),
                             exclude_pids=sorted(exclude_pids),
                             exclude_hwnds=sorted(exclude_hwnds),
                             window_info=_window_info(hwnd_i),
@@ -719,6 +748,8 @@ class CommandExecutor:
                     pid=int(pid),
                     account_login=account_login,
                     source="global_fallback_real_dota_window_guarded",
+                    tree_pids=last_tree_pids,
+                    process_tree_alive=bool(last_tree_pids),
                     min_create_ts=min_create_ts,
                     exclude_pids=sorted(exclude_pids),
                     exclude_hwnds=sorted(exclude_hwnds),
@@ -732,6 +763,8 @@ class CommandExecutor:
             hwnd=None,
             pid=None,
             account_login=account_login,
+            tree_pids=last_tree_pids,
+            process_tree_alive=bool(last_tree_pids),
             exclude_pids=sorted(exclude_pids),
             exclude_hwnds=sorted(exclude_hwnds),
         )
@@ -742,8 +775,7 @@ class CommandExecutor:
 
     def focus_window(self, payload: dict[str, Any]) -> dict[str, Any]:
         hwnd = self._find_hwnd_from_payload(payload)
-        if hwnd is None:
-            raise ValueError("focus_window requires hwnd or account_login mapping")
+        hwnd = _require_live_window(hwnd, "focus_window")
 
         _force_foreground(hwnd)
         return self._result_ok(hwnd=int(hwnd))
@@ -879,9 +911,7 @@ class CommandExecutor:
         vk_code = int(payload["vk_code"])
         hold_ms = int(payload.get("hold_ms", 25))
         force_fg = bool(payload.get("force_fg", True))
-
-        if hwnd is None:
-            raise ValueError("key_press requires resolved hwnd")
+        hwnd = _require_live_window(hwnd, "key_press")
 
         if force_fg:
             _force_foreground(hwnd)
@@ -897,9 +927,7 @@ class CommandExecutor:
         vk_code = int(payload["vk_code"])
         down = bool(payload["down"])
         force_fg = bool(payload.get("force_fg", True))
-
-        if hwnd is None:
-            raise ValueError("key_event requires resolved hwnd")
+        hwnd = _require_live_window(hwnd, "key_event")
 
         if force_fg:
             _force_foreground(hwnd)
@@ -916,9 +944,7 @@ class CommandExecutor:
         text = str(payload.get("text", ""))
         clear_before = bool(payload.get("clear_before", False))
         field = str(payload.get("field", ""))
-
-        if hwnd is None:
-            raise ValueError("write_text requires resolved hwnd")
+        hwnd = _require_live_window(hwnd, "write_text")
 
         _force_foreground(hwnd)
         _switch_keyboard_layout_en()
@@ -966,8 +992,7 @@ class CommandExecutor:
 
         if not keys:
             raise ValueError("hotkey requires non-empty keys")
-        if hwnd is None:
-            raise ValueError("hotkey requires resolved hwnd")
+        hwnd = _require_live_window(hwnd, "hotkey")
 
         if force_fg:
             _force_foreground(hwnd)

@@ -98,6 +98,8 @@ class VmAccountState:
     dota_pid: Optional[int] = None
     dota_find_in_progress: bool = False
     last_dota_find_ts: float = 0.0
+    dota_wait_started_ts: float = 0.0
+    dota_wait_fail_count: int = 0
 
     last_error: Optional[str] = None
 
@@ -183,6 +185,8 @@ class Controller:
         self.find_dota_window_timeout_sec = FIND_DOTA_WINDOW_TIMEOUT_SEC
         self.mafile_auth_timeout_sec = 150.0
         self.max_mafile_auth_failures = 3
+        self.dota_wait_timeout_sec = max(180.0, FIND_DOTA_WINDOW_TIMEOUT_SEC * 3.0)
+        self.max_dota_wait_failures = 3
         self.max_window_arrange_attempts = 3
         self.desktop_popup_scan_interval_sec = 10.0
 
@@ -874,8 +878,7 @@ class Controller:
 
                 cur_acc.auth_flow_in_progress = False
                 if ok:
-                    cur_acc.auth_done = True
-                    cur_acc.auth_started = True
+                    self._mark_auth_done(cur_acc)
                     cur_acc.auth_flow_fail_count = 0
                     cur_acc.last_error = None
                     self.logger.info(
@@ -926,6 +929,89 @@ class Controller:
         acc.login_window_found = False
         acc.login_hwnd = None
         acc.login_find_in_progress = False
+
+    def _mark_auth_done(self, acc: VmAccountState) -> None:
+        acc.auth_started = True
+        acc.auth_done = True
+        if acc.dota_wait_started_ts <= 0:
+            acc.dota_wait_started_ts = time.time()
+
+    def _result_has_empty_process_tree(self, result: Optional[dict]) -> bool:
+        if not result:
+            return False
+
+        if "process_tree_alive" in result:
+            return not bool(result.get("process_tree_alive"))
+
+        tree_pids = result.get("tree_pids")
+        if tree_pids is None:
+            return False
+
+        try:
+            return len(list(tree_pids)) == 0
+        except Exception:
+            return False
+
+    def _reset_account_for_relaunch(
+        self,
+        vm: VmState,
+        acc: VmAccountState,
+        reason: str,
+        *,
+        count_dota_wait_failure: bool = False,
+    ) -> None:
+        wait_fail_count = acc.dota_wait_fail_count + (1 if count_dota_wait_failure else 0)
+
+        self._cancel_queued_account_commands(vm, acc.username, reason)
+
+        self._forget_login_window(vm, acc)
+
+        if acc.dota_hwnd is not None:
+            try:
+                hwnd_i = int(acc.dota_hwnd)
+                vm.dota_hwnds = [h for h in vm.dota_hwnds if int(h) != hwnd_i]
+                vm.dota_window_sizes.pop(hwnd_i, None)
+            except Exception:
+                pass
+
+        acc.launched = False
+        acc.launch_sent = False
+        acc.launch_pid = None
+        acc.last_launch_ts = 0.0
+
+        acc.auth_branch = None
+        acc.auth_started = False
+        acc.auth_done = False
+        acc.auth_capture_requested = False
+        acc.auth_flow_in_progress = False
+
+        acc.popup_capture_requested = False
+        acc.popup_dismiss_in_progress = False
+        acc.last_popup_scan_ts = 0.0
+        acc.last_popup_match_name = None
+
+        acc.dota_window_found = False
+        acc.dota_hwnd = None
+        acc.dota_pid = None
+        acc.dota_find_in_progress = False
+        acc.last_dota_find_ts = 0.0
+        acc.dota_wait_started_ts = 0.0
+        acc.dota_wait_fail_count = wait_fail_count
+
+        acc.last_error = reason
+        self._clear_desktop_frame(vm.vm_id)
+
+        if count_dota_wait_failure and wait_fail_count >= self.max_dota_wait_failures:
+            vm.status = VmStatus.ERROR
+            self.logger.error(
+                f"{vm.vm_id}: dota did not appear for {acc.username}; "
+                f"giving up after {wait_fail_count} relaunch attempts: {reason}"
+            )
+            return
+
+        self.logger.warning(
+            f"{vm.vm_id}: reset launch state -> {acc.username}: {reason}"
+        )
 
     def _finish_window_arrange_if_ready(self, vm: VmState, failed: bool) -> None:
         if failed:
@@ -1079,13 +1165,18 @@ class Controller:
                         acc.last_error = None
                         if acc.login_hwnd not in vm.login_hwnds:
                             vm.login_hwnds.append(acc.login_hwnd)
+                    elif acc.launched and self._result_has_empty_process_tree(cmd.result):
+                        self._reset_account_for_relaunch(
+                            vm,
+                            acc,
+                            "steam process tree disappeared while finding login window",
+                        )
 
             elif cmd.type == HostCommandType.KEY_PRESS:
                 if acc is not None:
                     vk_code = int(cmd.payload.get("vk_code", 0))
                     if vk_code == 0x0D:
-                        acc.auth_started = True
-                        acc.auth_done = True
+                        self._mark_auth_done(acc)
 
             elif cmd.type == HostCommandType.CAPTURE_FRAME:
                 if acc is not None:
@@ -1172,6 +1263,8 @@ class Controller:
                             acc.dota_window_found = True
                             acc.dota_hwnd = hwnd_i
                             acc.dota_pid = pid_i
+                            acc.dota_wait_started_ts = 0.0
+                            acc.dota_wait_fail_count = 0
 
                             window_info = (cmd.result or {}).get("window_info") or {}
                             window_rect = window_info.get("window_rect") or {}
@@ -1197,6 +1290,13 @@ class Controller:
                         acc.dota_window_found = False
                         acc.dota_hwnd = None
                         acc.dota_pid = None
+                        if self._result_has_empty_process_tree(cmd.result):
+                            self._reset_account_for_relaunch(
+                                vm,
+                                acc,
+                                "steam process tree disappeared while waiting for dota window",
+                                count_dota_wait_failure=True,
+                            )
 
             elif cmd.type == HostCommandType.MOVE_WINDOW:
                 self._finish_window_arrange_if_ready(vm, failed=False)
@@ -1210,6 +1310,8 @@ class Controller:
     def drive_vm_bootstrap(self) -> None:
         for vm in self.vms.values():
             if not vm.is_online or not vm.assigned_accounts or vm.planner_active:
+                continue
+            if vm.status == VmStatus.ERROR:
                 continue
             if vm.current_command_id is not None:
                 continue
@@ -1380,6 +1482,20 @@ class Controller:
 
             if not acc.dota_window_found or acc.dota_hwnd is None:
                 now = time.time()
+
+                if acc.dota_wait_started_ts <= 0:
+                    acc.dota_wait_started_ts = now
+                elif now - acc.dota_wait_started_ts > self.dota_wait_timeout_sec:
+                    self._reset_account_for_relaunch(
+                        vm,
+                        acc,
+                        (
+                            "dota window did not appear within "
+                            f"{self.dota_wait_timeout_sec:.0f}s after auth"
+                        ),
+                        count_dota_wait_failure=True,
+                    )
+                    continue
 
                 if acc.popup_dismiss_in_progress:
                     continue
