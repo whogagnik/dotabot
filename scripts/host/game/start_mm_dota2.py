@@ -729,17 +729,17 @@ class StartMmDota2:
             if not member_hwnds:
                 state.party_accept_done = True
             else:
-                pending_accept = False
+                all_accepted = True
 
                 for hwnd in member_hwnds:
                     if state.windows[hwnd].invite_accepted:
                         continue
 
+                    all_accepted = False
                     frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
                     if frame is None:
                         if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
                             state.inflight = True
-                        pending_accept = True
                         continue
 
                     hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
@@ -752,10 +752,12 @@ class StartMmDota2:
 
                     if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
                         state.inflight = True
-                    pending_accept = True
 
-                if not pending_accept and all(state.windows[hwnd].invite_accepted for hwnd in member_hwnds):
+                if all_accepted:
                     state.party_accept_done = True
+
+        if not state.party_accept_done:
+            return False
 
         state.party_built = True
         state.stage = MmStage.START_GAME
