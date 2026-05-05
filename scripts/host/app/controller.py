@@ -226,7 +226,7 @@ class Controller:
             self.activate_planners_for_ready_vms()
             planner_runtime.tick_all()
             self.mark_stale_vms()
-            self.mm_starter._match()
+
         except Exception as e:
             self.logger.error(f"controller.tick_one failed: {e}", exc_info=True)
 

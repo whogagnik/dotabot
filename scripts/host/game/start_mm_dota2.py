@@ -61,6 +61,7 @@ class VmMmState:
     last_stage_ts: float = 0.0
     last_action_ts: float = 0.0
     inflight: bool = False
+    start_game_step: int = 0
 
     party_search_done: bool = False
     party_search_clicked: bool = False
@@ -97,7 +98,7 @@ class StartMmDota2:
         self.images_root = images_root
         self.confidence = float(confidence)
 
-        start_game_step: int = 0
+
         self._vm: Dict[str, VmMmState] = {}
         self._templates = self._load_templates()
 
