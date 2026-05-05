@@ -261,6 +261,39 @@ class ControllerStabilityTests(unittest.TestCase):
         self.assertFalse(acc.auth_capture_requested)
         self.assertTrue(acc.auth_flow_in_progress)
 
+    def test_wait_dota_tries_window_find_before_first_desktop_capture(self):
+        vm, acc = self.add_vm_account(has_mafile=False)
+        acc.launched = True
+        acc.login_window_found = True
+        acc.login_hwnd = 100
+        acc.auth_done = True
+
+        self.controller.drive_vm_bootstrap()
+
+        self.assertEqual(len(vm.command_queue), 1)
+        self.assertEqual(
+            vm.command_queue[0].type,
+            controller_mod.HostCommandType.FIND_DOTA_WINDOW,
+        )
+
+    def test_wait_dota_does_not_repeat_desktop_capture_before_find(self):
+        vm, acc = self.add_vm_account(has_mafile=False)
+        acc.launched = True
+        acc.login_window_found = True
+        acc.login_hwnd = 100
+        acc.auth_done = True
+        acc.last_popup_scan_ts = time.time()
+        self.controller._desktop_frames[vm.vm_id] = object()
+        self.controller._desktop_frame_ts[vm.vm_id] = time.time()
+
+        self.controller.drive_vm_bootstrap()
+
+        self.assertEqual(len(vm.command_queue), 1)
+        self.assertEqual(
+            vm.command_queue[0].type,
+            controller_mod.HostCommandType.FIND_DOTA_WINDOW,
+        )
+
     def test_window_arrangement_waits_for_all_acks(self):
         vm = self.controller.register_vm()
         vm.dota_hwnds = [10, 20]

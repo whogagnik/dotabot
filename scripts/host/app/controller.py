@@ -184,6 +184,7 @@ class Controller:
         self.mafile_auth_timeout_sec = 150.0
         self.max_mafile_auth_failures = 3
         self.max_window_arrange_attempts = 3
+        self.desktop_popup_scan_interval_sec = 10.0
 
         self.screen_w = 1920
         self.screen_h = 1080
@@ -192,6 +193,8 @@ class Controller:
 
         self._steam_templates = self._load_steam_templates()
         self._desktop_frames: Dict[str, np.ndarray] = {}
+        self._desktop_frame_ts: Dict[str, float] = {}
+        self._desktop_popup_match_cache: Dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 
         self.mm_starter = None
         if StartMmDota2 is not None:
@@ -368,8 +371,15 @@ class Controller:
             raw = base64.b64decode(image_b64)
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             self._desktop_frames[vm_id] = np.array(img, dtype=np.uint8)
+            self._desktop_frame_ts[vm_id] = time.time()
+            self._desktop_popup_match_cache.pop(vm_id, None)
         except Exception as e:
             self.logger.warning(f"{vm_id}: failed to decode desktop frame: {e}")
+
+    def _clear_desktop_frame(self, vm_id: str) -> None:
+        self._desktop_frames.pop(vm_id, None)
+        self._desktop_frame_ts.pop(vm_id, None)
+        self._desktop_popup_match_cache.pop(vm_id, None)
 
     def _find_desktop_steam_popup_match(
         self,
@@ -379,6 +389,11 @@ class Controller:
         frame_rgb = self._desktop_frames.get(vm_id)
         if frame_rgb is None or not self._steam_templates:
             return None
+
+        frame_ts = float(self._desktop_frame_ts.get(vm_id, 0.0) or 0.0)
+        cached = self._desktop_popup_match_cache.get(vm_id)
+        if cached is not None and float(cached[0]) == frame_ts:
+            return cached[1]
 
         try:
             gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
@@ -417,6 +432,7 @@ class Controller:
             if best is None or cand["score"] > best["score"]:
                 best = cand
 
+        self._desktop_popup_match_cache[vm_id] = (frame_ts, best)
         return best
 
     # -----------------------------------------------------
@@ -995,7 +1011,7 @@ class Controller:
                 elif cmd.type == HostCommandType.DISMISS_STEAM_POPUPS:
                     acc.popup_dismiss_in_progress = False
                     acc.popup_fail_count += 1
-                    self._desktop_frames.pop(vm.vm_id, None)
+                    self._clear_desktop_frame(vm.vm_id)
                     soft_failure = True
 
                 elif cmd.type == HostCommandType.FIND_DOTA_WINDOW:
@@ -1101,7 +1117,7 @@ class Controller:
                     dismissed = bool((cmd.result or {}).get("dismissed", False))
                     if dismissed:
                         acc.popup_fail_count = 0
-                    self._desktop_frames.pop(vm.vm_id, None)
+                    self._clear_desktop_frame(vm.vm_id)
 
             elif cmd.type == HostCommandType.FIND_DOTA_WINDOW:
                 if acc is not None:
@@ -1378,7 +1394,14 @@ class Controller:
                     else:
                         continue
 
-                match = self._find_desktop_steam_popup_match(vm.vm_id)
+                has_desktop_frame = vm.vm_id in self._desktop_frames
+                desktop_frame_ts = float(self._desktop_frame_ts.get(vm.vm_id, 0.0) or 0.0)
+
+                match = (
+                    self._find_desktop_steam_popup_match(vm.vm_id)
+                    if has_desktop_frame
+                    else None
+                )
 
                 if match is not None:
                     self._push_command(
@@ -1406,7 +1429,15 @@ class Controller:
                     )
                     continue
 
-                if vm.vm_id not in self._desktop_frames or now - acc.last_popup_scan_ts >= 1.2:
+                should_refresh_desktop = (
+                    not has_desktop_frame
+                    or now - desktop_frame_ts >= self.desktop_popup_scan_interval_sec
+                )
+                if (
+                    acc.last_dota_find_ts > 0
+                    and should_refresh_desktop
+                    and now - acc.last_popup_scan_ts >= self.desktop_popup_scan_interval_sec
+                ):
                     self._push_command(
                         vm,
                         HostCommandType.CAPTURE_DESKTOP,
@@ -1418,6 +1449,9 @@ class Controller:
                     acc.popup_capture_requested = True
                     acc.last_popup_scan_ts = now
                     vm.status = VmStatus.WAIT_DOTA
+                    self.logger.info(
+                        f"{vm.vm_id}: desktop popup scan -> {acc.username}"
+                    )
                     continue
 
                 if now - acc.last_dota_find_ts < 2.0:
