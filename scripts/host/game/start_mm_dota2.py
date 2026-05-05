@@ -735,6 +735,7 @@ class StartMmDota2:
                     return False
 
                 hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
+                print(hit)
                 if hit:
                     self._enqueue_focus(state.vm_id, hwnd)
                     self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
@@ -742,12 +743,16 @@ class StartMmDota2:
                     accepted_any = True
                     state.inflight = True
                     return False
+                else:
+                    self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite")
+                    state.inflight = True
+                    return False
 
-            if not accepted_any:
+            if accepted_any:
                 state.party_accept_done = True
 
         state.party_built = True
-        state.stage = MmStage.DETECT_SIDE
+        state.stage = MmStage.START_GAME
         state.last_stage_ts = time.time()
         self.log.info(f"[MM] {state.vm_id}: party stage done")
         return False
@@ -791,14 +796,14 @@ class StartMmDota2:
                 state.windows[hwnd].side = "unknown"
                 self.log.info(f"[MM] {state.vm_id}: hwnd={hex(hwnd)} side=unknown")
 
-        state.stage = MmStage.START_GAME
+        state.stage = MmStage.PICK_HEROES
         state.last_stage_ts = time.time()
         self.log.info(f"[MM] {state.vm_id}: detect_side stage done")
         return False
 
     def _tick_start_game_stub(self, state: VmMmState) -> bool:
         if state.start_game_done:
-            state.stage = MmStage.PICK_HEROES
+            state.stage = MmStage.DETECT_SIDE
             state.last_stage_ts = time.time()
             return False
 
@@ -945,11 +950,11 @@ class StartMmDota2:
         if state.stage == MmStage.BUILD_PARTY:
             return self._tick_build_party(state, friend_ids=friend_ids)
 
-        if state.stage == MmStage.DETECT_SIDE:
-            return self._tick_detect_side(state)
-
         if state.stage == MmStage.START_GAME:
             return self._tick_start_game_stub(state)
+
+        if state.stage == MmStage.DETECT_SIDE:
+            return self._tick_detect_side(state)
 
         if state.stage == MmStage.PICK_HEROES:
             return self._tick_pick_heroes_stub(state)
