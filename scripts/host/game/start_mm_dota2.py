@@ -177,6 +177,7 @@ class StartMmDota2:
             "id_field_eng": "lobby_id_field_eng",
             "search_ru": "lobby_search_ru",
             "search_eng": "lobby_search_eng",
+            'search_game_ru' : 'lobby_search_game_ru',
             "add": "lobby_add",
 
             "accept_invite_ru": "lobby_accept_invite_ru",
@@ -868,7 +869,7 @@ class StartMmDota2:
             )
             if hit:
                 self._enqueue_focus(state.vm_id, leader)
-                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"])
+                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"] + 10)
                 state.inflight = True
                 state.start_game_step = 3
                 self._clear_frame(state.vm_id, leader)
