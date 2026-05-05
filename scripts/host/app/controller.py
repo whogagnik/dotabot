@@ -112,6 +112,7 @@ class VmCommand:
     type: str
     payload: Dict[str, Any]
     created_ts: float
+    sent_ts: float = 0.0
     status: str = "queued"
     result: Optional[Dict[str, Any]] = None
 
@@ -221,6 +222,7 @@ class Controller:
 
         try:
             self.ensure_runtime_ready()
+            self._expire_stale_commands()
             self.assign_batches_to_idle_vms()
             self.drive_vm_bootstrap()
             self.activate_planners_for_ready_vms()
@@ -229,6 +231,43 @@ class Controller:
 
         except Exception as e:
             self.logger.error(f"controller.tick_one failed: {e}", exc_info=True)
+
+    def _command_timeout_sec(self, cmd_type: str) -> float:
+        if cmd_type == HostCommandType.FIND_LOGIN_WINDOW:
+            return self.find_login_window_timeout_sec + 5.0
+        if cmd_type == HostCommandType.FIND_DOTA_WINDOW:
+            return self.find_dota_window_timeout_sec + 3.0
+        if cmd_type == HostCommandType.CAPTURE_FRAME:
+            return 8.0
+        if cmd_type == HostCommandType.CAPTURE_DESKTOP:
+            return 8.0
+        if cmd_type in (
+            HostCommandType.FOCUS_WINDOW,
+            HostCommandType.WRITE_TEXT,
+            HostCommandType.KEY_PRESS,
+            HostCommandType.DISMISS_STEAM_POPUPS,
+        ):
+            return 15.0
+        return 20.0
+
+    def _expire_stale_commands(self) -> None:
+        now = time.time()
+        for vm in self.vms.values():
+            for cmd in vm.command_queue:
+                if cmd.status != "sent":
+                    continue
+                sent_ts = float(cmd.sent_ts or cmd.created_ts)
+                if now - sent_ts <= self._command_timeout_sec(cmd.type):
+                    continue
+
+                self.logger.warning(
+                    f"{vm.vm_id}: stale sent command expired id={cmd.id} type={cmd.type}"
+                )
+                cmd.status = "failed"
+                cmd.result = {"error": "host timeout waiting command ack", "expired": True}
+                if vm.current_command_id == cmd.id:
+                    vm.current_command_id = None
+                self._handle_command_result(vm, cmd)
 
     def ensure_runtime_ready(self) -> None:
         if not self._django_started:
@@ -614,11 +653,14 @@ class Controller:
             for c in vm.command_queue:
                 if c.id == vm.current_command_id and c.status in ("queued", "sent"):
                     c.status = "sent"
+                    if c.sent_ts <= 0:
+                        c.sent_ts = time.time()
                     return {"id": c.id, "type": c.type, "payload": c.payload}
 
         for c in vm.command_queue:
             if c.status == "queued":
                 c.status = "sent"
+                c.sent_ts = time.time()
                 vm.current_command_id = c.id
                 return {"id": c.id, "type": c.type, "payload": c.payload}
 
@@ -1001,6 +1043,7 @@ class Controller:
                     },
                 )
                 acc.auth_started = True
+                acc.auth_done = True
                 vm.status = VmStatus.LOGIN
                 self.logger.info(f"{vm.vm_id}: manual auth queued -> {acc.username}")
                 continue
@@ -1013,7 +1056,13 @@ class Controller:
                 if acc.popup_capture_requested:
                     continue
                 if acc.dota_find_in_progress:
-                    continue
+                    if now - acc.last_dota_find_ts > (self.find_dota_window_timeout_sec + 1.0):
+                        acc.dota_find_in_progress = False
+                        self.logger.warning(
+                            f"{vm.vm_id}: find_dota_window timed out locally -> {acc.username}; reset polling lock"
+                        )
+                    else:
+                        continue
 
                 match = self._find_desktop_steam_popup_match(vm.vm_id)
 
