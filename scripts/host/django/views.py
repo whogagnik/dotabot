@@ -269,6 +269,21 @@ class VmLogView(View):
     """
 
     def post(self, request: HttpRequest):
+        try:
+            content_length = int(request.META.get("CONTENT_LENGTH") or 0)
+        except Exception:
+            content_length = 0
+
+        if content_length > 512 * 1024:
+            return JsonResponse(
+                {
+                    "ok": True,
+                    "dropped": True,
+                    "reason": "log payload too large",
+                    "content_length": content_length,
+                }
+            )
+
         body = _json_body(request)
 
         vm_id = str(body.get("vm_id") or "").strip()

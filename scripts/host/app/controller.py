@@ -1630,7 +1630,7 @@ class Controller:
 
         line = f"[VMLOG][{vm_id}][{source}][{event}] {message}"
         if payload:
-            line += f" | payload={payload}"
+            line += f" | payload={self._sanitize_log_payload(payload)}"
 
         lvl = (level or "info").lower()
         if lvl == "debug":
@@ -1641,6 +1641,38 @@ class Controller:
             self.logger.error(line)
         else:
             self.logger.info(line)
+
+    def _sanitize_log_payload(self, value: Any, *, max_string_len: int = 1000) -> Any:
+        try:
+            if isinstance(value, dict):
+                out: dict[str, Any] = {}
+                for key, nested in value.items():
+                    key_s = str(key)
+                    if key_s in {"image_b64", "frame_b64"}:
+                        out[key_s] = f"<base64 {len(nested or '')} chars>"
+                    elif key_s in {"raw", "bytes"} and isinstance(nested, (bytes, bytearray)):
+                        out[key_s] = f"<bytes {len(nested)}>"
+                    else:
+                        out[key_s] = self._sanitize_log_payload(
+                            nested,
+                            max_string_len=max_string_len,
+                        )
+                return out
+            if isinstance(value, list):
+                return [
+                    self._sanitize_log_payload(item, max_string_len=max_string_len)
+                    for item in value[:50]
+                ]
+            if isinstance(value, tuple):
+                return tuple(
+                    self._sanitize_log_payload(item, max_string_len=max_string_len)
+                    for item in value[:50]
+                )
+            if isinstance(value, str) and len(value) > max_string_len:
+                return f"{value[:max_string_len]}...<truncated {len(value)} chars>"
+            return value
+        except Exception:
+            return "<unserializable>"
 
     def mark_stale_vms(self, timeout_sec: float = 60.0) -> None:
         now = time.time()
