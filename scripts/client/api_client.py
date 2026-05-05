@@ -147,10 +147,10 @@ class PlannerApiClient:
             "source": str(source),
             "event": str(event),
             "message": str(message),
-            "payload": payload or {},
+            "payload": self._sanitize_for_log(payload or {}),
         }
 
-        self._log(f"send_log -> {self._sanitize_for_log(body)}")
+        self._log(f"send_log -> {body}")
         resp = self.session.post(
             f"{self.base_url}/planner/log",
             json=body,
