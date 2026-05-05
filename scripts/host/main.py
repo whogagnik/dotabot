@@ -443,6 +443,7 @@ class App(tk.Tk):
                 iid=row["vm_id"],
                 values=(
                     row["vm_id"],
+                    "",
                     row["status"],
                     row["accounts"],
                     row["login_hwnds"],

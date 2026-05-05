@@ -698,7 +698,7 @@ class StartMmDota2:
                 field_hit = self._find_any(frame, ["id_field_ru", "id_field_eng"])
                 if field_hit:
                     self._enqueue_click(state.vm_id, leader, field_hit["x"], field_hit["y"])
-                    time.sleep(1)
+                    self._enqueue_sleep(state.vm_id, 1000)
                     self._enqueue_write(state.vm_id, leader, str(friend_ids[1]), clear_before=True)
 
                     search_hit = self._find_any(frame, ["search_ru", "search_eng"])

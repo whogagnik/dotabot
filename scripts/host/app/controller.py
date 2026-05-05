@@ -82,6 +82,10 @@ class VmAccountState:
     auth_capture_requested: bool = False
     last_auth_capture_ts: float = 0.0
     auth_capture_fail_count: int = 0
+    auth_flow_in_progress: bool = False
+    auth_flow_started_ts: float = 0.0
+    auth_flow_fail_count: int = 0
+    auth_job_id: int = 0
 
     popup_capture_requested: bool = False
     popup_dismiss_in_progress: bool = False
@@ -142,6 +146,8 @@ class VmState:
 
     windows_arranged: bool = False
     windows_arrange_sent: bool = False
+    windows_arrange_attempts: int = 0
+    windows_arrange_pending_ids: List[int] = field(default_factory=list)
 
     command_queue: List[VmCommand] = field(default_factory=list)
     current_command_id: Optional[int] = None
@@ -175,6 +181,9 @@ class Controller:
         self.launch_opts = list(DOTA_LAUNCH_OPTS)
         self.find_login_window_timeout_sec = 30.0
         self.find_dota_window_timeout_sec = 2.5
+        self.mafile_auth_timeout_sec = 150.0
+        self.max_mafile_auth_failures = 3
+        self.max_window_arrange_attempts = 3
 
         self.screen_w = 1920
         self.screen_h = 1080
@@ -217,26 +226,57 @@ class Controller:
         self.logger.info("Host controller stopped")
 
     def tick_one(self) -> None:
-        if not self.running:
-            return
-
         try:
-            self.ensure_runtime_ready()
-            self._expire_stale_commands()
-            self.assign_batches_to_idle_vms()
-            self.drive_vm_bootstrap()
-            self.activate_planners_for_ready_vms()
+            with self._lock:
+                if not self.running:
+                    return
+
+                self.ensure_runtime_ready()
+                self._expire_stale_commands()
+                self.assign_batches_to_idle_vms()
+                self.drive_vm_bootstrap()
+                self.activate_planners_for_ready_vms()
+                self.mark_stale_vms()
+
             planner_runtime.tick_all()
-            self.mark_stale_vms()
 
         except Exception as e:
             self.logger.error(f"controller.tick_one failed: {e}", exc_info=True)
 
-    def _command_timeout_sec(self, cmd_type: str) -> float:
+    def _command_timeout_sec(
+        self,
+        cmd_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        def payload_timeout_sec(fallback: float) -> float:
+            if not payload:
+                return fallback
+            try:
+                timeout_sec = float(payload.get("timeout_sec", 0.0) or 0.0)
+                if timeout_sec > 0:
+                    return timeout_sec
+            except Exception:
+                pass
+            try:
+                timeout_ms = float(payload.get("timeout_ms", 0.0) or 0.0)
+                if timeout_ms > 0:
+                    return timeout_ms / 1000.0
+            except Exception:
+                pass
+            return fallback
+
         if cmd_type == HostCommandType.FIND_LOGIN_WINDOW:
-            return self.find_login_window_timeout_sec + 5.0
+            return payload_timeout_sec(self.find_login_window_timeout_sec) + 5.0
         if cmd_type == HostCommandType.FIND_DOTA_WINDOW:
-            return self.find_dota_window_timeout_sec + 3.0
+            return payload_timeout_sec(self.find_dota_window_timeout_sec) + 3.0
+        if cmd_type == HostCommandType.SLEEP:
+            duration_ms = 0
+            if payload:
+                try:
+                    duration_ms = int(payload.get("duration_ms", 0) or 0)
+                except Exception:
+                    duration_ms = 0
+            return max(5.0, duration_ms / 1000.0 + 5.0)
         if cmd_type == HostCommandType.CAPTURE_FRAME:
             return 8.0
         if cmd_type == HostCommandType.CAPTURE_DESKTOP:
@@ -253,13 +293,16 @@ class Controller:
     def _expire_stale_commands(self) -> None:
         now = time.time()
         for vm in self.vms.values():
+            expired: list[VmCommand] = []
             for cmd in vm.command_queue:
                 if cmd.status != "sent":
                     continue
                 sent_ts = float(cmd.sent_ts or cmd.created_ts)
-                if now - sent_ts <= self._command_timeout_sec(cmd.type):
+                if now - sent_ts <= self._command_timeout_sec(cmd.type, cmd.payload):
                     continue
+                expired.append(cmd)
 
+            for cmd in expired:
                 self.logger.warning(
                     f"{vm.vm_id}: stale sent command expired id={cmd.id} type={cmd.type}"
                 )
@@ -268,6 +311,7 @@ class Controller:
                 if vm.current_command_id == cmd.id:
                     vm.current_command_id = None
                 self._handle_command_result(vm, cmd)
+                self._notify_mm_command_result(vm.vm_id, cmd)
 
     def ensure_runtime_ready(self) -> None:
         if not self._django_started:
@@ -515,13 +559,15 @@ class Controller:
             return vm
 
     def get_vm(self, vm_id: str) -> Optional[VmState]:
-        return self.vms.get(vm_id)
+        with self._lock:
+            return self.vms.get(vm_id)
 
     def touch_vm(self, vm_id: str) -> None:
-        vm = self.vms.get(vm_id)
-        if vm:
-            vm.last_ping_ts = time.time()
-            vm.is_online = True
+        with self._lock:
+            vm = self.vms.get(vm_id)
+            if vm:
+                vm.last_ping_ts = time.time()
+                vm.is_online = True
 
     # -----------------------------------------------------
     # batching
@@ -565,8 +611,9 @@ class Controller:
             )
 
     def get_vm_accounts_payload(self, vm_id: str) -> List[dict]:
-        vm = self.vms[vm_id]
-        return [a.to_payload() for a in vm.assigned_accounts]
+        with self._lock:
+            vm = self.vms[vm_id]
+            return [a.to_payload() for a in vm.assigned_accounts]
 
     # -----------------------------------------------------
     # helpers
@@ -634,73 +681,272 @@ class Controller:
     # -----------------------------------------------------
 
     def _push_command(self, vm: VmState, cmd_type: str, payload: Dict[str, Any]) -> VmCommand:
-        cmd = VmCommand(
-            id=self._next_command_id,
-            type=cmd_type,
-            payload=payload,
-            created_ts=time.time(),
-        )
-        self._next_command_id += 1
-        vm.command_queue.append(cmd)
-        return cmd
+        with self._lock:
+            cmd = VmCommand(
+                id=self._next_command_id,
+                type=cmd_type,
+                payload=payload,
+                created_ts=time.time(),
+            )
+            self._next_command_id += 1
+            vm.command_queue.append(cmd)
+            return cmd
 
     def get_next_command(self, vm_id: str) -> Optional[dict]:
-        vm = self.vms.get(vm_id)
-        if vm is None:
-            return None
+        with self._lock:
+            vm = self.vms.get(vm_id)
+            if vm is None:
+                return None
 
-        if vm.current_command_id is not None:
-            for c in vm.command_queue:
-                if c.id == vm.current_command_id and c.status in ("queued", "sent"):
-                    c.status = "sent"
-                    if c.sent_ts <= 0:
+            if vm.current_command_id is not None:
+                for c in vm.command_queue:
+                    if c.id != vm.current_command_id:
+                        continue
+                    if c.status == "queued":
+                        c.status = "sent"
                         c.sent_ts = time.time()
-                    return {"id": c.id, "type": c.type, "payload": c.payload}
+                        return {"id": c.id, "type": c.type, "payload": c.payload}
+                    if c.status == "sent":
+                        return None
 
-        for c in vm.command_queue:
-            if c.status == "queued":
-                c.status = "sent"
-                c.sent_ts = time.time()
-                vm.current_command_id = c.id
-                return {"id": c.id, "type": c.type, "payload": c.payload}
+                vm.current_command_id = None
+
+            for c in vm.command_queue:
+                if c.status == "queued":
+                    c.status = "sent"
+                    c.sent_ts = time.time()
+                    vm.current_command_id = c.id
+                    return {"id": c.id, "type": c.type, "payload": c.payload}
 
         return None
 
     def ack_command(self, vm_id: str, command_id: int, status: str, result: Optional[dict]) -> bool:
-        vm = self.vms.get(vm_id)
-        if vm is None:
-            return False
+        with self._lock:
+            vm = self.vms.get(vm_id)
+            if vm is None:
+                return False
 
-        for c in vm.command_queue:
-            if c.id == int(command_id):
-                c.status = status
-                c.result = result or {}
+            for c in vm.command_queue:
+                if c.id == int(command_id):
+                    c.status = status
+                    c.result = result or {}
 
-                if vm.current_command_id == c.id:
-                    vm.current_command_id = None
+                    if vm.current_command_id == c.id:
+                        vm.current_command_id = None
 
-                self._handle_command_result(vm, c)
+                    self._handle_command_result(vm, c)
+                    self._notify_mm_command_result(vm_id, c)
 
-                if self.mm_starter is not None:
-                    try:
-                        self.mm_starter.on_command_result(
-                            vm_id=vm_id,
-                            cmd_type=c.type,
-                            payload=c.payload,
-                            result=c.result or {},
-                            status=c.status,
-                        )
-                    except AttributeError:
-                        try:
-                            self.mm_starter.mark_command_done(vm_id)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        self.logger.warning(f"{vm_id}: mm_starter.on_command_result failed: {e}")
-
-                return True
+                    return True
 
         return False
+
+    def _notify_mm_command_result(self, vm_id: str, cmd: VmCommand) -> None:
+        if self.mm_starter is None:
+            return
+
+        try:
+            self.mm_starter.on_command_result(
+                vm_id=vm_id,
+                cmd_type=cmd.type,
+                payload=cmd.payload,
+                result=cmd.result or {},
+                status=cmd.status,
+            )
+        except AttributeError:
+            try:
+                self.mm_starter.mark_command_done(vm_id)
+            except Exception:
+                pass
+        except Exception as e:
+            self.logger.warning(f"{vm_id}: mm_starter.on_command_result failed: {e}")
+
+    def _source_account_for_vm_account(self, acc: VmAccountState) -> Optional[Account]:
+        for source in self.accounts:
+            if source.username == acc.username:
+                return source
+        return None
+
+    def _start_mafile_auth_job(
+        self,
+        vm: VmState,
+        acc: VmAccountState,
+        image_b64: str,
+    ) -> None:
+        if acc.auth_flow_in_progress or acc.auth_done:
+            return
+
+        source = self._source_account_for_vm_account(acc)
+        mafile_path = acc.mafile_path or (source.mafile_path if source else None)
+        mafile_data = source.mafile_data if source else None
+
+        if not mafile_path and not mafile_data:
+            acc.auth_flow_fail_count += 1
+            acc.last_error = "mafile data is missing"
+            self.logger.error(f"{vm.vm_id}: mafile auth cannot start for {acc.username}: no mafile")
+            return
+
+        acc.auth_job_id += 1
+        job_id = acc.auth_job_id
+        acc.auth_flow_in_progress = True
+        acc.auth_flow_started_ts = time.time()
+        acc.auth_started = True
+
+        def worker() -> None:
+            ok = False
+            details: dict[str, Any] = {}
+            error: Optional[str] = None
+
+            try:
+                from pathlib import Path
+
+                from pyzbar.pyzbar import ZBarSymbol, decode
+
+                from scripts.host.core import qr_loger
+
+                raw = base64.b64decode(image_b64)
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                codes = decode(img, symbols=[ZBarSymbol.QRCODE])
+                if not codes:
+                    raise RuntimeError("QR code was not found in login frame")
+
+                qr_url = codes[0].data.decode("utf-8", errors="ignore")
+
+                ma = dict(mafile_data or {})
+                path_obj = None
+                if mafile_path:
+                    path_obj = Path(mafile_path)
+                    if not ma:
+                        with open(path_obj, "r", encoding="utf-8") as f:
+                            ma = json.load(f)
+
+                access_token = qr_loger.extract_existing_token(ma)
+                if not access_token:
+                    raise RuntimeError("mafile has no access token for QR approval")
+
+                ok, snapshot, updated_ma = qr_loger.do_flow(
+                    qr_url=qr_url,
+                    poll_payload_b64=None,
+                    mafile_path=path_obj,
+                    save_to=path_obj,
+                    ma=ma,
+                    login=acc.username,
+                    password=acc.password,
+                    access_token=access_token,
+                    poll_seconds=60,
+                    exit_on_interaction=True,
+                    debug_payload=False,
+                    login_hwnd=None,
+                    exit_on_window_close=False,
+                    exit_on_qr_disappear=False,
+                    qr_disappear_consecutive=2,
+                    qr_recheck_interval=1.0,
+                )
+                details = dict(snapshot or {})
+
+                if path_obj is not None:
+                    qr_loger.save_mafile(path_obj, updated_ma)
+
+            except Exception as e:
+                error = str(e)
+
+            with self._lock:
+                cur_vm = self.vms.get(vm.vm_id)
+                cur_acc = self._get_vm_account(cur_vm, acc.username) if cur_vm else None
+                if cur_acc is None or cur_acc.auth_job_id != job_id:
+                    return
+
+                cur_acc.auth_flow_in_progress = False
+                if ok:
+                    cur_acc.auth_done = True
+                    cur_acc.auth_started = True
+                    cur_acc.auth_flow_fail_count = 0
+                    cur_acc.last_error = None
+                    self.logger.info(
+                        f"{vm.vm_id}: mafile auth done -> {cur_acc.username} "
+                        f"finish={details.get('finish_mode')}"
+                    )
+                else:
+                    cur_acc.auth_done = False
+                    cur_acc.auth_flow_fail_count += 1
+                    cur_acc.last_error = error or str(details or "mafile auth failed")
+                    self.logger.warning(
+                        f"{vm.vm_id}: mafile auth failed for {cur_acc.username}: "
+                        f"{cur_acc.last_error}"
+                    )
+
+        t = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"mafile-auth-{vm.vm_id}-{acc.username}",
+        )
+        t.start()
+        self.logger.info(f"{vm.vm_id}: mafile auth started -> {acc.username}")
+
+    def _check_mafile_auth_timeout(self, vm: VmState, acc: VmAccountState) -> bool:
+        if not acc.auth_flow_in_progress:
+            return False
+
+        elapsed = time.time() - float(acc.auth_flow_started_ts or 0.0)
+        if elapsed <= self.mafile_auth_timeout_sec:
+            return True
+
+        acc.auth_job_id += 1
+        acc.auth_flow_in_progress = False
+        acc.auth_done = False
+        acc.auth_flow_fail_count += 1
+        acc.last_error = "mafile auth timeout"
+        self.logger.warning(
+            f"{vm.vm_id}: mafile auth timed out after {elapsed:.1f}s -> {acc.username}"
+        )
+        return False
+
+    def _forget_login_window(self, vm: VmState, acc: VmAccountState) -> None:
+        if acc.login_hwnd is not None:
+            try:
+                vm.login_hwnds = [h for h in vm.login_hwnds if int(h) != int(acc.login_hwnd)]
+            except Exception:
+                pass
+        acc.login_window_found = False
+        acc.login_hwnd = None
+        acc.login_find_in_progress = False
+
+    def _finish_window_arrange_if_ready(self, vm: VmState, failed: bool) -> None:
+        if failed:
+            vm.windows_arrange_sent = False
+            vm.windows_arranged = False
+            vm.windows_arrange_pending_ids.clear()
+            return
+
+        pending = {
+            c.id
+            for c in vm.command_queue
+            if c.status in ("queued", "sent")
+            and c.type == HostCommandType.MOVE_WINDOW
+            and c.payload.get("purpose") == "arrange_dota_windows"
+        }
+        vm.windows_arrange_pending_ids = [
+            cmd_id for cmd_id in vm.windows_arrange_pending_ids if cmd_id in pending
+        ]
+
+        if not vm.windows_arrange_pending_ids:
+            vm.windows_arrange_sent = False
+            vm.windows_arranged = True
+            self.logger.info(f"{vm.vm_id}: window arrangement acknowledged")
+
+    def _cancel_queued_account_commands(
+        self,
+        vm: VmState,
+        username: str,
+        reason: str,
+    ) -> None:
+        for pending in vm.command_queue:
+            if pending.status != "queued":
+                continue
+            if pending.payload.get("account_login") != username:
+                continue
+            pending.status = "failed"
+            pending.result = {"error": reason, "cancelled": True}
 
     def _handle_command_result(self, vm: VmState, cmd: VmCommand) -> None:
         account_login = str(
@@ -756,6 +1002,42 @@ class Controller:
                     acc.dota_find_in_progress = False
                     soft_failure = True
 
+                elif (
+                    cmd.type
+                    in (
+                        HostCommandType.FOCUS_WINDOW,
+                        HostCommandType.WRITE_TEXT,
+                        HostCommandType.KEY_PRESS,
+                        HostCommandType.KEY_EVENT,
+                        HostCommandType.HOTKEY,
+                        HostCommandType.SLEEP,
+                    )
+                    and not acc.auth_done
+                ):
+                    self._cancel_queued_account_commands(
+                        vm,
+                        acc.username,
+                        f"cancelled after {cmd.type} failed",
+                    )
+                    acc.auth_started = False
+                    acc.auth_done = False
+                    acc.auth_capture_requested = False
+                    acc.auth_flow_in_progress = False
+                    self._forget_login_window(vm, acc)
+                    soft_failure = True
+                    self.logger.warning(
+                        f"{vm.vm_id}: auth input command failed -> refind login "
+                        f"for {acc.username}: {cmd.result}"
+                    )
+
+                elif cmd.type == HostCommandType.MOVE_WINDOW:
+                    soft_failure = True
+                    self._finish_window_arrange_if_ready(vm, failed=True)
+
+            elif cmd.type == HostCommandType.MOVE_WINDOW:
+                soft_failure = True
+                self._finish_window_arrange_if_ready(vm, failed=True)
+
             if not soft_failure:
                 vm.status = VmStatus.ERROR
                 self.logger.error(f"{vm.vm_id}: command failed {cmd.type} -> {cmd.result}")
@@ -775,8 +1057,12 @@ class Controller:
                     hwnd = (cmd.result or {}).get("hwnd")
                     acc.login_window_found = found
                     acc.login_hwnd = None if hwnd is None else int(hwnd)
-                    if found and acc.login_hwnd is not None and acc.login_hwnd not in vm.login_hwnds:
-                        vm.login_hwnds.append(acc.login_hwnd)
+                    if found and acc.login_hwnd is not None:
+                        acc.auth_capture_fail_count = 0
+                        acc.auth_flow_fail_count = 0
+                        acc.last_error = None
+                        if acc.login_hwnd not in vm.login_hwnds:
+                            vm.login_hwnds.append(acc.login_hwnd)
 
             elif cmd.type == HostCommandType.KEY_PRESS:
                 if acc is not None:
@@ -791,6 +1077,16 @@ class Controller:
                         acc.auth_capture_requested = False
                         acc.auth_capture_fail_count = 0
                         acc.auth_started = True
+                        if acc.auth_branch == "mafile" or acc.has_mafile:
+                            image_b64 = str((cmd.result or {}).get("image_b64") or "")
+                            if image_b64:
+                                self._start_mafile_auth_job(vm, acc, image_b64)
+                            else:
+                                acc.auth_flow_fail_count += 1
+                                acc.last_error = "auth capture returned no image"
+                                self.logger.warning(
+                                    f"{vm.vm_id}: auth capture returned no image -> {acc.username}"
+                                )
                     if acc.popup_capture_requested:
                         acc.popup_capture_requested = False
 
@@ -887,7 +1183,7 @@ class Controller:
                         acc.dota_pid = None
 
             elif cmd.type == HostCommandType.MOVE_WINDOW:
-                pass
+                self._finish_window_arrange_if_ready(vm, failed=False)
 
         vm.command_queue = [x for x in vm.command_queue if x.status not in ("done", "failed")]
 
@@ -954,10 +1250,22 @@ class Controller:
                 
                 if acc.has_mafile:
                     now = time.time()
+
+                    if self._check_mafile_auth_timeout(vm, acc):
+                        continue
+
+                    if acc.auth_flow_fail_count >= self.max_mafile_auth_failures:
+                        self._forget_login_window(vm, acc)
+                        acc.auth_capture_requested = False
+                        acc.auth_flow_in_progress = False
+                        self.logger.warning(
+                            f"{vm.vm_id}: mafile auth failed too many times -> "
+                            f"refind login window for {acc.username}"
+                        )
+                        continue
+
                     if acc.auth_capture_fail_count >= 3:
-                        acc.login_window_found = False
-                        acc.login_hwnd = None
-                        acc.login_find_in_progress = False
+                        self._forget_login_window(vm, acc)
                         continue
                     if acc.auth_capture_requested:
                         continue
@@ -997,7 +1305,14 @@ class Controller:
                         "hwnd": int(acc.login_hwnd),
                     },
                 )
-                time.sleep(5)
+                self._push_command(
+                    vm,
+                    HostCommandType.SLEEP,
+                    {
+                        "account_login": acc.username,
+                        "duration_ms": 5000,
+                    },
+                )
                 self._push_command(
                     vm,
                     HostCommandType.WRITE_TEXT,
@@ -1043,7 +1358,6 @@ class Controller:
                     },
                 )
                 acc.auth_started = True
-                acc.auth_done = True
                 vm.status = VmStatus.LOGIN
                 self.logger.info(f"{vm.vm_id}: manual auth queued -> {acc.username}")
                 continue
@@ -1164,6 +1478,14 @@ class Controller:
             return
         if vm.windows_arranged or vm.windows_arrange_sent:
             return
+        if vm.windows_arrange_attempts >= self.max_window_arrange_attempts:
+            vm.windows_arranged = True
+            vm.windows_arrange_sent = False
+            self.logger.warning(
+                f"{vm.vm_id}: window arrangement skipped after "
+                f"{vm.windows_arrange_attempts} failed attempts"
+            )
+            return
 
         screen_w = int(vm.desktop_width or self.screen_w)
         screen_h = int(vm.desktop_height or self.screen_h)
@@ -1176,18 +1498,21 @@ class Controller:
         )
 
         for hwnd, (x, y) in positions.items():
-            self._push_command(
+            cmd = self._push_command(
                 vm,
                 HostCommandType.MOVE_WINDOW,
                 {
                     "hwnd": int(hwnd),
                     "x": int(x),
                     "y": int(y),
+                    "purpose": "arrange_dota_windows",
                 },
             )
+            vm.windows_arrange_pending_ids.append(cmd.id)
 
+        vm.windows_arrange_attempts += 1
         vm.windows_arrange_sent = True
-        vm.windows_arranged = True
+        vm.windows_arranged = False
 
         self.logger.info(
             f"{vm.vm_id}: queued arrange for {len(vm.dota_hwnds)} dota windows "
@@ -1298,9 +1623,10 @@ class Controller:
         message: str,
         payload: Optional[dict] = None,
     ) -> None:
-        vm = self.vms.get(vm_id)
-        if vm:
-            vm.last_log_ts = time.time()
+        with self._lock:
+            vm = self.vms.get(vm_id)
+            if vm:
+                vm.last_log_ts = time.time()
 
         line = f"[VMLOG][{vm_id}][{source}][{event}] {message}"
         if payload:
@@ -1328,37 +1654,38 @@ class Controller:
         return {acc.username: 0.0 for acc in accounts}
 
     def get_vm_rows(self) -> List[dict]:
-        rows = []
-        for vm in self.vms.values():
-            mm_stage = ""
-            if self.mm_starter is not None:
-                try:
-                    mm_stage = self.mm_starter.get_stage(vm.vm_id)
-                except Exception:
-                    mm_stage = ""
+        with self._lock:
+            rows = []
+            for vm in self.vms.values():
+                mm_stage = ""
+                if self.mm_starter is not None:
+                    try:
+                        mm_stage = self.mm_starter.get_stage(vm.vm_id)
+                    except Exception:
+                        mm_stage = ""
 
-            rows.append(
-                {
-                    "vm_id": vm.vm_id,
-                    "status": vm.status,
-                    "capacity": vm.capacity,
-                    "accounts": len(vm.assigned_accounts),
-                    "login_hwnds": len(vm.login_hwnds),
-                    "dota_hwnds": len(vm.dota_hwnds),
-                    "planner": vm.planner_active,
-                    "queue": len(vm.command_queue),
-                    "mm_stage": mm_stage,
-                    "arranged": vm.windows_arranged,
-                    "desktop": f"{vm.desktop_width}x{vm.desktop_height}",
-                    "sizes": str(vm.dota_window_sizes),
-                    "dota_pids": [
-                        acc.dota_pid
-                        for acc in vm.assigned_accounts
-                        if acc.dota_pid is not None
-                    ],
-                }
-            )
-        return rows
+                rows.append(
+                    {
+                        "vm_id": vm.vm_id,
+                        "status": vm.status,
+                        "capacity": vm.capacity,
+                        "accounts": len(vm.assigned_accounts),
+                        "login_hwnds": len(vm.login_hwnds),
+                        "dota_hwnds": len(vm.dota_hwnds),
+                        "planner": vm.planner_active,
+                        "queue": len(vm.command_queue),
+                        "mm_stage": mm_stage,
+                        "arranged": vm.windows_arranged,
+                        "desktop": f"{vm.desktop_width}x{vm.desktop_height}",
+                        "sizes": str(vm.dota_window_sizes),
+                        "dota_pids": [
+                            acc.dota_pid
+                            for acc in vm.assigned_accounts
+                            if acc.dota_pid is not None
+                        ],
+                    }
+                )
+            return rows
 
 
 _CONTROLLER_SINGLETON: Optional[Controller] = None
