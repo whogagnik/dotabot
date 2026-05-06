@@ -21,6 +21,13 @@ class GuiHandler(logging.Handler):
         self.max_queue_size = int(max_queue_size)
         self._queue: queue.Queue[str] = queue.Queue(maxsize=self.max_queue_size)
         self._closed = False
+        self._polling_started = False
+
+    def start_polling(self) -> None:
+        if self._closed or self._polling_started:
+            return
+
+        self._polling_started = True
         self._schedule_flush()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -78,4 +85,4 @@ class GuiHandler(logging.Handler):
         try:
             self.text_widget.after(self.flush_interval_ms, self._flush)
         except Exception:
-            self._closed = True
+            self._polling_started = False
