@@ -45,6 +45,7 @@ class HwndState:
     side: Optional[str] = None
     invite_accepted: bool = False
     invite_sent_ts: float = 0.0
+    latest_frame_ts: float = 0.0
     self_found: bool = False
     last_log_ts: float = 0.0
 
@@ -289,6 +290,10 @@ class StartMmDota2:
 
         self._frame_cache[(vm_id, hwnd_i)] = frame
 
+        state = self._vm.get(vm_id)
+        if state is not None and hwnd_i in state.windows:
+            state.windows[hwnd_i].latest_frame_ts = time.time()
+
     def _decode_capture_frame_result(self, result: Dict[str, Any]) -> Optional[np.ndarray]:
         image_b64 = (
             result.get("image_b64")
@@ -360,6 +365,11 @@ class StartMmDota2:
                 return None
 
         self._frame_cache[(vm_id, hwnd_i)] = arr
+
+        state = self._vm.get(vm_id)
+        if state is not None and hwnd_i in state.windows:
+            state.windows[hwnd_i].latest_frame_ts = time.time()
+
         return arr
 
     def _match(
@@ -823,6 +833,22 @@ class StartMmDota2:
                         continue
 
                     all_accepted = False
+                    frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+                    if frame is None or (
+                        w.invite_sent_ts > 0 and w.latest_frame_ts < w.invite_sent_ts
+                    ):
+                        if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
+                            state.inflight = True
+                        continue
+
+                    hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
+                    if hit:
+                        self._enqueue_focus(state.vm_id, hwnd)
+                        self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
+                        state.windows[hwnd].invite_accepted = True
+                        state.inflight = True
+                        return False
+
                     now = time.time()
                     if (
                         w.invite_sent_ts > 0
@@ -840,20 +866,6 @@ class StartMmDota2:
                         state.party_return_to_dota_pending = False
                         state.party_retry_invite_active = True
                         self._clear_frame(state.vm_id, leader)
-                        return False
-
-                    frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
-                    if frame is None:
-                        if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
-                            state.inflight = True
-                        continue
-
-                    hit = self._find_any(frame, ["accept_invite_ru", "accept_invite_eng"])
-                    if hit:
-                        self._enqueue_focus(state.vm_id, hwnd)
-                        self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
-                        state.windows[hwnd].invite_accepted = True
-                        state.inflight = True
                         return False
 
                     if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
