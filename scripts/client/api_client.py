@@ -92,7 +92,7 @@ class PlannerApiClient:
             "result": result,
         }
 
-        self._log(f"ack_command -> {self._sanitize_for_log(payload)}")
+        self._log(f"ack_command -> {self._sanitize_for_log(payload, max_string_len=300)}")
         resp = self.session.post(
             f"{self.base_url}/planner/ack-command",
             json=payload,
@@ -102,7 +102,7 @@ class PlannerApiClient:
         data = resp.json()
         self._log(f"ack_command <- {data}")
         return data
-    def _sanitize_for_log(self, value: Any) -> Any:
+    def _sanitize_for_log(self, value: Any, *, max_string_len: int = 1000) -> Any:
         try:
             if isinstance(value, dict):
                 out: dict[str, Any] = {}
@@ -113,12 +113,23 @@ class PlannerApiClient:
                     elif key in {"raw", "bytes"} and isinstance(v, (bytes, bytearray)):
                         out[key] = f"<bytes {len(v)}>"
                     else:
-                        out[key] = self._sanitize_for_log(v)
+                        out[key] = self._sanitize_for_log(
+                            v,
+                            max_string_len=max_string_len,
+                        )
                 return out
             if isinstance(value, list):
-                return [self._sanitize_for_log(v) for v in value]
+                return [
+                    self._sanitize_for_log(v, max_string_len=max_string_len)
+                    for v in value[:50]
+                ]
             if isinstance(value, tuple):
-                return tuple(self._sanitize_for_log(v) for v in value)
+                return tuple(
+                    self._sanitize_for_log(v, max_string_len=max_string_len)
+                    for v in value[:50]
+                )
+            if isinstance(value, str) and len(value) > max_string_len:
+                return f"{value[:max_string_len]}...<truncated {len(value)} chars>"
             return value
         except Exception:
             return "<unserializable>"
@@ -143,15 +154,15 @@ class PlannerApiClient:
             "payload": self._sanitize_for_log(payload or {}),
         }
 
-        self._log(f"send_log -> {body}")
+        self._log(f"send_log -> {self._sanitize_for_log(body, max_string_len=300)}")
         resp = self.session.post(
             f"{self.base_url}/planner/log",
             json=body,
-            timeout=self.timeout,
+            timeout=min(self.timeout, 2.0),
         )
         resp.raise_for_status()
         data = resp.json()
-        self._log(f"send_log -> {self._sanitize_for_log(data)}")
+        self._log(f"send_log -> {self._sanitize_for_log(data, max_string_len=300)}")
         return data
 
     def submit_frame_raw(

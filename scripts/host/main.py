@@ -367,15 +367,28 @@ class App(tk.Tk):
             return
 
         self._tick_stop.clear()
+        tick_error_count = 0
+        last_tick_error_log_ts = 0.0
 
         def loop():
+            nonlocal tick_error_count, last_tick_error_log_ts
             while not self._tick_stop.is_set():
                 try:
 
                     self.controller.tick_one()
+                    tick_error_count = 0
 
                 except Exception as e:
-                    self.logger.error(f"controller.tick_one error: {e}", exc_info=True)
+                    tick_error_count += 1
+                    now = time.time()
+                    min_interval = min(30.0, max(2.0, 0.25 * tick_error_count))
+                    if now - last_tick_error_log_ts >= min_interval:
+                        last_tick_error_log_ts = now
+                        self.logger.error(
+                            "controller.tick_one error: "
+                            f"{e}; failures={tick_error_count}",
+                            exc_info=True,
+                        )
                 time.sleep(0.02)
 
         self._tick_thread = threading.Thread(

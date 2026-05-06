@@ -95,10 +95,7 @@ class VmClient:
 
         return isinstance(
             exc,
-            (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ),
+            requests.exceptions.ConnectionError,
         )
 
     # ---------------------------------------------------------
