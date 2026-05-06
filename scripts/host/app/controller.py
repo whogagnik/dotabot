@@ -176,9 +176,6 @@ class Controller:
         self._next_command_id = 1
         self._next_vm_num = 1
         self._django_started = False
-        self._tick_error_count = 0
-        self._last_tick_error_log_ts = 0.0
-        self._mm_stage_log_state: Dict[str, tuple[str, float]] = {}
 
         self.batch_size = 5
         self.steam_path = r"C:\Program Files (x86)\Steam\steam.exe"
@@ -245,27 +242,13 @@ class Controller:
                 self._expire_stale_commands()
                 self.assign_batches_to_idle_vms()
                 self.drive_vm_bootstrap()
+                self.activate_planners_for_ready_vms()
                 self.mark_stale_vms()
 
-            self.activate_planners_for_ready_vms()
             planner_runtime.tick_all()
 
-            self._tick_error_count = 0
-
         except Exception as e:
-            self._tick_error_count += 1
-            now = time.time()
-            min_interval = min(30.0, max(2.0, 0.25 * self._tick_error_count))
-            if (
-                self._last_tick_error_log_ts <= 0
-                or now - self._last_tick_error_log_ts >= min_interval
-            ):
-                self._last_tick_error_log_ts = now
-                self.logger.error(
-                    "controller.tick_one failed: "
-                    f"{e}; failures={self._tick_error_count}",
-                    exc_info=True,
-                )
+            self.logger.error(f"controller.tick_one failed: {e}", exc_info=True)
 
     def _command_timeout_sec(
         self,
@@ -1686,15 +1669,6 @@ class Controller:
             f"desktop={screen_w}x{screen_h} sizes={vm.dota_window_sizes}"
         )
 
-    def _log_mm_stage_waiting(self, vm_id: str, stage: str) -> None:
-        now = time.time()
-        prev_stage, prev_ts = self._mm_stage_log_state.get(vm_id, ("", 0.0))
-        if prev_stage == stage and now - prev_ts < 2.0:
-            return
-
-        self._mm_stage_log_state[vm_id] = (stage, now)
-        self.logger.info(f"{vm_id}: MM not ready yet, stage={stage}")
-
     def activate_planners_for_ready_vms(self) -> None:
         for vm in self.vms.values():
             if vm.planner_active:
@@ -1769,7 +1743,9 @@ class Controller:
                 mm_stage_after = self.mm_starter.get_stage(vm.vm_id)
 
                 if not mm_ready or mm_stage_after != "done":
-                    self._log_mm_stage_waiting(vm.vm_id, mm_stage_after)
+                    self.logger.info(
+                        f"{vm.vm_id}: MM not ready yet, stage={mm_stage_after}"
+                    )
                     continue
 
             roles = vm.roles or (["unknown"] * len(vm.dota_hwnds))

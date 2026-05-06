@@ -26,9 +26,6 @@ class PlannerApiClient:
         if self.debug:
             print(f"[API] {message}", flush=True)
 
-    def reset_registration(self) -> None:
-        self.vm_id = None
-
     def register_vm(self) -> dict[str, Any]:
         self._log("register_vm -> {}")
 
@@ -92,7 +89,17 @@ class PlannerApiClient:
             "result": result,
         }
 
-        self._log(f"ack_command -> {self._sanitize_for_log(payload, max_string_len=300)}")
+        log_payload = payload
+        try:
+            if isinstance(result, dict) and "image_b64" in result:
+                safe_result = dict(result)
+                safe_result["image_b64"] = f"<base64 {len(result.get('image_b64') or '')} chars>"
+                log_payload = dict(payload)
+                log_payload["result"] = safe_result
+        except Exception:
+            pass
+
+        self._log(f"ack_command -> {log_payload}")
         resp = self.session.post(
             f"{self.base_url}/planner/ack-command",
             json=payload,
@@ -102,7 +109,7 @@ class PlannerApiClient:
         data = resp.json()
         self._log(f"ack_command <- {data}")
         return data
-    def _sanitize_for_log(self, value: Any, *, max_string_len: int = 1000) -> Any:
+    def _sanitize_for_log(self, value: Any) -> Any:
         try:
             if isinstance(value, dict):
                 out: dict[str, Any] = {}
@@ -113,23 +120,12 @@ class PlannerApiClient:
                     elif key in {"raw", "bytes"} and isinstance(v, (bytes, bytearray)):
                         out[key] = f"<bytes {len(v)}>"
                     else:
-                        out[key] = self._sanitize_for_log(
-                            v,
-                            max_string_len=max_string_len,
-                        )
+                        out[key] = self._sanitize_for_log(v)
                 return out
             if isinstance(value, list):
-                return [
-                    self._sanitize_for_log(v, max_string_len=max_string_len)
-                    for v in value[:50]
-                ]
+                return [self._sanitize_for_log(v) for v in value]
             if isinstance(value, tuple):
-                return tuple(
-                    self._sanitize_for_log(v, max_string_len=max_string_len)
-                    for v in value[:50]
-                )
-            if isinstance(value, str) and len(value) > max_string_len:
-                return f"{value[:max_string_len]}...<truncated {len(value)} chars>"
+                return tuple(self._sanitize_for_log(v) for v in value)
             return value
         except Exception:
             return "<unserializable>"
@@ -154,15 +150,15 @@ class PlannerApiClient:
             "payload": self._sanitize_for_log(payload or {}),
         }
 
-        self._log(f"send_log -> {self._sanitize_for_log(body, max_string_len=300)}")
+        self._log(f"send_log -> {body}")
         resp = self.session.post(
             f"{self.base_url}/planner/log",
             json=body,
-            timeout=min(self.timeout, 2.0),
+            timeout=self.timeout,
         )
         resp.raise_for_status()
         data = resp.json()
-        self._log(f"send_log -> {self._sanitize_for_log(data, max_string_len=300)}")
+        self._log(f"send_log -> {self._sanitize_for_log(data)}")
         return data
 
     def submit_frame_raw(

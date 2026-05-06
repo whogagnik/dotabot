@@ -55,31 +55,6 @@ class ClientLoggingTests(unittest.TestCase):
         )
         self.assertNotIn(raw_b64, str(kwargs["json"]))
 
-    def test_send_log_uses_short_timeout_and_truncates_debug_payload(self):
-        client = api_client_mod.PlannerApiClient(
-            base_url="http://host",
-            timeout=15.0,
-            debug=True,
-        )
-        client.vm_id = "vm_1"
-
-        long_traceback = "T" * 5000
-        client.send_log(
-            level="error",
-            source="client",
-            event="client_tick_failed",
-            message="Unhandled exception in client loop",
-            payload={"traceback": long_traceback},
-        )
-
-        _, kwargs = client.session.posts[-1]
-
-        self.assertEqual(kwargs["timeout"], 2.0)
-        self.assertEqual(
-            kwargs["json"]["payload"]["traceback"],
-            f"{long_traceback[:1000]}...<truncated 5000 chars>",
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
