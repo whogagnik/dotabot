@@ -67,6 +67,9 @@ class VmMmState:
     party_search_clicked: bool = False
     party_add_done: bool = False
     party_accept_done: bool = False
+    party_invite_index: int = 1
+    party_return_to_dota_pending: bool = False
+    party_invited_indices: List[int] = field(default_factory=list)
 
 
 class StartMmDota2:
@@ -687,24 +690,76 @@ class StartMmDota2:
             return False
 
         if not state.party_add_done:
-            # Если friend_id нет — пока считаем party_add_done, чтобы не зависать.
-            if not friend_ids or len(friend_ids) <= 1 or not friend_ids[1]:
-                self.log.warning(f"[MM] {state.vm_id}: no friend_id for party invite, skip invite")
+            between_invites_sleep_ms = 2500
+
+            if state.party_return_to_dota_pending:
+                dota_hit = self._match(frame, "dota", confidence=0.75)
+                if dota_hit:
+                    self._enqueue_focus(state.vm_id, leader)
+                    self._enqueue_click(state.vm_id, leader, dota_hit["x"], dota_hit["y"])
+                    self._enqueue_sleep(state.vm_id, between_invites_sleep_ms)
+
+                    state.party_return_to_dota_pending = False
+                    state.party_search_clicked = False
+                    state.party_invite_index += 1
+
+                    if state.party_invite_index >= len(state.hwnds):
+                        state.party_add_done = True
+                    else:
+                        state.party_search_done = False
+
+                    state.inflight = True
+
+                    if self._enqueue_capture(state.vm_id, leader, purpose="build_party_after_dota"):
+                        state.inflight = True
+
+                    self.log.info(
+                        f"[MM] {state.vm_id}: returned to dota after party invite "
+                        f"next_index={state.party_invite_index}"
+                    )
+                    return False
+
+                if self._enqueue_capture(state.vm_id, leader, purpose="build_party_find_dota"):
+                    state.inflight = True
+                return False
+
+            if state.party_invite_index >= len(state.hwnds):
                 state.party_add_done = True
                 return False
 
+            current_friend_id = None
+            if friend_ids and state.party_invite_index < len(friend_ids):
+                current_friend_id = friend_ids[state.party_invite_index]
+
+            if not current_friend_id:
+                self.log.warning(
+                    f"[MM] {state.vm_id}: no friend_id for party invite "
+                    f"index={state.party_invite_index}, skip invite"
+                )
+                state.party_invite_index += 1
+                state.party_search_clicked = False
+                state.party_search_done = False
+
+                if self._enqueue_capture(state.vm_id, leader, purpose="build_party_skip_missing_friend_id"):
+                    state.inflight = True
+                return False
+
+            current_friend_id = str(current_friend_id)
+
             self._enqueue_focus(state.vm_id, leader)
+            state.inflight = True
 
             if not state.party_search_clicked:
                 field_hit = self._find_any(frame, ["id_field_ru", "id_field_eng"])
                 if field_hit:
                     self._enqueue_click(state.vm_id, leader, field_hit["x"], field_hit["y"])
                     self._enqueue_sleep(state.vm_id, 1000)
-                    self._enqueue_write(state.vm_id, leader, str(friend_ids[1]), clear_before=True)
+                    self._enqueue_write(state.vm_id, leader, current_friend_id, clear_before=True)
 
                     search_hit = self._find_any(frame, ["search_ru", "search_eng"])
                     if search_hit:
                         self._enqueue_click(state.vm_id, leader, search_hit["x"], search_hit["y"])
+                        self._enqueue_sleep(state.vm_id, between_invites_sleep_ms)
                         state.party_search_clicked = True
                         if self._enqueue_capture(state.vm_id, leader, purpose="build_party_after_search"):
                             state.inflight = True
@@ -717,8 +772,19 @@ class StartMmDota2:
             add_hit = self._match(frame, "add")
             if add_hit:
                 self._enqueue_click(state.vm_id, leader, add_hit["x"], add_hit["y"])
+                self._enqueue_sleep(state.vm_id, between_invites_sleep_ms)
+
+                if state.party_invite_index not in state.party_invited_indices:
+                    state.party_invited_indices.append(state.party_invite_index)
+
+                state.party_return_to_dota_pending = True
                 state.inflight = True
-                state.party_add_done = True
+                if self._enqueue_capture(state.vm_id, leader, purpose="build_party_after_add"):
+                    state.inflight = True
+                self.log.info(
+                    f"[MM] {state.vm_id}: sent party invite "
+                    f"index={state.party_invite_index} friend_id={current_friend_id}"
+                )
                 return False
 
             if self._enqueue_capture(state.vm_id, leader, purpose="build_party_find_add"):
@@ -726,7 +792,11 @@ class StartMmDota2:
             return False
 
         if not state.party_accept_done:
-            member_hwnds = state.hwnds[1:]
+            member_hwnds = [
+                state.hwnds[i]
+                for i in state.party_invited_indices
+                if 0 <= i < len(state.hwnds)
+            ]
             if not member_hwnds:
                 state.party_accept_done = True
             else:
