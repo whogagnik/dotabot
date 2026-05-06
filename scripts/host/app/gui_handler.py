@@ -20,7 +20,8 @@ class GuiHandler(logging.Handler):
         self.max_batch = int(max_batch)
         self.max_queue_size = int(max_queue_size)
         self._queue: queue.Queue[str] = queue.Queue(maxsize=self.max_queue_size)
-        self._flush_scheduled = False
+        self._closed = False
+        self._schedule_flush()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -35,16 +36,11 @@ class GuiHandler(logging.Handler):
         except Exception:
             return
 
-        if not self._flush_scheduled:
-            self._flush_scheduled = True
-            try:
-                self.text_widget.after(self.flush_interval_ms, self._flush)
-            except Exception:
-                self._flush_scheduled = False
+    def close(self) -> None:
+        self._closed = True
+        super().close()
 
     def _flush(self) -> None:
-        self._flush_scheduled = False
-
         lines: list[str] = []
         for _ in range(self.max_batch):
             try:
@@ -55,6 +51,7 @@ class GuiHandler(logging.Handler):
                 break
 
         if not lines:
+            self._schedule_flush()
             return
 
         try:
@@ -71,10 +68,14 @@ class GuiHandler(logging.Handler):
         except Exception:
             pass
 
-        # если очередь ещё не пуста — планируем следующую пачку
-        if not self._queue.empty():
-            self._flush_scheduled = True
-            try:
-                self.text_widget.after(self.flush_interval_ms, self._flush)
-            except Exception:
-                self._flush_scheduled = False
+        # Only the Tk thread schedules and flushes GUI updates.
+        self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        if self._closed:
+            return
+
+        try:
+            self.text_widget.after(self.flush_interval_ms, self._flush)
+        except Exception:
+            self._closed = True
