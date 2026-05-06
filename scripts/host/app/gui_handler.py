@@ -7,12 +7,19 @@ import tkinter as tk
 
 
 class GuiHandler(logging.Handler):
-    def __init__(self, text_widget: tk.Text, flush_interval_ms: int = 100, max_batch: int = 200):
+    def __init__(
+        self,
+        text_widget: tk.Text,
+        flush_interval_ms: int = 100,
+        max_batch: int = 200,
+        max_queue_size: int = 5000,
+    ):
         super().__init__()
         self.text_widget = text_widget
         self.flush_interval_ms = int(flush_interval_ms)
         self.max_batch = int(max_batch)
-        self._queue: queue.Queue[str] = queue.Queue()
+        self.max_queue_size = int(max_queue_size)
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=self.max_queue_size)
         self._flush_scheduled = False
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -23,6 +30,8 @@ class GuiHandler(logging.Handler):
 
         try:
             self._queue.put_nowait(msg)
+        except queue.Full:
+            return
         except Exception:
             return
 

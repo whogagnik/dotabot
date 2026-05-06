@@ -176,6 +176,8 @@ class Controller:
         self._next_command_id = 1
         self._next_vm_num = 1
         self._django_started = False
+        self._tick_error_count = 0
+        self._last_tick_error_log_ts = 0.0
 
         self.batch_size = 5
         self.steam_path = r"C:\Program Files (x86)\Steam\steam.exe"
@@ -247,8 +249,22 @@ class Controller:
 
             planner_runtime.tick_all()
 
+            self._tick_error_count = 0
+
         except Exception as e:
-            self.logger.error(f"controller.tick_one failed: {e}", exc_info=True)
+            self._tick_error_count += 1
+            now = time.time()
+            min_interval = min(30.0, max(2.0, 0.25 * self._tick_error_count))
+            if (
+                self._last_tick_error_log_ts <= 0
+                or now - self._last_tick_error_log_ts >= min_interval
+            ):
+                self._last_tick_error_log_ts = now
+                self.logger.error(
+                    "controller.tick_one failed: "
+                    f"{e}; failures={self._tick_error_count}",
+                    exc_info=True,
+                )
 
     def _command_timeout_sec(
         self,

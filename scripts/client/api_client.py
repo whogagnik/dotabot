@@ -26,6 +26,9 @@ class PlannerApiClient:
         if self.debug:
             print(f"[API] {message}", flush=True)
 
+    def reset_registration(self) -> None:
+        self.vm_id = None
+
     def register_vm(self) -> dict[str, Any]:
         self._log("register_vm -> {}")
 
@@ -89,17 +92,7 @@ class PlannerApiClient:
             "result": result,
         }
 
-        log_payload = payload
-        try:
-            if isinstance(result, dict) and "image_b64" in result:
-                safe_result = dict(result)
-                safe_result["image_b64"] = f"<base64 {len(result.get('image_b64') or '')} chars>"
-                log_payload = dict(payload)
-                log_payload["result"] = safe_result
-        except Exception:
-            pass
-
-        self._log(f"ack_command -> {log_payload}")
+        self._log(f"ack_command -> {self._sanitize_for_log(payload)}")
         resp = self.session.post(
             f"{self.base_url}/planner/ack-command",
             json=payload,
