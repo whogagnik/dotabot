@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from threading import RLock
 from typing import Dict, Optional, List
@@ -16,6 +17,9 @@ class PlannerRuntimeEntry:
     hwnds: Optional[List[int]] = None
     roles: Optional[List[str]] = None
     side: str = "radiant"
+    tick_fail_count: int = 0
+    last_tick_error_log_ts: float = 0.0
+    next_tick_after_ts: float = 0.0
 
 
 class PlannerRuntimeRegistry:
@@ -128,14 +132,39 @@ class PlannerRuntimeRegistry:
             planner = entry.planner
             if planner is None:
                 continue
+            now = time.time()
+            if entry.next_tick_after_ts > now:
+                continue
 
             try:
                 planner.tick_one()
+                entry.tick_fail_count = 0
+                entry.next_tick_after_ts = 0.0
             except Exception:
+                entry.tick_fail_count += 1
+                cooldown_sec = min(5.0, 0.25 * entry.tick_fail_count)
+                now = time.time()
+                entry.next_tick_after_ts = now + cooldown_sec
+
+                should_log = (
+                    entry.last_tick_error_log_ts <= 0
+                    or now - entry.last_tick_error_log_ts >= min(
+                        30.0,
+                        max(2.0, cooldown_sec),
+                    )
+                )
+                if not should_log:
+                    continue
+
+                entry.last_tick_error_log_ts = now
                 # наружу не роняем весь цикл
                 if getattr(planner, "log", None):
                     try:
-                        planner.log.exception(f"[planner_runtime] tick failed for vm_id={entry.vm_id}")
+                        planner.log.exception(
+                            "[planner_runtime] tick failed for "
+                            f"vm_id={entry.vm_id}; failures={entry.tick_fail_count}; "
+                            f"cooldown={cooldown_sec:.2f}s"
+                        )
                     except Exception:
                         pass
 
