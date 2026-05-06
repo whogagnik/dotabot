@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from scripts.host.core.config import MM_PARTY_INVITE_TIMEOUT_SEC
 from scripts.host.game.planner_runtime import planner_runtime
 
 
@@ -43,6 +44,7 @@ class HwndState:
     dota_ready: bool = False
     side: Optional[str] = None
     invite_accepted: bool = False
+    invite_sent_ts: float = 0.0
     self_found: bool = False
     last_log_ts: float = 0.0
 
@@ -70,6 +72,7 @@ class VmMmState:
     party_invite_index: int = 1
     party_return_to_dota_pending: bool = False
     party_invited_indices: List[int] = field(default_factory=list)
+    party_retry_invite_active: bool = False
 
 
 class StartMmDota2:
@@ -676,19 +679,6 @@ class StartMmDota2:
                 state.inflight = True
             return False
 
-        if not state.party_search_done:
-            hit_add_party = self._match(frame, "add_party")
-            if hit_add_party:
-                self._enqueue_focus(state.vm_id, leader)
-                self._enqueue_click(state.vm_id, leader, hit_add_party["x"], hit_add_party["y"])
-                state.inflight = True
-                state.party_search_done = True
-                return False
-
-            if self._enqueue_capture(state.vm_id, leader, purpose="build_party_find_add_party"):
-                state.inflight = True
-            return False
-
         if not state.party_add_done:
             between_invites_sleep_ms = 2500
 
@@ -701,12 +691,18 @@ class StartMmDota2:
 
                     state.party_return_to_dota_pending = False
                     state.party_search_clicked = False
-                    state.party_invite_index += 1
 
-                    if state.party_invite_index >= len(state.hwnds):
+                    if state.party_retry_invite_active:
+                        state.party_retry_invite_active = False
                         state.party_add_done = True
+                        state.party_invite_index = len(state.hwnds)
                     else:
-                        state.party_search_done = False
+                        state.party_invite_index += 1
+
+                        if state.party_invite_index >= len(state.hwnds):
+                            state.party_add_done = True
+                        else:
+                            state.party_search_done = False
 
                     state.inflight = True
 
@@ -746,10 +742,23 @@ class StartMmDota2:
 
             current_friend_id = str(current_friend_id)
 
-            self._enqueue_focus(state.vm_id, leader)
-            state.inflight = True
+            if not state.party_search_done:
+                hit_add_party = self._match(frame, "add_party")
+                if hit_add_party:
+                    self._enqueue_focus(state.vm_id, leader)
+                    self._enqueue_click(state.vm_id, leader, hit_add_party["x"], hit_add_party["y"])
+                    state.inflight = True
+                    state.party_search_done = True
+                    return False
+
+                if self._enqueue_capture(state.vm_id, leader, purpose="build_party_find_add_party"):
+                    state.inflight = True
+                return False
 
             if not state.party_search_clicked:
+                self._enqueue_focus(state.vm_id, leader)
+                state.inflight = True
+
                 field_hit = self._find_any(frame, ["id_field_ru", "id_field_eng"])
                 if field_hit:
                     self._enqueue_click(state.vm_id, leader, field_hit["x"], field_hit["y"])
@@ -771,8 +780,14 @@ class StartMmDota2:
 
             add_hit = self._match(frame, "add")
             if add_hit:
+                self._enqueue_focus(state.vm_id, leader)
                 self._enqueue_click(state.vm_id, leader, add_hit["x"], add_hit["y"])
                 self._enqueue_sleep(state.vm_id, between_invites_sleep_ms)
+
+                if 0 <= state.party_invite_index < len(state.hwnds):
+                    invite_hwnd = state.hwnds[state.party_invite_index]
+                    state.windows[invite_hwnd].invite_sent_ts = time.time()
+                    state.windows[invite_hwnd].invite_accepted = False
 
                 if state.party_invite_index not in state.party_invited_indices:
                     state.party_invited_indices.append(state.party_invite_index)
@@ -792,21 +807,41 @@ class StartMmDota2:
             return False
 
         if not state.party_accept_done:
-            member_hwnds = [
-                state.hwnds[i]
-                for i in state.party_invited_indices
-                if 0 <= i < len(state.hwnds)
+            member_indices = [
+                i for i in state.party_invited_indices if 0 <= i < len(state.hwnds)
             ]
-            if not member_hwnds:
+            if not member_indices:
                 state.party_accept_done = True
             else:
                 all_accepted = True
 
-                for hwnd in member_hwnds:
-                    if state.windows[hwnd].invite_accepted:
+                for member_index in member_indices:
+                    hwnd = state.hwnds[member_index]
+                    w = state.windows[hwnd]
+
+                    if w.invite_accepted:
                         continue
 
                     all_accepted = False
+                    now = time.time()
+                    if (
+                        w.invite_sent_ts > 0
+                        and now - w.invite_sent_ts >= MM_PARTY_INVITE_TIMEOUT_SEC
+                    ):
+                        self.log.warning(
+                            f"[MM] {state.vm_id}: party invite timeout "
+                            f"index={member_index} hwnd={hex(hwnd)} "
+                            f"timeout={MM_PARTY_INVITE_TIMEOUT_SEC:.1f}s, retry invite"
+                        )
+                        state.party_invite_index = member_index
+                        state.party_search_done = False
+                        state.party_search_clicked = False
+                        state.party_add_done = False
+                        state.party_return_to_dota_pending = False
+                        state.party_retry_invite_active = True
+                        self._clear_frame(state.vm_id, leader)
+                        return False
+
                     frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
                     if frame is None:
                         if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
