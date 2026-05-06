@@ -92,6 +92,7 @@ class App(tk.Tk):
         self._build_mid()
         self._build_bottom()
 
+        self.after(0, self._start_gui_log_polling)
         self.refresh_accounts_table()
         self.after(1000, self._refresh_vm_table_loop)
 
@@ -298,6 +299,11 @@ class App(tk.Tk):
     # ---------------------------------------------------------
     # django boot
     # ---------------------------------------------------------
+
+    def _start_gui_log_polling(self):
+        for handler in self.logger.handlers:
+            if isinstance(handler, GuiHandler):
+                handler.start_polling()
 
     def _start_django_server_on_boot(self):
         try:

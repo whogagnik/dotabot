@@ -34,7 +34,6 @@ class GuiHandlerTests(unittest.TestCase):
     def test_emit_only_queues_and_does_not_schedule_tk_from_caller(self):
         widget = FakeTextWidget()
         handler = GuiHandler(widget, flush_interval_ms=100, max_batch=10)
-        initial_after_count = len(widget.after_calls)
 
         record = logging.LogRecord(
             name="test",
@@ -48,13 +47,16 @@ class GuiHandlerTests(unittest.TestCase):
 
         handler.emit(record)
 
-        self.assertEqual(len(widget.after_calls), initial_after_count)
+        self.assertEqual(widget.after_calls, [])
+
+        handler.start_polling()
+        self.assertEqual(len(widget.after_calls), 1)
 
         _, callback = widget.after_calls.pop(0)
         callback()
 
         self.assertEqual(widget.inserts, [("end", "hello\n")])
-        self.assertEqual(len(widget.after_calls), initial_after_count)
+        self.assertEqual(len(widget.after_calls), 1)
 
 
 if __name__ == "__main__":
