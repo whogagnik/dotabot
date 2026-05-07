@@ -813,6 +813,27 @@ class StartMmDota2:
                 )
                 return False
 
+            invite_pop_hit = self._match(frame, "invite_pop")
+            if invite_pop_hit:
+                self._enqueue_focus(state.vm_id, leader)
+                self._enqueue_click(
+                    state.vm_id,
+                    leader,
+                    invite_pop_hit["x"],
+                    invite_pop_hit["y"],
+                )
+                self._enqueue_sleep(state.vm_id, 1000)
+                state.inflight = True
+
+                if self._enqueue_capture(state.vm_id, leader, purpose="build_party_after_invite_pop"):
+                    state.inflight = True
+
+                self.log.info(
+                    f"[MM] {state.vm_id}: add button not found, clicked invite_pop "
+                    f"index={state.party_invite_index} friend_id={current_friend_id}"
+                )
+                return False
+
             if self._enqueue_capture(state.vm_id, leader, purpose="build_party_find_add"):
                 state.inflight = True
             return False

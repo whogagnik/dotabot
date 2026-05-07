@@ -1676,6 +1676,14 @@ class Controller:
                 },
             )
             vm.windows_arrange_pending_ids.append(cmd.id)
+            self._push_command(
+                vm,
+                HostCommandType.FOCUS_WINDOW,
+                {
+                    "hwnd": int(hwnd),
+                    "purpose": "arrange_dota_windows",
+                },
+            )
 
         vm.windows_arrange_attempts += 1
         vm.windows_arrange_sent = True
