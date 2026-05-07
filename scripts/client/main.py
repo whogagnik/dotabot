@@ -13,7 +13,7 @@ from executor import CommandExecutor
 
 
 HOST_URL = "http://192.168.217.1:8000"
-DEBUG = os.environ.get("DOTABOT_CLIENT_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+DEBUG = True
 
 
 class VmClient:
