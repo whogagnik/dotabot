@@ -373,6 +373,15 @@ class ControllerStabilityTests(unittest.TestCase):
         self.assertFalse(vm.windows_arranged)
         self.assertTrue(vm.windows_arrange_sent)
         self.assertEqual(len(vm.windows_arrange_pending_ids), 2)
+        self.assertEqual(
+            [cmd.type for cmd in vm.command_queue],
+            [
+                controller_mod.HostCommandType.MOVE_WINDOW,
+                controller_mod.HostCommandType.FOCUS_WINDOW,
+                controller_mod.HostCommandType.MOVE_WINDOW,
+                controller_mod.HostCommandType.FOCUS_WINDOW,
+            ],
+        )
 
         first = vm.command_queue[0]
         first.status = "done"
@@ -382,6 +391,11 @@ class ControllerStabilityTests(unittest.TestCase):
         self.assertFalse(vm.windows_arranged)
         self.assertTrue(vm.windows_arrange_sent)
 
+        focus_first = vm.command_queue[0]
+        focus_first.status = "done"
+        focus_first.result = {}
+        self.controller._handle_command_result(vm, focus_first)
+
         second = vm.command_queue[0]
         second.status = "done"
         second.result = {}
@@ -389,6 +403,12 @@ class ControllerStabilityTests(unittest.TestCase):
 
         self.assertTrue(vm.windows_arranged)
         self.assertFalse(vm.windows_arrange_sent)
+
+        focus_second = vm.command_queue[0]
+        focus_second.status = "done"
+        focus_second.result = {}
+        self.controller._handle_command_result(vm, focus_second)
+
         self.assertEqual(vm.command_queue, [])
 
 
