@@ -32,6 +32,10 @@ except ImportError as e:
     ) from e
 
 
+ROLE_NAMES = ["Carry", "Mid", "Offlane", "Support", "Hard Support"]
+ROLE_RE = r"(Hard Support|Support|Offlane|Mid|Carry)"
+
+
 @dataclass
 class BuildItem:
     name: str
@@ -65,6 +69,7 @@ class HeroBuild:
 def _log(logger, level: str, msg: str) -> None:
     if logger is None:
         return
+
     fn = getattr(logger, level, None)
     if callable(fn):
         fn(msg)
@@ -82,6 +87,21 @@ def _hero_url_part(hero_name: str) -> str:
     return quote(hero_name.strip(), safe="")
 
 
+def _extract_hero_name(item: Any) -> str:
+    if isinstance(item, str):
+        return item.strip()
+
+    if isinstance(item, dict):
+        for key in ("hero", "hero_name", "localized_name", "name", "display_name"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        raise ValueError(f"Cannot extract hero name from dict: {item}")
+
+    raise ValueError(f"Unsupported hero item type: {type(item).__name__}: {item}")
+
+
 def _make_session(referer: str):
     session = cloudscraper.create_scraper(
         browser={
@@ -90,9 +110,11 @@ def _make_session(referer: str):
             "mobile": False,
         }
     )
+
     headers = dict(DEFAULT_HEADERS)
     headers["Referer"] = referer
     session.headers.update(headers)
+
     return session
 
 
@@ -123,7 +145,8 @@ def _request_html(session, url: str, logger=None) -> str:
                 _log(
                     logger,
                     "warning",
-                    f"[builds] status={r.status_code} for {url}; retry in {wait:.1f}s; body={snippet}",
+                    f"[builds] status={r.status_code} for {url}; "
+                    f"retry in {wait:.1f}s; body={snippet}",
                 )
                 time.sleep(wait)
                 continue
@@ -206,6 +229,7 @@ def _is_bad_item_name(name: str) -> bool:
         "Different common options",
         "Builds Meta Analysis Matchups & Synergies Item Stats Off-Meta Builds",
     }
+
     if name in bad_exact:
         return True
 
@@ -244,6 +268,7 @@ def _dedupe_items(items: List[BuildItem]) -> List[BuildItem]:
         key = item.name.strip().lower()
         if not key or key in seen:
             continue
+
         seen.add(key)
         out.append(item)
 
@@ -253,12 +278,15 @@ def _dedupe_items(items: List[BuildItem]) -> List[BuildItem]:
 def _dedupe_names(items: List[str]) -> List[str]:
     out: List[str] = []
     seen = set()
+
     for item in items:
         key = item.strip().lower()
         if not key or key in seen:
             continue
+
         seen.add(key)
         out.append(item)
+
     return out
 
 
@@ -280,6 +308,159 @@ def _looks_like_matches(line: str) -> bool:
     )
 
 
+def _parse_int(text: str) -> Optional[int]:
+    text = _collapse_ws(text).replace(",", "")
+    if not re.fullmatch(r"\d+", text):
+        return None
+
+    return int(text)
+
+
+def _normalize_role(role: Optional[str]) -> Optional[str]:
+    if not role:
+        return None
+
+    role = _collapse_ws(role)
+    role = re.sub(r"^Image:\s*", "", role, flags=re.IGNORECASE).strip()
+
+    aliases = {
+        "carry": "Carry",
+        "mid": "Mid",
+        "offlane": "Offlane",
+        "support": "Support",
+        "hard support": "Hard Support",
+    }
+
+    return aliases.get(role.lower())
+
+
+def _line_to_role(line: str) -> Optional[str]:
+    line = _collapse_ws(line)
+    line = re.sub(r"^Image:\s*", "", line, flags=re.IGNORECASE).strip()
+
+    return _normalize_role(line)
+
+
+def _extract_most_popular_role_from_text(page_text: str) -> Optional[str]:
+    """
+    Основной способ.
+
+    На Dota2ProTracker блок обычно выглядит так:
+    Most Played
+    Image: Carry
+    Carry
+    351
+    matches
+
+    Поэтому ищем роль сразу после Most Played.
+    """
+
+    patterns = [
+        rf"Most Played\s*(?:Image:\s*)?{ROLE_RE}\b",
+        rf"Most Played[\s\S]{{0,120}}?(?:Image:\s*)?{ROLE_RE}\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, page_text, flags=re.IGNORECASE)
+        if m:
+            role = _normalize_role(m.group(1))
+            if role:
+                return role
+
+    return None
+
+
+def _extract_build_role_from_text(page_text: str) -> Optional[str]:
+    """
+    Fallback по заголовку основного билда.
+
+    На странице бывает:
+    Alchemist stats for Image: Carry Carry
+    """
+
+    patterns = [
+        rf"stats for\s*(?:Image:\s*)?{ROLE_RE}\b",
+        rf"stats for[\s\S]{{0,80}}?(?:Image:\s*)?{ROLE_RE}\b",
+        rf"Match History for[\s\S]{{0,120}}?-\s*(?:Image:\s*)?{ROLE_RE}\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, page_text, flags=re.IGNORECASE)
+        if m:
+            role = _normalize_role(m.group(1))
+            if role:
+                return role
+
+    return None
+
+
+def _extract_most_popular_role_from_lines(lines: List[str]) -> Optional[str]:
+    """
+    Дополнительный fallback.
+
+    1. Ищет строку Most Played.
+    2. После нее ищет ближайшую роль.
+    3. Если не нашел, считает matches по ролям и берет максимальную.
+    """
+
+    for i, line in enumerate(lines):
+        if _collapse_ws(line).lower() != "most played":
+            continue
+
+        for candidate in lines[i + 1 : i + 12]:
+            role = _line_to_role(candidate)
+            if role:
+                return role
+
+    role_rows: List[Dict[str, Any]] = []
+
+    for i, line in enumerate(lines):
+        role = _line_to_role(line)
+        if not role:
+            continue
+
+        matches: Optional[int] = None
+        winrate: Optional[str] = None
+
+        for candidate in lines[i + 1 : i + 8]:
+            candidate_clean = _collapse_ws(candidate)
+
+            if _line_to_role(candidate_clean):
+                break
+
+            if matches is None:
+                maybe_matches = _parse_int(candidate_clean)
+                if maybe_matches is not None:
+                    matches = maybe_matches
+                    continue
+
+            if winrate is None and _looks_like_percent(candidate_clean):
+                winrate = candidate_clean
+
+        if matches is not None:
+            role_rows.append(
+                {
+                    "role": role,
+                    "matches": matches,
+                    "winrate": winrate,
+                }
+            )
+
+    if not role_rows:
+        return None
+
+    role_rows.sort(key=lambda x: x["matches"], reverse=True)
+    return role_rows[0]["role"]
+
+
+def _extract_best_role(page_text: str, lines: List[str]) -> Optional[str]:
+    return (
+        _extract_most_popular_role_from_text(page_text)
+        or _extract_build_role_from_text(page_text)
+        or _extract_most_popular_role_from_lines(lines)
+    )
+
+
 def _parse_starting_stats_line(line: str) -> tuple[Optional[str], Optional[str]]:
     line = _collapse_ws(line)
     m = re.search(
@@ -287,8 +468,10 @@ def _parse_starting_stats_line(line: str) -> tuple[Optional[str], Optional[str]]
         line,
         flags=re.IGNORECASE,
     )
+
     if not m:
         return None, None
+
     return f"{m.group(1)} matches", f"{m.group(2)}%"
 
 
@@ -297,23 +480,16 @@ def _extract_patch(page_text: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _extract_role(page_text: str) -> Optional[str]:
-    m = re.search(
-        r"stats for .*?\b(Hard Support|Support|Offlane|Mid|Carry)\b",
-        page_text,
-        flags=re.IGNORECASE,
-    )
-    return _collapse_ws(m.group(1)) if m else None
-
-
 def _extract_item_stats_section(lines: List[str]) -> List[str]:
     item_stats_indices = [
         i for i, line in enumerate(lines) if _collapse_ws(line).lower() == "item stats"
     ]
+
     if not item_stats_indices:
         return []
 
     start_idx = item_stats_indices[-1] + 1
+
     end_markers = {
         "Matchups & Synergies",
         "Off-Meta Builds",
@@ -326,6 +502,7 @@ def _extract_item_stats_section(lines: List[str]) -> List[str]:
     for line in lines[start_idx:]:
         if line in end_markers:
             break
+
         section.append(line)
 
     return section
@@ -333,10 +510,12 @@ def _extract_item_stats_section(lines: List[str]) -> List[str]:
 
 def _find_heading_tag(soup: BeautifulSoup, heading_text: str) -> Optional[Tag]:
     pattern = re.compile(rf"^\s*{re.escape(heading_text)}\s*$", flags=re.IGNORECASE)
+
     for tag in soup.find_all(True):
         text = _collapse_ws(tag.get_text(" ", strip=True))
         if pattern.fullmatch(text):
             return tag
+
     return None
 
 
@@ -350,6 +529,7 @@ def _collect_section_nodes(
     for sib in start_tag.next_siblings:
         if isinstance(sib, NavigableString):
             continue
+
         if not isinstance(sib, Tag):
             continue
 
@@ -357,12 +537,12 @@ def _collect_section_nodes(
         if sib_text in end_texts:
             break
 
-        # иногда следующий заголовок вложен глубже
         heading_like = sib.find(
             lambda t: isinstance(t, Tag)
             and re.fullmatch(r"h[1-6]", t.name or "", flags=re.IGNORECASE)
             and _collapse_ws(t.get_text(" ", strip=True)).lower() in end_texts
         )
+
         if heading_like is not None:
             break
 
@@ -380,6 +560,7 @@ def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemS
         start_tag,
         end_heading_texts=["Core Item Build", "Item Stats", "Neutral Items"],
     )
+
     if not section_nodes:
         return []
 
@@ -390,6 +571,7 @@ def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemS
 
     def flush_current():
         nonlocal current_items, current_matches, current_winrate
+
         current_items = _dedupe_names(
             [
                 _clean_item_name(x)
@@ -397,6 +579,7 @@ def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemS
                 if not _is_bad_item_name(_clean_item_name(x))
             ]
         )
+
         if current_items:
             sets.append(
                 StartingItemSet(
@@ -405,26 +588,27 @@ def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemS
                     winrate=current_winrate,
                 )
             )
+
         current_items = []
         current_matches = None
         current_winrate = None
 
     for node in section_nodes:
-        # 1) сначала пробуем собрать статистику с текста блока
         node_lines = [
             _collapse_ws(x)
             for x in node.get_text("\n", strip=True).splitlines()
             if _collapse_ws(x)
         ]
+
         for line in node_lines:
             matches, winrate = _parse_starting_stats_line(line)
             if matches or winrate:
                 if current_items:
                     flush_current()
+
                 current_matches = matches
                 current_winrate = winrate
 
-        # 2) достаем item names из img alt/title/data-* и ссылок
         extracted_names: List[str] = []
 
         for img in node.find_all("img"):
@@ -435,6 +619,7 @@ def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemS
                 img.get("data-tip"),
                 img.get("data-original-title"),
             ]
+
             for cand in candidates:
                 cand = _clean_item_name(cand or "")
                 if cand and not _is_bad_item_name(cand):
@@ -447,18 +632,16 @@ def _extract_starting_items_from_html(soup: BeautifulSoup) -> List[StartingItemS
                 if val and not _is_bad_item_name(val):
                     extracted_names.append(val)
 
-        # fallback: иногда название предмета лежит только текстом внутри элемента
         for line in node_lines:
             cleaned = _clean_item_name(line)
             if cleaned and not _is_bad_item_name(cleaned):
-                # не забираем строки статистики
                 if _parse_starting_stats_line(cleaned) != (None, None):
                     continue
+
                 extracted_names.append(cleaned)
 
         extracted_names = _dedupe_names(extracted_names)
 
-        # отсекаем строки статистики, если случайно попали
         extracted_names = [
             x for x in extracted_names if _parse_starting_stats_line(x) == (None, None)
         ]
@@ -491,14 +674,19 @@ def _parse_items_from_lines(
     }
 
     cleaned = []
+
     for x in lines:
         x = _collapse_ws(x)
+
         if not x:
             continue
+
         if x in ignored:
             continue
+
         if x.startswith("Show Core Items"):
             continue
+
         cleaned.append(x)
 
     core_items: List[BuildItem] = []
@@ -559,11 +747,12 @@ def parse_d2pt_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
 
     html = _request_html(session, url, logger=logger)
     soup = BeautifulSoup(html, "html.parser")
+
     page_text = soup.get_text("\n", strip=True)
     lines = [_collapse_ws(x) for x in page_text.splitlines() if _collapse_ws(x)]
 
     patch = _extract_patch(page_text)
-    role = _extract_role(page_text)
+    role = _extract_best_role(page_text, lines)
 
     starting_items = _extract_starting_items_from_html(soup)
 
@@ -584,11 +773,20 @@ def parse_d2pt_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
             for item in situational_items[:6]
         ]
 
+    if not role:
+        _log(
+            logger,
+            "warning",
+            f"[builds] role not found for hero={hero_name}; "
+            f"first lines={lines[:80]}",
+        )
+
     _log(
         logger,
         "debug",
-        f"[builds] hero={hero_name} patch={patch} "
-        f"starting={len(starting_items)} core={len(core_items)} situational={len(situational_items)}",
+        f"[builds] hero={hero_name} role={role} patch={patch} "
+        f"starting={len(starting_items)} core={len(core_items)} "
+        f"situational={len(situational_items)}",
     )
 
     return HeroBuild(
@@ -605,7 +803,10 @@ def parse_d2pt_hero_build(session, hero_name: str, logger=None) -> HeroBuild:
 
 
 def _error_record(
-    hero_name: str, hero_slug: str, source: str, error: str
+    hero_name: str,
+    hero_slug: str,
+    source: str,
+    error: str,
 ) -> Dict[str, Any]:
     return {
         "hero": hero_name,
@@ -621,22 +822,40 @@ def _error_record(
     }
 
 
-def parse_hero_builds(hero_names: List[str], logger=None) -> List[Dict[str, Any]]:
+def parse_hero_builds(hero_names: List[Any], logger=None) -> List[Dict[str, Any]]:
     d2pt_session = make_d2pt_session()
     out: List[Dict[str, Any]] = []
 
-    for hero_name in hero_names:
+    for hero_item in hero_names:
         try:
-            d2pt = parse_d2pt_hero_build(d2pt_session, hero_name, logger=logger)
-            out.append(asdict(d2pt))
-        except Exception as e:
-            _log(
-                logger, "warning", f"[builds] d2pt parse failed for '{hero_name}': {e}"
+            hero_name = _extract_hero_name(hero_item)
+
+            d2pt = parse_d2pt_hero_build(
+                d2pt_session,
+                hero_name,
+                logger=logger,
             )
+
+            out.append(asdict(d2pt))
+
+        except Exception as e:
+            try:
+                hero_name = _extract_hero_name(hero_item)
+                hero_slug = _hero_slug(hero_name)
+            except Exception:
+                hero_name = str(hero_item)
+                hero_slug = str(hero_item)
+
+            _log(
+                logger,
+                "warning",
+                f"[builds] d2pt parse failed for '{hero_name}': {e}",
+            )
+
             out.append(
                 _error_record(
                     hero_name=hero_name,
-                    hero_slug=_hero_slug(hero_name),
+                    hero_slug=hero_slug,
                     source="dota2protracker",
                     error=str(e),
                 )
@@ -650,6 +869,7 @@ def parse_hero_builds(hero_names: List[str], logger=None) -> List[Dict[str, Any]
         json.dump(out, f, ensure_ascii=JSON_ENSURE_ASCII, indent=JSON_INDENT)
 
     _log(logger, "info", f"[builds] saved {len(out)} records to {OUT_FILE_HERO_BUILDS}")
+
     return out
 
 
@@ -657,17 +877,26 @@ if __name__ == "__main__":
     import logging
 
     with open(DEFAULT_HERO_BUILDS_DIR, "r", encoding="utf-8") as f:
-        hero_map = dict(json.load(f))
-        print(hero_map)
+        hero_data = json.load(f)
+
+    if isinstance(hero_data, dict):
+        hero_names = list(hero_data.values())
+    elif isinstance(hero_data, list):
+        hero_names = hero_data
+    else:
+        raise ValueError(
+            f"Unsupported heroes file format: {type(hero_data).__name__}"
+        )
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
     log = logging.getLogger("hero-builds")
 
     parse_hero_builds(
-        list(hero_map.values()),
+        hero_names,
         logger=log,
     )

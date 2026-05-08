@@ -1775,6 +1775,17 @@ class Controller:
                 )
 
                 mm_stage_after = self.mm_starter.get_stage(vm.vm_id)
+                try:
+                    detected_side = self.mm_starter.get_side(vm.vm_id)
+                except AttributeError:
+                    detected_side = None
+
+                if detected_side in ("radiant", "dire"):
+                    if vm.side != detected_side:
+                        self.logger.info(
+                            f"{vm.vm_id}: detected side={detected_side}, update vm state"
+                        )
+                    vm.side = detected_side
 
                 if not mm_ready or mm_stage_after != "done":
                     self._log_mm_stage_waiting(vm.vm_id, mm_stage_after)
