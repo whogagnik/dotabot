@@ -56,6 +56,7 @@ class VmMmState:
     stage: str = MmStage.IDLE
     hwnds: List[int] = field(default_factory=list)
     windows: Dict[int, HwndState] = field(default_factory=dict)
+    side: Optional[str] = None
 
     party_built: bool = False
     start_game_done: bool = False
@@ -905,47 +906,54 @@ class StartMmDota2:
         return False
 
     def _tick_detect_side(self, state: VmMmState) -> bool:
-        unresolved = []
+        if state.side in ("radiant", "dire"):
+            state.stage = MmStage.PICK_HEROES
+            state.last_stage_ts = time.time()
+            self.log.info(f"[MM] {state.vm_id}: detect_side stage done side={state.side}")
+            return False
 
-        for hwnd in state.hwnds:
-            w = state.windows[hwnd]
-            if w.side:
-                continue
+        if not state.hwnds:
+            return False
 
-            frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
-            if frame is None:
-                if self._enqueue_capture(state.vm_id, hwnd, purpose="detect_side"):
-                    state.inflight = True
-                return False
+        hwnd = state.hwnds[0]
+        w = state.windows[hwnd]
 
-            hit_r = self._match(frame, "detect_radiant")
-            if hit_r:
-                w.side = "radiant"
-                self.log.info(f"[MM] {state.vm_id}: hwnd={hex(hwnd)} side=radiant")
-                continue
+        frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+        if frame is None:
+            if self._enqueue_capture(state.vm_id, hwnd, purpose="detect_side"):
+                state.inflight = True
+            return False
 
+        hit_r = self._match(frame, "detect_radiant")
+        if hit_r:
+            state.side = "radiant"
+
+        if state.side is None:
             hit_d = self._match(frame, "detect_dire")
             if hit_d:
-                w.side = "dire"
-                self.log.info(f"[MM] {state.vm_id}: hwnd={hex(hwnd)} side=dire")
-                continue
+                state.side = "dire"
 
-            unresolved.append(hwnd)
+        if state.side is None:
+            self._log_throttled(
+                state.vm_id,
+                hwnd,
+                f"[MM] {state.vm_id}: side not detected yet hwnd={hex(hwnd)}",
+                interval=2.0,
+            )
+            if self._enqueue_capture(state.vm_id, hwnd, purpose="detect_side_refresh"):
+                state.inflight = True
+            return False
 
-        if unresolved:
-            if time.time() - state.last_stage_ts < 5.0:
-                hwnd = unresolved[0]
-                if self._enqueue_capture(state.vm_id, hwnd, purpose="detect_side_refresh"):
-                    state.inflight = True
-                return False
+        for hwnd_i in state.hwnds:
+            if hwnd_i in state.windows:
+                state.windows[hwnd_i].side = state.side
 
-            for hwnd in unresolved:
-                state.windows[hwnd].side = "unknown"
-                self.log.info(f"[MM] {state.vm_id}: hwnd={hex(hwnd)} side=unknown")
+        w.side = state.side
+        self.log.info(f"[MM] {state.vm_id}: hwnd={hex(hwnd)} side={state.side}")
 
         state.stage = MmStage.PICK_HEROES
         state.last_stage_ts = time.time()
-        self.log.info(f"[MM] {state.vm_id}: detect_side stage done")
+        self.log.info(f"[MM] {state.vm_id}: detect_side stage done side={state.side}")
         return False
 
     def _tick_start_game_stub(self, state: VmMmState) -> bool:
@@ -1125,7 +1133,20 @@ class StartMmDota2:
         state = self._vm.get(vm_id)
         if state is None:
             return {}
+        if state.side in ("radiant", "dire"):
+            return {hwnd: state.side for hwnd in state.hwnds}
         return {hwnd: w.side for hwnd, w in state.windows.items() if w.side}
+
+    def get_side(self, vm_id: str) -> Optional[str]:
+        state = self._vm.get(vm_id)
+        if state is None:
+            return None
+        if state.side in ("radiant", "dire"):
+            return state.side
+        for w in state.windows.values():
+            if w.side in ("radiant", "dire"):
+                return w.side
+        return None
 
     # ---------------------------------------------------------
     # logging
