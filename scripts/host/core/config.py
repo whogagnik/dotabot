@@ -30,7 +30,7 @@ DOTABUFF_HERO_ABILITIES_URL = "https://www.dotabuff.com/heroes/{hero_slug}/abili
 DEFAULT_ID_HERO_TO_NAME = "config/id_hero_to_name.json"
 DEFAULT_OUT = "config/heroes_hero_abilities.json"
 
-OUT_FILE_HERO_BUILDS = BASE_DIR / "config" / "hero_builds.json"
+OUT_FILE_HERO_BUILDS = "config/hero_builds.json"
 
 # ---------- HTTP ----------
 HTTP_TIMEOUT_SECONDS = 30

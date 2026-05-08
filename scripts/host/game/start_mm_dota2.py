@@ -1100,6 +1100,8 @@ class StartMmDota2:
             return False
 
         if state.stage == MmStage.WAIT_DOTA_READY:
+            state.stage = MmStage.DETECT_SIDE
+            return False
             return self._tick_wait_dota_ready(state)
 
         if state.stage == MmStage.BUILD_PARTY:
