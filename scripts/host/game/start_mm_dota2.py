@@ -22,6 +22,7 @@ class MmStage:
     IDLE = "idle"
     WAIT_DOTA_READY = "wait_dota_ready"
     BUILD_PARTY = "build_party"
+    WAIT_ACCEPT_GAME = "wait_accept_game"
     DETECT_SIDE = "detect_side"
     START_GAME = "start_game"
     PICK_HEROES = "pick_heroes"
@@ -44,6 +45,7 @@ class HwndState:
     dota_ready: bool = False
     side: Optional[str] = None
     invite_accepted: bool = False
+    game_accepted: bool = False
     invite_sent_ts: float = 0.0
     latest_frame_ts: float = 0.0
     self_found: bool = False
@@ -190,6 +192,8 @@ class StartMmDota2:
 
             "accept_invite_ru": "lobby_accept_invite_ru",
             "accept_invite_eng": "lobby_accept_invite_eng",
+            "accept_game": "lobby_accept_game",
+            "accept_eng": "lobby_accept_eng",
             "accept_reward_ru": "lobby_accept_reward_ru",
             'invite_pop' : 'lobby_invite_pop',
             "play_eng": "lobby_play_eng",
@@ -429,6 +433,19 @@ class StartMmDota2:
             if best is None or hit["score"] > best["score"]:
                 best = hit
         return best
+
+    def _find_accept_game(self, frame_rgb: np.ndarray) -> Optional[Dict[str, Any]]:
+        return self._find_any(
+            frame_rgb,
+            [
+                "accept_game",
+                "lobby_accept_game",
+                "game_accept_game",
+                "accept_eng",
+                "lobby_accept_eng",
+            ],
+            confidence=0.80,
+        )
 
     # ---------------------------------------------------------
     # vm state
@@ -905,6 +922,79 @@ class StartMmDota2:
         self.log.info(f"[MM] {state.vm_id}: party stage done")
         return False
 
+    def _tick_wait_accept_game(self, state: VmMmState) -> bool:
+        if not state.hwnds:
+            return False
+
+        leader = state.hwnds[0]
+        leader_state = state.windows[leader]
+
+        if not leader_state.game_accepted:
+            frame = self._get_latest_frame_rgb(state.vm_id, leader)
+            if frame is None:
+                if self._enqueue_capture(state.vm_id, leader, purpose="wait_accept_game_leader"):
+                    state.inflight = True
+                return False
+
+            hit = self._find_accept_game(frame)
+            if hit:
+                self._enqueue_focus(state.vm_id, leader)
+                self._enqueue_click(state.vm_id, leader, hit["x"], hit["y"])
+                leader_state.game_accepted = True
+                state.inflight = True
+                self.log.info(
+                    f"[MM] {state.vm_id}: accepted game on leader hwnd={hex(leader)} "
+                    f"by {hit['key']}"
+                )
+                return False
+
+            self._log_throttled(
+                state.vm_id,
+                leader,
+                f"[MM] {state.vm_id}: accept_game not found yet on leader hwnd={hex(leader)}",
+                interval=2.0,
+            )
+            if self._enqueue_capture(state.vm_id, leader, purpose="wait_accept_game_leader_refresh"):
+                state.inflight = True
+            return False
+
+        for hwnd in state.hwnds[1:]:
+            w = state.windows[hwnd]
+            if w.game_accepted:
+                continue
+
+            frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+            if frame is None:
+                if self._enqueue_capture(state.vm_id, hwnd, purpose="wait_accept_game_member"):
+                    state.inflight = True
+                return False
+
+            hit = self._find_accept_game(frame)
+            if hit:
+                self._enqueue_focus(state.vm_id, hwnd)
+                self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
+                w.game_accepted = True
+                state.inflight = True
+                self.log.info(
+                    f"[MM] {state.vm_id}: accepted game on hwnd={hex(hwnd)} by {hit['key']}"
+                )
+                return False
+
+            self._log_throttled(
+                state.vm_id,
+                hwnd,
+                f"[MM] {state.vm_id}: accept_game not found yet hwnd={hex(hwnd)}",
+                interval=2.0,
+            )
+            if self._enqueue_capture(state.vm_id, hwnd, purpose="wait_accept_game_member_refresh"):
+                state.inflight = True
+            return False
+
+        state.stage = MmStage.DETECT_SIDE
+        state.last_stage_ts = time.time()
+        self.log.info(f"[MM] {state.vm_id}: wait_accept_game stage done")
+        return False
+
     def _tick_detect_side(self, state: VmMmState) -> bool:
         if state.side in ("radiant", "dire"):
             state.stage = MmStage.PICK_HEROES
@@ -958,7 +1048,7 @@ class StartMmDota2:
 
     def _tick_start_game_stub(self, state: VmMmState) -> bool:
         if state.start_game_done:
-            state.stage = MmStage.DETECT_SIDE
+            state.stage = MmStage.WAIT_ACCEPT_GAME
             state.last_stage_ts = time.time()
             return False
 
@@ -1100,7 +1190,7 @@ class StartMmDota2:
             return False
 
         if state.stage == MmStage.WAIT_DOTA_READY:
-            state.stage = MmStage.DETECT_SIDE
+            state.stage = MmStage.WAIT_ACCEPT_GAME
             return False
             return self._tick_wait_dota_ready(state)
 
@@ -1109,6 +1199,9 @@ class StartMmDota2:
 
         if state.stage == MmStage.START_GAME:
             return self._tick_start_game_stub(state)
+
+        if state.stage == MmStage.WAIT_ACCEPT_GAME:
+            return self._tick_wait_accept_game(state)
 
         if state.stage == MmStage.DETECT_SIDE:
             return self._tick_detect_side(state)
