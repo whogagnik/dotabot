@@ -6,6 +6,7 @@ import ctypes
 import io
 import subprocess
 import time
+from ctypes import wintypes
 from typing import Any, Optional
 
 import psutil
@@ -18,9 +19,64 @@ import win32process
 from PIL import Image
 
 
-EXECUTOR_VERSION = "executor_real_dota_window_filter_v5"
+EXECUTOR_VERSION = "executor_real_dota_window_filter_v6"
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = (
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    )
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = (
+        ("type", wintypes.DWORD),
+        ("union", _INPUT_UNION),
+    )
+
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+user32.SendInput.restype = wintypes.UINT
 
 
 class HostCommandType:
@@ -321,6 +377,110 @@ def _switch_keyboard_layout_en() -> None:
         time.sleep(0.05)
     except Exception:
         pass
+
+
+def _vk_scan_code(vk_code: int) -> int:
+    try:
+        return int(user32.MapVirtualKeyW(int(vk_code), 0))
+    except Exception:
+        return 0
+
+
+def _key_down(vk_code: int) -> None:
+    vk_code = int(vk_code)
+    win32api.keybd_event(vk_code, _vk_scan_code(vk_code), 0, 0)
+
+
+def _key_up(vk_code: int) -> None:
+    vk_code = int(vk_code)
+    win32api.keybd_event(vk_code, _vk_scan_code(vk_code), win32con.KEYEVENTF_KEYUP, 0)
+
+
+def _tap_vk(vk_code: int, hold_ms: int = 25) -> None:
+    _key_down(vk_code)
+    time.sleep(max(0, int(hold_ms)) / 1000.0)
+    _key_up(vk_code)
+
+
+def _hotkey_vk(*vk_codes: int, hold_ms: int = 35) -> None:
+    pressed: list[int] = []
+    try:
+        for vk_code in vk_codes:
+            _key_down(vk_code)
+            pressed.append(int(vk_code))
+            time.sleep(0.015)
+        time.sleep(max(0, int(hold_ms)) / 1000.0)
+    finally:
+        for vk_code in reversed(pressed):
+            _key_up(vk_code)
+            time.sleep(0.015)
+
+
+def _set_clipboard_text(text: str) -> None:
+    clip_err = None
+    for _ in range(5):
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+            return
+        except Exception as e:
+            clip_err = e
+            time.sleep(0.05)
+
+    if clip_err is not None:
+        raise clip_err
+
+
+def _send_unicode_text(text: str, interval_ms: int = 5) -> None:
+    interval_sec = max(0, int(interval_ms)) / 1000.0
+    data = text.encode("utf-16-le")
+
+    for i in range(0, len(data), 2):
+        unit = int.from_bytes(data[i : i + 2], "little")
+        events = (_INPUT * 2)(
+            _INPUT(
+                type=INPUT_KEYBOARD,
+                union=_INPUT_UNION(
+                    ki=_KEYBDINPUT(
+                        wVk=0,
+                        wScan=unit,
+                        dwFlags=KEYEVENTF_UNICODE,
+                        time=0,
+                        dwExtraInfo=0,
+                    )
+                ),
+            ),
+            _INPUT(
+                type=INPUT_KEYBOARD,
+                union=_INPUT_UNION(
+                    ki=_KEYBDINPUT(
+                        wVk=0,
+                        wScan=unit,
+                        dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                        time=0,
+                        dwExtraInfo=0,
+                    )
+                ),
+            ),
+        )
+
+        sent = user32.SendInput(2, events, ctypes.sizeof(_INPUT))
+        if sent != 2:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        if interval_sec:
+            time.sleep(interval_sec)
+
+
+def _paste_clipboard_text(text: str) -> None:
+    _set_clipboard_text(text)
+    time.sleep(0.05)
+    _hotkey_vk(win32con.VK_CONTROL, ord("V"), hold_ms=35)
+    time.sleep(0.10)
 
 
 def _get_client_rect(hwnd: int) -> tuple[int, int, int, int]:
@@ -916,9 +1076,7 @@ class CommandExecutor:
         if force_fg:
             _force_foreground(hwnd)
 
-        win32api.keybd_event(vk_code, 0, 0, 0)
-        time.sleep(max(0, hold_ms) / 1000.0)
-        win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+        _tap_vk(vk_code, hold_ms)
 
         return self._result_ok(vk_code=vk_code, hold_ms=hold_ms, hwnd=hwnd)
 
@@ -933,9 +1091,9 @@ class CommandExecutor:
             _force_foreground(hwnd)
 
         if down:
-            win32api.keybd_event(vk_code, 0, 0, 0)
+            _key_down(vk_code)
         else:
-            win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+            _key_up(vk_code)
 
         return self._result_ok(vk_code=vk_code, down=down, hwnd=hwnd)
 
@@ -944,6 +1102,8 @@ class CommandExecutor:
         text = str(payload.get("text", ""))
         clear_before = bool(payload.get("clear_before", False))
         field = str(payload.get("field", ""))
+        input_method = str(payload.get("input_method", "clipboard_unicode_paste")).lower().strip()
+        char_interval_ms = int(payload.get("char_interval_ms", 5))
         hwnd = _require_live_window(hwnd, "write_text")
 
         _force_foreground(hwnd)
@@ -951,38 +1111,25 @@ class CommandExecutor:
         time.sleep(0.12)
 
         if clear_before:
-            p.hotkey("ctrl", "a")
+            _hotkey_vk(win32con.VK_CONTROL, ord("A"), hold_ms=35)
             time.sleep(0.05)
-            p.press("backspace")
+            _tap_vk(win32con.VK_BACK, 25)
             time.sleep(0.05)
 
-        clip_err = None
-        for _ in range(5):
-            try:
-                win32clipboard.OpenClipboard()
-                try:
-                    win32clipboard.EmptyClipboard()
-                    win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
-                finally:
-                    win32clipboard.CloseClipboard()
-                clip_err = None
-                break
-            except Exception as e:
-                clip_err = e
-                time.sleep(0.05)
-
-        if clip_err is not None:
-            raise clip_err
-
-        time.sleep(0.05)
-        p.hotkey("ctrl", "v")
-        time.sleep(0.10)
+        if input_method in ("clipboard", "clipboard_unicode_paste", "paste"):
+            _paste_clipboard_text(text)
+            method = "clipboard_unicode_paste"
+        elif input_method in ("sendinput_unicode", "unicode", "typing", "type"):
+            _send_unicode_text(text, interval_ms=char_interval_ms)
+            method = "sendinput_unicode"
+        else:
+            raise ValueError(f"unsupported write_text input_method: {input_method}")
 
         return self._result_ok(
             text_len=len(text),
             hwnd=hwnd,
             field=field,
-            method="clipboard_unicode_paste",
+            method=method,
         )
 
     def hotkey(self, payload: dict[str, Any]) -> dict[str, Any]:

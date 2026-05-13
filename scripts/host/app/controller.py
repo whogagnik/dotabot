@@ -1457,6 +1457,7 @@ class Controller:
                         "field": "login",
                         "text": acc.username,
                         "clear_before": True,
+                        "input_method": "sendinput_unicode",
                     },
                 )
                 self._push_command(
@@ -1479,6 +1480,7 @@ class Controller:
                         "field": "password",
                         "text": acc.password,
                         "clear_before": True,
+                        "input_method": "sendinput_unicode",
                     },
                 )
                 self._push_command(
