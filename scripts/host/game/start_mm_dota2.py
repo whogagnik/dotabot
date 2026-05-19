@@ -10,7 +10,7 @@ import random
 import time
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any, Tuple
 
 import cv2
 import numpy as np
@@ -98,6 +98,7 @@ class VmMmState:
     pick_wait_seen_disabled_hwnds: List[int] = field(default_factory=list)
     pick_candidate_pools_by_hwnd: Dict[int, List[str]] = field(default_factory=dict)
     pick_candidate_index_by_hwnd: Dict[int, int] = field(default_factory=dict)
+    pick_probe_index: int = 0
     pick_selected_hero_by_hwnd: Dict[int, str] = field(default_factory=dict)
     pick_confirmed_ts_by_hwnd: Dict[int, float] = field(default_factory=dict)
     pick_confirmed_hwnds: List[int] = field(default_factory=list)
@@ -659,8 +660,7 @@ class StartMmDota2:
 
     @staticmethod
     def _remove_value(values: List[Any], value: Any) -> None:
-        while value in values:
-            values.remove(value)
+        values[:] = [x for x in values if x != value]
 
     def _load_pick_role_pools(self) -> Dict[str, List[str]]:
         if self._pick_role_pools is not None:
@@ -754,12 +754,13 @@ class StartMmDota2:
         return pools
 
     def _reset_pick_state(self, state: VmMmState) -> None:
-        state.pick_phase = "supports"
+        state.pick_phase = "current_turn"
         state.pick_phase_started_ts = time.time()
         state.pick_wait_started_ts = 0.0
         state.pick_wait_seen_disabled_hwnds = []
         state.pick_candidate_pools_by_hwnd = {}
         state.pick_candidate_index_by_hwnd = {}
+        state.pick_probe_index = 0
         state.pick_selected_hero_by_hwnd = {}
         state.pick_confirmed_ts_by_hwnd = {}
         state.pick_confirmed_hwnds = []
@@ -810,6 +811,9 @@ class StartMmDota2:
                 out.append(int(hwnd))
         return out
 
+    def _pick_all_hwnds(self, state: VmMmState) -> List[int]:
+        return self._pick_hwnds_for_roles(state, PICK_ROLE_ORDER)
+
     def _used_pick_heroes(
         self,
         state: VmMmState,
@@ -831,7 +835,7 @@ class StartMmDota2:
         state: VmMmState,
         hwnd: int,
         role: str,
-    ) -> Optional[str]:
+    ) -> Tuple[Optional[str], bool]:
         pools = self._load_pick_role_pools()
 
         if hwnd not in state.pick_candidate_pools_by_hwnd:
@@ -843,19 +847,19 @@ class StartMmDota2:
         candidates = state.pick_candidate_pools_by_hwnd.get(hwnd, [])
         banned = set(state.pick_banned_heroes)
 
-        while state.pick_candidate_index_by_hwnd.get(hwnd, 0) < len(candidates):
-            index = state.pick_candidate_index_by_hwnd.get(hwnd, 0)
-            state.pick_candidate_index_by_hwnd[hwnd] = index + 1
+        index = state.pick_candidate_index_by_hwnd.get(hwnd, 0)
+        if index >= len(candidates):
+            return None, True
 
-            hero_name = candidates[index]
-            if hero_name in banned:
-                continue
-            if hero_name in self._used_pick_heroes(state, exclude_hwnd=hwnd):
-                continue
+        state.pick_candidate_index_by_hwnd[hwnd] = index + 1
 
-            return hero_name
+        hero_name = candidates[index]
+        if hero_name in banned:
+            return None, False
+        if hero_name in self._used_pick_heroes(state, exclude_hwnd=hwnd):
+            return None, False
 
-        return None
+        return hero_name, False
 
     def _hero_template_key(self, hero_name: str) -> Optional[str]:
         return self._hero_template_key_by_name.get(
@@ -973,6 +977,7 @@ class StartMmDota2:
             if lock_hit:
                 self._enqueue_focus(state.vm_id, hwnd)
                 self._enqueue_click(state.vm_id, hwnd, lock_hit["x"], lock_hit["y"])
+                self._clear_frame(state.vm_id, hwnd)
                 state.inflight = True
                 self.log.info(
                     f"[MM] {state.vm_id}: clicked lock-in hwnd={hex(hwnd)} "
@@ -980,16 +985,21 @@ class StartMmDota2:
                 )
                 return False
 
+            if disabled_hit:
+                self._reset_pick_hwnd(
+                    state,
+                    hwnd,
+                    ban_selected=True,
+                    reason="pick_selection_did_not_enable_lock",
+                )
+                return False
+
             self._request_pick_refresh(state, hwnd, "pick_wait_lock_or_inventory")
             return False
 
-        if disabled_hit:
-            self._request_pick_refresh(state, hwnd, "pick_wait_enabled_lock")
-            return False
-
-        while True:
-            hero_name = self._next_pick_candidate(state, hwnd, role)
-            if not hero_name:
+        hero_name, exhausted = self._next_pick_candidate(state, hwnd, role)
+        if not hero_name:
+            if exhausted:
                 self._log_throttled(
                     state.vm_id,
                     hwnd,
@@ -1000,23 +1010,29 @@ class StartMmDota2:
                 self._request_pick_refresh(state, hwnd, "pick_no_candidates")
                 return False
 
-            template_key = self._hero_template_key(hero_name)
-            if not template_key:
-                continue
-
-            hero_hit = self._match(frame, template_key, confidence=0.80)
-            if not hero_hit:
-                continue
-
-            state.pick_selected_hero_by_hwnd[hwnd] = hero_name
-            self._enqueue_focus(state.vm_id, hwnd)
-            self._enqueue_click(state.vm_id, hwnd, hero_hit["x"], hero_hit["y"])
-            state.inflight = True
-            self.log.info(
-                f"[MM] {state.vm_id}: selected hero hwnd={hex(hwnd)} "
-                f"role={role} hero={hero_name} by {template_key}"
-            )
+            self._request_pick_refresh(state, hwnd, "pick_skip_candidate")
             return False
+
+        template_key = self._hero_template_key(hero_name)
+        if not template_key:
+            self._request_pick_refresh(state, hwnd, "pick_skip_missing_template")
+            return False
+
+        hero_hit = self._match(frame, template_key, confidence=0.80)
+        if not hero_hit:
+            self._request_pick_refresh(state, hwnd, "pick_candidate_not_visible")
+            return False
+
+        state.pick_selected_hero_by_hwnd[hwnd] = hero_name
+        self._enqueue_focus(state.vm_id, hwnd)
+        self._enqueue_click(state.vm_id, hwnd, hero_hit["x"], hero_hit["y"])
+        self._clear_frame(state.vm_id, hwnd)
+        state.inflight = True
+        self.log.info(
+            f"[MM] {state.vm_id}: selected hero hwnd={hex(hwnd)} "
+            f"role={role} hero={hero_name} by {template_key}"
+        )
+        return False
 
     def _begin_pick_wait(
         self,
@@ -1071,6 +1087,93 @@ class StartMmDota2:
                 return False
 
         return True
+
+    def _tick_pick_current_turn(self, state: VmMmState) -> bool:
+        pick_hwnds = self._pick_all_hwnds(state)
+        if not pick_hwnds:
+            return False
+
+        pending_hwnds = [
+            hwnd for hwnd in pick_hwnds
+            if hwnd not in state.pick_finalized_hwnds
+        ]
+
+        if not pending_hwnds:
+            state.heroes_picked = True
+            self.log.info(f"[MM] {state.vm_id}: all heroes picked")
+            return True
+
+        waiting_selected_hwnds: List[int] = []
+
+        for hwnd in pending_hwnds:
+            if hwnd in state.pick_confirmed_hwnds:
+                if self._tick_pick_single_hwnd(state, hwnd):
+                    self._append_unique(state.pick_finalized_hwnds, hwnd)
+                return False
+
+            if hwnd not in state.pick_selected_hero_by_hwnd:
+                continue
+
+            frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+            if frame is None:
+                self._request_pick_refresh(state, hwnd, "pick_refresh_selected")
+                return False
+
+            if (
+                self._match(frame, "inventory", confidence=0.80)
+                or self._find_lock_in(frame)
+                or self._find_disabled_lock_in(frame)
+            ):
+                if self._tick_pick_single_hwnd(state, hwnd):
+                    if hwnd in state.pick_confirmed_hwnds:
+                        self._append_unique(state.pick_finalized_hwnds, hwnd)
+                return False
+
+            waiting_selected_hwnds.append(hwnd)
+
+        ready_hwnds: List[int] = []
+        missing_hwnds: List[int] = []
+
+        for hwnd in pending_hwnds:
+            if (
+                hwnd in state.pick_selected_hero_by_hwnd
+                or hwnd in state.pick_confirmed_hwnds
+            ):
+                continue
+
+            frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+            if frame is None:
+                missing_hwnds.append(hwnd)
+                continue
+
+            if self._find_disabled_lock_in(frame):
+                ready_hwnds.append(hwnd)
+
+        if ready_hwnds:
+            hwnd = ready_hwnds[0]
+            self._log_throttled(
+                state.vm_id,
+                hwnd,
+                f"[MM] {state.vm_id}: current pick hwnd={hex(hwnd)} "
+                f"role={state.pick_role_by_hwnd.get(hwnd)}",
+                interval=2.0,
+            )
+            self._tick_pick_single_hwnd(state, hwnd)
+            return False
+
+        probe_hwnds = missing_hwnds or waiting_selected_hwnds or pending_hwnds
+        target = probe_hwnds[state.pick_probe_index % len(probe_hwnds)]
+        state.pick_probe_index += 1
+
+        if missing_hwnds:
+            purpose = "pick_probe_current_turn"
+        elif waiting_selected_hwnds:
+            purpose = "pick_wait_lock_or_inventory"
+        else:
+            purpose = "pick_wait_current_turn"
+
+        self._request_pick_refresh(state, target, purpose)
+        return False
 
     def _tick_wait_for_next_pick_phase(
         self,
@@ -1753,67 +1856,7 @@ class StartMmDota2:
             return False
 
         self._load_pick_role_pools()
-
-        if state.pick_phase == "supports":
-            if self._tick_pick_phase(state, PICK_SUPPORT_ROLES):
-                self._begin_pick_wait(
-                    state,
-                    "wait_cores",
-                    PICK_SUPPORT_ROLES,
-                    PICK_CORE_ROLES,
-                )
-            return False
-
-        if state.pick_phase == "wait_cores":
-            self._tick_wait_for_next_pick_phase(
-                state,
-                rollback_roles=PICK_SUPPORT_ROLES,
-                retry_phase="supports",
-                next_roles=PICK_CORE_ROLES,
-                next_phase="cores",
-            )
-            return False
-
-        if state.pick_phase == "cores":
-            if self._tick_pick_phase(state, PICK_CORE_ROLES):
-                self._begin_pick_wait(
-                    state,
-                    "wait_mid",
-                    PICK_CORE_ROLES,
-                    PICK_MID_ROLES,
-                )
-            return False
-
-        if state.pick_phase == "wait_mid":
-            self._tick_wait_for_next_pick_phase(
-                state,
-                rollback_roles=PICK_CORE_ROLES,
-                retry_phase="cores",
-                next_roles=PICK_MID_ROLES,
-                next_phase="mid",
-            )
-            return False
-
-        if state.pick_phase == "mid":
-            if self._tick_pick_phase(state, PICK_MID_ROLES):
-                self._begin_pick_wait(
-                    state,
-                    "wait_done",
-                    PICK_MID_ROLES,
-                    [],
-                )
-            return False
-
-        if state.pick_phase == "wait_done":
-            self._tick_wait_final_pick_confirmation(
-                state,
-                rollback_roles=PICK_MID_ROLES,
-                retry_phase="mid",
-            )
-            return False
-
-        self._enter_pick_phase(state, "supports", PICK_SUPPORT_ROLES)
-        return False
+        return self._tick_pick_current_turn(state)
 
     # ---------------------------------------------------------
     # public tick
