@@ -34,11 +34,13 @@ PICK_PHASE_ROLES = {
     "cores": PICK_CORE_ROLES,
     "mid": PICK_MID_ROLES,
 }
+LEAVE_PARTY_CLICK_POINTS = [(30, 455), (50, 455)]
 
 
 class MmStage:
     IDLE = "idle"
     WAIT_DOTA_READY = "wait_dota_ready"
+    LEAVE_PARTY = "leave_party"
     BUILD_PARTY = "build_party"
     WAIT_ACCEPT_GAME = "wait_accept_game"
     DETECT_SIDE = "detect_side"
@@ -79,6 +81,9 @@ class VmMmState:
     side: Optional[str] = None
 
     party_built: bool = False
+    leave_party_done: bool = False
+    leave_party_done_hwnds: List[int] = field(default_factory=list)
+    leave_party_click_index_by_hwnd: Dict[int, int] = field(default_factory=dict)
     start_game_done: bool = False
     heroes_picked: bool = False
 
@@ -219,6 +224,8 @@ class StartMmDota2:
             "self": "lobby_self",
 
             "add_party": "lobby_add_party",
+            "player_icon": "lobby_player_icon",
+            "leave_from_party": "lobby_leave_from_party",
             "id_field_ru": "lobby_id_field_ru",
             "id_field_eng": "lobby_id_field_eng",
             "search_ru": "lobby_search_ru",
@@ -457,6 +464,56 @@ class StartMmDota2:
             "key": key,
         }
 
+    def count_match(
+        self,
+        frame_rgb: np.ndarray,
+        key: str,
+        confidence: Optional[float] = None,
+    ) -> int:
+        tpl = self._templates.get(key)
+
+        if tpl is None:
+            return 0
+
+        try:
+            gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        except Exception:
+            return 0
+
+        th, tw = tpl.shape[:2]
+        fh, fw = gray.shape[:2]
+        if fh < th or fw < tw:
+            return 0
+
+        try:
+            res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+        except Exception:
+            return 0
+
+        threshold = self.confidence if confidence is None else float(confidence)
+        ys, xs = np.where(res >= threshold)
+        if len(xs) == 0:
+            return 0
+
+        candidates = sorted(
+            (
+                (float(res[int(y), int(x)]), int(x), int(y))
+                for x, y in zip(xs, ys)
+            ),
+            reverse=True,
+        )
+
+        hits: List[Tuple[int, int]] = []
+        min_dx = max(1, int(tw * 0.5))
+        min_dy = max(1, int(th * 0.5))
+
+        for _, x, y in candidates:
+            if any(abs(x - hx) < min_dx and abs(y - hy) < min_dy for hx, hy in hits):
+                continue
+            hits.append((x, y))
+
+        return len(hits)
+
     def _find_any(
         self,
         frame_rgb: np.ndarray,
@@ -541,7 +598,15 @@ class StartMmDota2:
             {"hwnd": int(hwnd)},
         )
 
-    def _enqueue_click(self, vm_id: str, hwnd: int, x: int, y: int) -> None:
+    def _enqueue_click(
+        self,
+        vm_id: str,
+        hwnd: int,
+        x: int,
+        y: int,
+        *,
+        button: str = "left",
+    ) -> None:
         self._clear_frame(vm_id, hwnd)
 
         self.queue_command(
@@ -552,7 +617,7 @@ class StartMmDota2:
                 "x": int(x),
                 "y": int(y),
                 "coord_space": "client",
-                "button": "left",
+                "button": str(button),
                 "clicks": 1,
                 "force_fg": True,
             },
@@ -1419,9 +1484,105 @@ class StartMmDota2:
         if not all_ready:
             return False
 
-        state.stage = MmStage.BUILD_PARTY
+        state.stage = MmStage.LEAVE_PARTY
         state.last_stage_ts = time.time()
         self.log.info(f"[MM] {state.vm_id}: all dota windows are ready")
+        return False
+
+    def _enter_build_party(self, state: VmMmState, reason: str) -> None:
+        state.leave_party_done = True
+        state.leave_party_done_hwnds = list(state.hwnds)
+        state.leave_party_click_index_by_hwnd = {}
+        state.stage = MmStage.BUILD_PARTY
+        state.last_stage_ts = time.time()
+        self.log.info(f"[MM] {state.vm_id}: leave_party stage done reason={reason}")
+
+    def _tick_leave_party(self, state: VmMmState) -> bool:
+        if state.leave_party_done:
+            state.stage = MmStage.BUILD_PARTY
+            state.last_stage_ts = time.time()
+            return False
+
+        if not state.hwnds:
+            return False
+
+        pending_hwnds = [
+            int(hwnd) for hwnd in state.hwnds
+            if int(hwnd) not in state.leave_party_done_hwnds
+        ]
+        if not pending_hwnds:
+            self._enter_build_party(state, "all_hwnds_checked")
+            return False
+
+        hwnd = pending_hwnds[0]
+        frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+
+        if frame is None:
+            if self._enqueue_capture(state.vm_id, hwnd, purpose="leave_party_check"):
+                state.inflight = True
+            return False
+
+        if self._templates.get("player_icon") is None:
+            self._log_throttled(
+                state.vm_id,
+                hwnd,
+                f"[MM] {state.vm_id}: player_icon template missing, "
+                "cannot check party state",
+                interval=5.0,
+            )
+            return False
+
+        player_icon_count = self.count_match(frame, "player_icon", confidence=0.80)
+        if player_icon_count == 4:
+            self._append_unique(state.leave_party_done_hwnds, hwnd)
+            state.leave_party_click_index_by_hwnd.pop(hwnd, None)
+            self._clear_frame(state.vm_id, hwnd)
+            self.log.info(
+                f"[MM] {state.vm_id}: leave_party hwnd={hex(hwnd)} "
+                "already solo player_icons=4"
+            )
+            return False
+
+        if self._templates.get("leave_from_party") is None:
+            self._log_throttled(
+                state.vm_id,
+                hwnd,
+                f"[MM] {state.vm_id}: leave_from_party template missing, "
+                f"cannot leave party player_icons={player_icon_count}",
+                interval=5.0,
+            )
+            return False
+
+        click_index = state.leave_party_click_index_by_hwnd.get(hwnd, 0)
+
+        if click_index > 0:
+            leave_hit = self._match(frame, "leave_from_party", confidence=0.80)
+            if leave_hit:
+                self._enqueue_focus(state.vm_id, hwnd)
+                self._enqueue_click(state.vm_id, hwnd, leave_hit["x"], leave_hit["y"])
+                self._clear_frame(state.vm_id, hwnd)
+                state.leave_party_click_index_by_hwnd[hwnd] = 0
+                state.inflight = True
+                self.log.info(
+                    f"[MM] {state.vm_id}: clicked leave-from-party hwnd={hex(hwnd)} "
+                    f"by {leave_hit['key']} player_icons={player_icon_count}"
+                )
+                return False
+
+        if click_index >= len(LEAVE_PARTY_CLICK_POINTS):
+            click_index = 0
+
+        x, y = LEAVE_PARTY_CLICK_POINTS[click_index]
+        state.leave_party_click_index_by_hwnd[hwnd] = click_index + 1
+
+        self._enqueue_focus(state.vm_id, hwnd)
+        self._enqueue_click(state.vm_id, hwnd, x, y, button="right")
+        self._clear_frame(state.vm_id, hwnd)
+        state.inflight = True
+        self.log.info(
+            f"[MM] {state.vm_id}: right-clicked party slot hwnd={hex(hwnd)} "
+            f"pos=({x},{y}) player_icons={player_icon_count}"
+        )
         return False
 
     def _tick_build_party(
@@ -1925,9 +2086,10 @@ class StartMmDota2:
             return False
 
         if state.stage == MmStage.WAIT_DOTA_READY:
-            state.stage = MmStage.WAIT_ACCEPT_GAME
-            return False
             return self._tick_wait_dota_ready(state)
+
+        if state.stage == MmStage.LEAVE_PARTY:
+            return self._tick_leave_party(state)
 
         if state.stage == MmStage.BUILD_PARTY:
             return self._tick_build_party(state, friend_ids=friend_ids)
