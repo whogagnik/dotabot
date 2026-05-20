@@ -1705,6 +1705,46 @@ class Controller:
         self._mm_stage_log_state[vm_id] = (stage, now)
         self.logger.info(f"{vm_id}: MM not ready yet, stage={stage}")
 
+    @staticmethod
+    def _clean_role(role: Any) -> str:
+        role_s = str(role).strip() if role is not None else ""
+        return role_s or "unknown"
+
+    def _roles_for_planner(self, vm: VmState) -> List[str]:
+        if self.mm_starter is not None:
+            get_roles = getattr(self.mm_starter, "get_roles", None)
+            if get_roles is not None:
+                try:
+                    roles = [
+                        self._clean_role(role)
+                        for role in get_roles(vm.vm_id, vm.dota_hwnds)
+                    ]
+                except Exception as e:
+                    roles = []
+                    self.logger.warning(
+                        f"{vm.vm_id}: failed to get MM roles for planner: {e}"
+                    )
+
+                if len(roles) == len(vm.dota_hwnds):
+                    vm.roles = list(roles)
+                    return roles
+
+                if roles:
+                    self.logger.warning(
+                        f"{vm.vm_id}: MM roles count mismatch: "
+                        f"roles={roles} hwnds={vm.dota_hwnds}"
+                    )
+
+        roles = [self._clean_role(role) for role in (vm.roles or [])]
+        if len(roles) != len(vm.dota_hwnds):
+            if roles:
+                self.logger.warning(
+                    f"{vm.vm_id}: stored roles count mismatch: "
+                    f"roles={roles} hwnds={vm.dota_hwnds}"
+                )
+            roles = ["unknown"] * len(vm.dota_hwnds)
+        return roles
+
     def activate_planners_for_ready_vms(self) -> None:
         for vm in self.vms.values():
             if vm.planner_active:
@@ -1793,7 +1833,7 @@ class Controller:
                     self._log_mm_stage_waiting(vm.vm_id, mm_stage_after)
                     continue
 
-            roles = vm.roles or (["unknown"] * len(vm.dota_hwnds))
+            roles = self._roles_for_planner(vm)
             planner_runtime.attach_hwnds(
                 vm_id=vm.vm_id,
                 hwnds=vm.dota_hwnds,
@@ -1803,7 +1843,7 @@ class Controller:
             )
             vm.planner_active = True
             vm.status = VmStatus.PLANNER_ACTIVE
-            self.logger.info(f"Planner activated for {vm.vm_id}")
+            self.logger.info(f"Planner activated for {vm.vm_id} roles={roles}")
 
     # -----------------------------------------------------
     # vm logs / misc
