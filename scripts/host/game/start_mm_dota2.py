@@ -26,8 +26,14 @@ from scripts.host.game.planner_runtime import planner_runtime
 
 PICK_ROLE_ORDER = ["Carry", "Offlane", "Hard Support", "Support", "Mid"]
 PICK_SUPPORT_ROLES = ["Hard Support", "Support"]
-PICK_CORE_ROLES = ["Offlane", "Carry"]
+PICK_CORE_ROLES = ["Carry", "Offlane"]
 PICK_MID_ROLES = ["Mid"]
+PICK_PHASE_ORDER = ["supports", "cores", "mid"]
+PICK_PHASE_ROLES = {
+    "supports": PICK_SUPPORT_ROLES,
+    "cores": PICK_CORE_ROLES,
+    "mid": PICK_MID_ROLES,
+}
 
 
 class MmStage:
@@ -754,7 +760,7 @@ class StartMmDota2:
         return pools
 
     def _reset_pick_state(self, state: VmMmState) -> None:
-        state.pick_phase = "current_turn"
+        state.pick_phase = "supports"
         state.pick_phase_started_ts = time.time()
         state.pick_wait_started_ts = 0.0
         state.pick_wait_seen_disabled_hwnds = []
@@ -813,6 +819,42 @@ class StartMmDota2:
 
     def _pick_all_hwnds(self, state: VmMmState) -> List[int]:
         return self._pick_hwnds_for_roles(state, PICK_ROLE_ORDER)
+
+    def _current_pick_phase_roles(self, state: VmMmState) -> List[str]:
+        if state.pick_phase not in PICK_PHASE_ROLES:
+            state.pick_phase = "supports"
+            state.pick_phase_started_ts = time.time()
+            state.pick_probe_index = 0
+
+        return list(PICK_PHASE_ROLES[state.pick_phase])
+
+    def _advance_pick_phase(self, state: VmMmState) -> bool:
+        try:
+            phase_index = PICK_PHASE_ORDER.index(state.pick_phase)
+        except ValueError:
+            phase_index = 0
+
+        next_index = phase_index + 1
+        if next_index >= len(PICK_PHASE_ORDER):
+            state.heroes_picked = True
+            self.log.info(f"[MM] {state.vm_id}: all heroes picked")
+            return True
+
+        state.pick_phase = PICK_PHASE_ORDER[next_index]
+        state.pick_phase_started_ts = time.time()
+        state.pick_probe_index = 0
+
+        for hwnd in self._pick_hwnds_for_roles(
+            state,
+            PICK_PHASE_ROLES[state.pick_phase],
+        ):
+            self._clear_frame(state.vm_id, hwnd)
+
+        self.log.info(
+            f"[MM] {state.vm_id}: enter pick phase={state.pick_phase} "
+            f"roles={PICK_PHASE_ROLES[state.pick_phase]}"
+        )
+        return False
 
     def _used_pick_heroes(
         self,
@@ -1089,19 +1131,19 @@ class StartMmDota2:
         return True
 
     def _tick_pick_current_turn(self, state: VmMmState) -> bool:
-        pick_hwnds = self._pick_all_hwnds(state)
-        if not pick_hwnds:
+        phase_roles = self._current_pick_phase_roles(state)
+        phase_hwnds = self._pick_hwnds_for_roles(state, phase_roles)
+        if not phase_hwnds:
             return False
 
         pending_hwnds = [
-            hwnd for hwnd in pick_hwnds
+            hwnd for hwnd in phase_hwnds
             if hwnd not in state.pick_finalized_hwnds
         ]
 
         if not pending_hwnds:
-            state.heroes_picked = True
-            self.log.info(f"[MM] {state.vm_id}: all heroes picked")
-            return True
+            self._advance_pick_phase(state)
+            return False
 
         waiting_selected_hwnds: List[int] = []
 
@@ -1154,7 +1196,8 @@ class StartMmDota2:
             self._log_throttled(
                 state.vm_id,
                 hwnd,
-                f"[MM] {state.vm_id}: current pick hwnd={hex(hwnd)} "
+                f"[MM] {state.vm_id}: current pick "
+                f"phase={state.pick_phase} hwnd={hex(hwnd)} "
                 f"role={state.pick_role_by_hwnd.get(hwnd)}",
                 interval=2.0,
             )
@@ -1166,11 +1209,11 @@ class StartMmDota2:
         state.pick_probe_index += 1
 
         if missing_hwnds:
-            purpose = "pick_probe_current_turn"
+            purpose = f"pick_probe_{state.pick_phase}"
         elif waiting_selected_hwnds:
-            purpose = "pick_wait_lock_or_inventory"
+            purpose = f"pick_wait_{state.pick_phase}_lock_or_inventory"
         else:
-            purpose = "pick_wait_current_turn"
+            purpose = f"pick_wait_{state.pick_phase}"
 
         self._request_pick_refresh(state, target, purpose)
         return False
