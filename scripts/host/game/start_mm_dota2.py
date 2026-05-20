@@ -2095,6 +2095,9 @@ class StartMmDota2:
             return self._tick_build_party(state, friend_ids=friend_ids)
 
         if state.stage == MmStage.START_GAME:
+            state.stage = MmStage.DETECT_SIDE
+            self._enqueue_sleep(vm_id,30000)
+            return False
             return self._tick_start_game_stub(state)
 
         if state.stage == MmStage.WAIT_ACCEPT_GAME:
