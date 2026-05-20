@@ -60,6 +60,7 @@ class DummyPlannerRuntime:
     def __init__(self):
         self.registered = []
         self.ticks = 0
+        self.attach_calls = []
 
     def register_vm(self, vm_id):
         self.registered.append(vm_id)
@@ -68,6 +69,7 @@ class DummyPlannerRuntime:
         self.ticks += 1
 
     def attach_hwnds(self, **kwargs):
+        self.attach_calls.append(kwargs)
         return None
 
 
@@ -120,6 +122,8 @@ class ControllerStabilityTests(unittest.TestCase):
         self.controller = controller_mod.Controller(logger, lambda *_: None)
         self.controller.mm_starter = None
         self.controller.accounts.clear()
+        if hasattr(controller_mod.planner_runtime, "attach_calls"):
+            controller_mod.planner_runtime.attach_calls.clear()
 
     def add_vm_account(self, has_mafile=False):
         account = DummyAccount("alice", "secret")
@@ -410,6 +414,54 @@ class ControllerStabilityTests(unittest.TestCase):
         self.controller._handle_command_result(vm, focus_second)
 
         self.assertEqual(vm.command_queue, [])
+
+    def test_mm_roles_are_forwarded_to_planner_runtime(self):
+        vm = self.controller.register_vm()
+        self.controller.accounts.extend(
+            [
+                DummyAccount("alice", "secret"),
+                DummyAccount("bob", "secret"),
+            ]
+        )
+
+        acc1 = controller_mod.VmAccountState(username="alice", password="secret")
+        acc1.dota_window_found = True
+        acc1.dota_hwnd = 10
+        acc1.dota_pid = 100
+
+        acc2 = controller_mod.VmAccountState(username="bob", password="secret")
+        acc2.dota_window_found = True
+        acc2.dota_hwnd = 20
+        acc2.dota_pid = 200
+
+        vm.assigned_accounts = [acc1, acc2]
+        vm.dota_hwnds = [10, 20]
+        vm.windows_arranged = True
+
+        class FakeMmStarter:
+            def tick_one(self, vm_id, hwnds, *, friend_ids=None):
+                return True
+
+            def get_stage(self, vm_id):
+                return "done"
+
+            def get_side(self, vm_id):
+                return "dire"
+
+            def get_roles(self, vm_id, hwnds=None):
+                return ["Carry", "Hard Support"]
+
+        self.controller.mm_starter = FakeMmStarter()
+
+        self.controller.activate_planners_for_ready_vms()
+
+        self.assertTrue(vm.planner_active)
+        self.assertEqual(vm.side, "dire")
+        self.assertEqual(vm.roles, ["Carry", "Hard Support"])
+        self.assertEqual(
+            controller_mod.planner_runtime.attach_calls[-1]["roles"],
+            ["Carry", "Hard Support"],
+        )
 
 
 if __name__ == "__main__":

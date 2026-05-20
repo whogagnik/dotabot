@@ -838,11 +838,15 @@ class StartMmDota2:
         state.pick_finalized_hwnds = []
         state.pick_banned_heroes = []
 
-    def _ensure_pick_setup(self, state: VmMmState) -> bool:
-        expected_role_by_hwnd: Dict[int, str] = {}
+    @staticmethod
+    def _pick_roles_by_hwnd_for(hwnds: List[int]) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        for index, hwnd in enumerate(hwnds[:len(PICK_ROLE_ORDER)]):
+            out[int(hwnd)] = PICK_ROLE_ORDER[index]
+        return out
 
-        for index, hwnd in enumerate(state.hwnds[:len(PICK_ROLE_ORDER)]):
-            expected_role_by_hwnd[int(hwnd)] = PICK_ROLE_ORDER[index]
+    def _ensure_pick_setup(self, state: VmMmState) -> bool:
+        expected_role_by_hwnd = self._pick_roles_by_hwnd_for(state.hwnds)
 
         if not expected_role_by_hwnd:
             return False
@@ -2142,6 +2146,31 @@ class StartMmDota2:
             if w.side in ("radiant", "dire"):
                 return w.side
         return None
+
+    def get_role_by_hwnd(self, vm_id: str) -> Dict[int, str]:
+        state = self._vm.get(vm_id)
+        if state is None:
+            return {}
+
+        roles_by_hwnd = dict(state.pick_role_by_hwnd)
+        if not roles_by_hwnd:
+            roles_by_hwnd = self._pick_roles_by_hwnd_for(state.hwnds)
+        return roles_by_hwnd
+
+    def get_roles(
+        self,
+        vm_id: str,
+        hwnds: Optional[List[int]] = None,
+    ) -> List[str]:
+        state = self._vm.get(vm_id)
+        if state is None:
+            return []
+
+        ordered_hwnds = [
+            int(hwnd) for hwnd in (hwnds if hwnds is not None else state.hwnds)
+        ]
+        roles_by_hwnd = self.get_role_by_hwnd(vm_id)
+        return [roles_by_hwnd.get(hwnd, "unknown") for hwnd in ordered_hwnds]
 
     # ---------------------------------------------------------
     # logging
