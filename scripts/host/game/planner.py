@@ -143,6 +143,7 @@ class Planner:
         self.django_bridge = django_bridge
         self.log = logger
         self.show_preview = bool(show_preview)
+        self._last_preview_key: int = -1
 
         self.self_hp = SelfHud()
         self.game_start_ts: float = time.time()
@@ -280,7 +281,7 @@ class Planner:
                 v = visualize_full_frame(self, hwnd, snap, fps=self._fps_smooth)
                 if v is not None:
                     cv2.imshow("planner", v)
-                    cv2.waitKey(1)
+                    self._last_preview_key = cv2.waitKey(1) & 0xFF
 
             self.last_by_hwnd[hwnd] = snap
             out[hwnd] = snap
@@ -1236,6 +1237,18 @@ class LocalPlanner(Planner):
         self._frame_size_by_hwnd[int(hwnd)] = pil.size
         return pil
 
+    def grab_roi_rgb(
+        self,
+        hwnd: int,
+        roi: Tuple[int, int, int, int],
+    ) -> Optional[np.ndarray]:
+        hay = self._grab_window_pil(int(hwnd))
+        if hay is None:
+            return None
+
+        frame = np.array(hay.convert("RGB"))
+        return _crop_roi_from_rgb(frame, roi)
+
     def _emit_command(self, hwnd: int, command_type: str, payload: Dict[str, Any]) -> None:
         if command_type == "mouse_click":
             self._mouse_click_local(
@@ -1315,6 +1328,161 @@ def _parse_hwnd(raw: str) -> int:
     return int(str(raw), 0)
 
 
+def _timestamp_name(prefix: str) -> str:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    us = int((time.time() % 1) * 1e6)
+    return f"{prefix}_{ts}_{us:06d}.png"
+
+
+def _crop_roi_from_rgb(
+    frame_rgb: np.ndarray,
+    roi: Tuple[int, int, int, int],
+) -> Optional[np.ndarray]:
+    if frame_rgb is None or frame_rgb.size == 0:
+        return None
+
+    h, w = frame_rgb.shape[:2]
+    x1, y1, x2, y2 = roi
+    x1 = max(0, min(w - 1, int(x1)))
+    y1 = max(0, min(h - 1, int(y1)))
+    x2 = max(x1 + 1, min(w, int(x2)))
+    y2 = max(y1 + 1, min(h, int(y2)))
+    return frame_rgb[y1:y2, x1:x2].copy()
+
+
+def _save_rgb_png(path: Path, img_rgb: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+
+
+def _atomic_dump_json_file(
+    path: Path,
+    data: Any,
+    *,
+    shadow_path: Optional[Path] = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{int(time.time() * 1e6)}.tmp")
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+
+    try:
+        tmp_path.replace(path)
+    except Exception:
+        if shadow_path is not None:
+            shadow_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(shadow_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+        raise
+
+
+def _to_localfiles_url(abs_img_path: Path, project_root: Path) -> str:
+    try:
+        rel = abs_img_path.resolve().relative_to(project_root.resolve())
+        value = rel.as_posix()
+    except Exception:
+        value = abs_img_path.resolve().as_posix()
+    return "/data/local-files/?d=" + value
+
+
+def _preprocess_gold_roi_mask(img_rgb: np.ndarray) -> np.ndarray:
+    h, w = img_rgb.shape[:2]
+    scale = 8
+    big = cv2.resize(
+        img_rgb,
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    hsv = cv2.cvtColor(big, cv2.COLOR_RGB2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    goldish = (hue >= 10) & (hue <= 50) & (sat >= 35) & (val >= 85)
+    bright_text = (sat >= 20) & (val >= 150)
+    mask = np.where(goldish | bright_text, 255, 0).astype(np.uint8)
+
+    if not np.any(mask):
+        gray = cv2.cvtColor(big, cv2.COLOR_RGB2GRAY)
+        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    return mask
+
+
+class _LocalGoldRoiWriter:
+    def __init__(self, dump_dir: str = "runs/gold", textarea_name: str = "gold_text"):
+        self.dump_dir = Path(dump_dir)
+        self.img_dir = self.dump_dir / "images"
+        self.tasks_path = self.dump_dir / "ls_tasks.json"
+        self.shadow_path = self.dump_dir / "ls_tasks.shadow.json"
+        self.project_root = Path.cwd()
+        self.textarea_name = str(textarea_name or "gold_text")
+
+        self.img_dir.mkdir(parents=True, exist_ok=True)
+        self.tasks = self._load_tasks()
+
+    def _load_tasks(self) -> list:
+        if not self.tasks_path.exists():
+            return []
+        try:
+            with open(self.tasks_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def _flush(self) -> None:
+        _atomic_dump_json_file(
+            self.tasks_path,
+            self.tasks,
+            shadow_path=self.shadow_path,
+        )
+
+    def save(self, roi_rgb: np.ndarray) -> Path:
+        mask = _preprocess_gold_roi_mask(roi_rgb)
+        fname = _timestamp_name("gold")
+        path = self.img_dir / fname
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(path), mask)
+
+        task = {
+            "data": {
+                "image": _to_localfiles_url(path.resolve(), self.project_root),
+            },
+            "meta": {
+                "kind": "gold_roi",
+                "roi": list(GOLD_ROI),
+                "format": "mask_0_255",
+                "textarea_name": self.textarea_name,
+            },
+            "predictions": [],
+        }
+        self.tasks.append(task)
+        self._flush()
+        return path
+
+
+class _LocalLevelRoiWriter:
+    def __init__(self, dump_dir: str = "runs/level"):
+        self.dump_dir = Path(dump_dir)
+        self.dump_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(self, roi_rgb: np.ndarray) -> Path:
+        path = self.dump_dir / _timestamp_name("level")
+        _save_rgb_png(path, roi_rgb)
+        return path
+
+
 def _find_current_dota_hwnd(preferred_hwnd: Optional[int] = None) -> Optional[int]:
     import win32gui
 
@@ -1370,6 +1538,27 @@ def _build_local_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-input", action="store_true")
     parser.add_argument("--no-preview", action="store_true")
     parser.add_argument(
+        "--capture-gold-roi",
+        "--capture_gold_roi",
+        action="store_true",
+        dest="capture_gold_roi",
+    )
+    parser.add_argument(
+        "--capture-level-roi",
+        "--capture_level_roi",
+        "--captrure-level-roi",
+        "--captrure_level_roi",
+        action="store_true",
+        dest="capture_level_roi",
+    )
+    parser.add_argument("--gold-dump-dir", default="runs/gold")
+    parser.add_argument("--level-dump-dir", default="runs/level")
+    parser.add_argument("--gold-textarea-name", default="gold_text")
+    parser.add_argument("--gold-auto-dump-sec", type=float, default=1.0)
+    parser.add_argument("--roi-capture-key", default="x")
+    parser.add_argument("--gold-capture-key", default="g")
+    parser.add_argument("--level-capture-key", default="l")
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -1410,6 +1599,71 @@ def _run_local_main() -> int:
     )
     planner.block_input = not bool(args.no_input)
 
+    gold_writer = (
+        _LocalGoldRoiWriter(args.gold_dump_dir, args.gold_textarea_name)
+        if args.capture_gold_roi
+        else None
+    )
+    level_writer = (
+        _LocalLevelRoiWriter(args.level_dump_dir) if args.capture_level_roi else None
+    )
+    last_gold_dump_ts = 0.0
+
+    def _single_key_code(value: str, fallback: str) -> int:
+        text = str(value or fallback)
+        return ord(text[0].lower())
+
+    roi_key = _single_key_code(args.roi_capture_key, "x")
+    gold_key = _single_key_code(args.gold_capture_key, "g")
+    level_key = _single_key_code(args.level_capture_key, "l")
+
+    if gold_writer:
+        log.info(
+            "Gold ROI capture enabled: roi=%s dir=%s textarea=%s key=%s shared_key=%s auto=%.2fs",
+            GOLD_ROI,
+            gold_writer.dump_dir,
+            gold_writer.textarea_name,
+            chr(gold_key),
+            chr(roi_key),
+            float(args.gold_auto_dump_sec),
+        )
+    if level_writer:
+        log.info(
+            "Level ROI capture enabled: roi=%s dir=%s key=%s shared_key=%s",
+            LEVEL_ROI,
+            level_writer.dump_dir,
+            chr(level_key),
+            chr(roi_key),
+        )
+    if args.no_preview and level_writer:
+        log.warning("Level ROI capture needs the preview window to receive keypresses")
+
+    def _save_gold_roi(reason: str) -> None:
+        if gold_writer is None:
+            return
+        roi_rgb = planner.grab_roi_rgb(int(hwnd), GOLD_ROI)
+        if roi_rgb is None or roi_rgb.size == 0:
+            log.warning("Gold ROI capture skipped: empty ROI")
+            return
+        try:
+            out = gold_writer.save(roi_rgb)
+            log.info("Saved gold ROI (%s): %s", reason, out)
+        except Exception:
+            log.exception("Failed to save gold ROI")
+
+    def _save_level_roi(reason: str) -> None:
+        if level_writer is None:
+            return
+        roi_rgb = planner.grab_roi_rgb(int(hwnd), LEVEL_ROI)
+        if roi_rgb is None or roi_rgb.size == 0:
+            log.warning("Level ROI capture skipped: empty ROI")
+            return
+        try:
+            out = level_writer.save(roi_rgb)
+            log.info("Saved level ROI (%s): %s", reason, out)
+        except Exception:
+            log.exception("Failed to save level ROI")
+
     min_dt = 1.0 / max(0.1, float(args.fps))
 
     try:
@@ -1421,10 +1675,30 @@ def _run_local_main() -> int:
                 log.exception("Local planner tick failed")
                 time.sleep(0.5)
 
+            now = time.time()
+            if (
+                gold_writer is not None
+                and args.gold_auto_dump_sec > 0
+                and (now - last_gold_dump_ts) >= float(args.gold_auto_dump_sec)
+            ):
+                _save_gold_roi("auto")
+                last_gold_dump_ts = now
+
+            key = -1
             if not args.no_preview:
-                key = cv2.waitKey(1) & 0xFF
+                key = int(getattr(planner, "_last_preview_key", -1))
+                planner._last_preview_key = -1
                 if key in (27, ord("q")):
                     break
+                if key == roi_key:
+                    _save_gold_roi("manual")
+                    _save_level_roi("manual")
+                    last_gold_dump_ts = time.time()
+                elif key == gold_key:
+                    _save_gold_roi("manual")
+                    last_gold_dump_ts = time.time()
+                elif key == level_key:
+                    _save_level_roi("manual")
 
             elapsed = time.time() - t0
             sleep_s = min_dt - elapsed
