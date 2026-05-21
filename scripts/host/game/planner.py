@@ -2,12 +2,19 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import argparse
 from collections import deque
-import time
 import json
+import logging
+from pathlib import Path
+import sys
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from time import perf_counter
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import numpy as np
 import cv2
@@ -127,6 +134,7 @@ class Planner:
         *,
         full_frame_min_dt: float = 0.01,
         win_crop_min_dt: float = 0.01,
+        show_preview: bool = True,
         logger=None,
     ):
         self.hwnds = list(hwnds)
@@ -134,6 +142,7 @@ class Planner:
         self.side = side.lower().strip()
         self.django_bridge = django_bridge
         self.log = logger
+        self.show_preview = bool(show_preview)
 
         self.self_hp = SelfHud()
         self.game_start_ts: float = time.time()
@@ -267,10 +276,11 @@ class Planner:
             if snap is None:
                 continue
 
-            v = visualize_full_frame(self, hwnd, snap, fps=self._fps_smooth)
-            if v is not None:
-                cv2.imshow("12333", v)
-                cv2.waitKey(1)
+            if self.show_preview:
+                v = visualize_full_frame(self, hwnd, snap, fps=self._fps_smooth)
+                if v is not None:
+                    cv2.imshow("planner", v)
+                    cv2.waitKey(1)
 
             self.last_by_hwnd[hwnd] = snap
             out[hwnd] = snap
@@ -904,3 +914,531 @@ def visualize_full_frame(
 
     img = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
     return img
+
+
+class _LocalDxcamDotaCapture:
+    def __init__(self, *, output_idx: int = 0):
+        import dxcam
+
+        self._cam = dxcam.create(output_idx=int(output_idx), output_color="RGB")
+        if self._cam is None:
+            raise RuntimeError(f"dxcam.create(output_idx={output_idx}) returned None")
+
+    @staticmethod
+    def _desktop_bounds() -> tuple[int, int, int, int]:
+        import win32api
+
+        left = win32api.GetSystemMetrics(76)
+        top = win32api.GetSystemMetrics(77)
+        width = win32api.GetSystemMetrics(78)
+        height = win32api.GetSystemMetrics(79)
+        return int(left), int(top), int(left + width), int(top + height)
+
+    @staticmethod
+    def _clamp_region_to_desktop(
+        region: tuple[int, int, int, int],
+    ) -> Optional[tuple[int, int, int, int]]:
+        left, top, right, bottom = region
+        desk_left, desk_top, desk_right, desk_bottom = (
+            _LocalDxcamDotaCapture._desktop_bounds()
+        )
+
+        left = max(left, desk_left)
+        top = max(top, desk_top)
+        right = min(right, desk_right)
+        bottom = min(bottom, desk_bottom)
+
+        if right <= left or bottom <= top:
+            return None
+
+        if desk_left != 0 or desk_top != 0:
+            left -= desk_left
+            right -= desk_left
+            top -= desk_top
+            bottom -= desk_top
+
+        if right <= left or bottom <= top:
+            return None
+
+        return int(left), int(top), int(right), int(bottom)
+
+    @staticmethod
+    def _window_ok(hwnd: int) -> bool:
+        import win32gui
+
+        try:
+            return bool(win32gui.IsWindow(hwnd)) and bool(win32gui.IsWindowVisible(hwnd))
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_screen_client_rect(hwnd: int) -> tuple[int, int, int, int]:
+        import win32gui
+
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(int(hwnd))
+            sx, sy = win32gui.ClientToScreen(int(hwnd), (0, 0))
+            return sx, sy, max(1, right - left), max(1, bottom - top)
+        except Exception:
+            left, top, right, bottom = win32gui.GetWindowRect(int(hwnd))
+            return left, top, max(1, right - left), max(1, bottom - top)
+
+    def grab_window_rgb(self, hwnd: int) -> Optional[np.ndarray]:
+        hwnd = int(hwnd)
+        if not self._window_ok(hwnd):
+            return None
+
+        try:
+            x, y, w, h = self.get_screen_client_rect(hwnd)
+        except Exception:
+            return None
+
+        if w <= 0 or h <= 0:
+            return None
+
+        region = self._clamp_region_to_desktop((x, y, x + w, y + h))
+        if region is None:
+            return None
+
+        try:
+            frame = self._cam.grab(region=region)
+        except Exception:
+            return None
+
+        if frame is None or not isinstance(frame, np.ndarray):
+            return None
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            return None
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8, copy=False)
+
+        return frame.copy()
+
+    def close(self) -> None:
+        stop = getattr(self._cam, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+
+
+class LocalPlanner(Planner):
+    """
+    Direct, single-machine planner for running this file as __main__.
+
+    It replaces the Django bridge with dxcam frames and direct win32 input.
+    The regular server/runtime path keeps using Planner unchanged.
+    """
+
+    def __init__(
+        self,
+        hwnds: List[int],
+        roles: List[str],
+        *,
+        side: str = "radiant",
+        output_idx: int = 0,
+        logger=None,
+        show_preview: bool = True,
+    ):
+        self._local_capture = _LocalDxcamDotaCapture(output_idx=output_idx)
+        self._local_frame_seq: int = 0
+        self._local_init_win32()
+
+        try:
+            super().__init__(
+                hwnds=hwnds,
+                roles=roles,
+                side=side,
+                django_bridge=DjangoPlannerBridge(vm_id="local"),
+                logger=logger,
+                show_preview=show_preview,
+            )
+        except Exception:
+            self._local_capture.close()
+            raise
+
+    def _local_init_win32(self) -> None:
+        import ctypes
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+
+        self._ctypes = ctypes
+        self._win32api = win32api
+        self._win32con = win32con
+        self._win32gui = win32gui
+        self._win32process = win32process
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    def close(self) -> None:
+        self._local_capture.close()
+
+    def _force_foreground(self, hwnd: int) -> None:
+        hwnd = int(hwnd)
+        try:
+            if self._win32gui.IsIconic(hwnd):
+                self._win32gui.ShowWindow(hwnd, self._win32con.SW_RESTORE)
+
+            self._win32gui.ShowWindow(hwnd, self._win32con.SW_SHOWNORMAL)
+
+            fore = self._win32gui.GetForegroundWindow()
+            ftid = (
+                self._win32process.GetWindowThreadProcessId(fore)[0] if fore else 0
+            )
+            ctid = self._win32api.GetCurrentThreadId()
+
+            self._user32.AttachThreadInput(ftid, ctid, True)
+            try:
+                self._win32gui.BringWindowToTop(hwnd)
+                self._win32gui.SetForegroundWindow(hwnd)
+                self._win32gui.SetActiveWindow(hwnd)
+            finally:
+                self._user32.AttachThreadInput(ftid, ctid, False)
+
+            time.sleep(0.06)
+        except Exception:
+            try:
+                self._win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.06)
+            except Exception:
+                pass
+
+    def _vk_scan_code(self, vk_code: int) -> int:
+        try:
+            return int(self._user32.MapVirtualKeyW(int(vk_code), 0))
+        except Exception:
+            return 0
+
+    def _key_down_local(self, vk_code: int) -> None:
+        vk_code = int(vk_code)
+        self._win32api.keybd_event(vk_code, self._vk_scan_code(vk_code), 0, 0)
+
+    def _key_up_local(self, vk_code: int) -> None:
+        vk_code = int(vk_code)
+        self._win32api.keybd_event(
+            vk_code,
+            self._vk_scan_code(vk_code),
+            self._win32con.KEYEVENTF_KEYUP,
+            0,
+        )
+
+    def _tap_vk_local(
+        self,
+        vk_code: int,
+        *,
+        hold_ms: int = 25,
+        hwnd: Optional[int] = None,
+        force_fg: bool = True,
+    ) -> None:
+        if hwnd is not None and force_fg:
+            self._force_foreground(int(hwnd))
+
+        self._key_down_local(vk_code)
+        time.sleep(max(0, int(hold_ms)) / 1000.0)
+        self._key_up_local(vk_code)
+
+    def _mouse_click_local(
+        self,
+        hwnd: int,
+        x: int,
+        y: int,
+        *,
+        button: str = "right",
+        clicks: int = 1,
+        coord_space: str = "client",
+        force_fg: bool = True,
+    ) -> None:
+        hwnd = int(hwnd)
+        button = str(button).lower()
+        coord_space = str(coord_space)
+
+        if force_fg:
+            self._force_foreground(hwnd)
+
+        if coord_space == "screen":
+            sx, sy = int(x), int(y)
+        else:
+            win_x, win_y, win_w, win_h = (
+                self._local_capture.get_screen_client_rect(hwnd)
+            )
+            cx = max(0, min(win_w - 1, int(x)))
+            cy = max(0, min(win_h - 1, int(y)))
+            sx, sy = int(win_x + cx), int(win_y + cy)
+
+        self._win32api.SetCursorPos((sx, sy))
+        time.sleep(0.01)
+
+        if button == "left":
+            down_flag = self._win32con.MOUSEEVENTF_LEFTDOWN
+            up_flag = self._win32con.MOUSEEVENTF_LEFTUP
+        elif button == "middle":
+            down_flag = self._win32con.MOUSEEVENTF_MIDDLEDOWN
+            up_flag = self._win32con.MOUSEEVENTF_MIDDLEUP
+        else:
+            down_flag = self._win32con.MOUSEEVENTF_RIGHTDOWN
+            up_flag = self._win32con.MOUSEEVENTF_RIGHTUP
+
+        for _ in range(max(1, int(clicks))):
+            self._win32api.mouse_event(down_flag, 0, 0, 0, 0)
+            time.sleep(0.02)
+            self._win32api.mouse_event(up_flag, 0, 0, 0, 0)
+            time.sleep(0.03)
+
+    def _attack_click_local(
+        self,
+        hwnd: int,
+        x: int,
+        y: int,
+        *,
+        coord_space: str = "client",
+        force_fg: bool = True,
+    ) -> None:
+        if force_fg:
+            self._force_foreground(int(hwnd))
+        self._tap_vk_local(ord("A"), hold_ms=25, hwnd=hwnd, force_fg=False)
+        time.sleep(0.03)
+        self._mouse_click_local(
+            hwnd,
+            x,
+            y,
+            button="left",
+            clicks=1,
+            coord_space=coord_space,
+            force_fg=False,
+        )
+
+    def _get_client_rect(self, hwnd: int) -> Tuple[int, int, int, int]:
+        size = self._frame_size_by_hwnd.get(int(hwnd))
+        if size is None:
+            _, _, w, h = self._local_capture.get_screen_client_rect(int(hwnd))
+            size = (int(w), int(h))
+            self._frame_size_by_hwnd[int(hwnd)] = size
+
+        w, h = size
+        return 0, 0, int(w), int(h)
+
+    def _grab_window_pil(self, hwnd: int) -> Optional[Image.Image]:
+        frame_rgb = self._local_capture.grab_window_rgb(int(hwnd))
+        if frame_rgb is None:
+            if self.log:
+                self.log.debug(
+                    f"[LocalPlanner] dxcam returned no frame for hwnd={hex(int(hwnd))}"
+                )
+            return None
+
+        self._local_frame_seq += 1
+        self._current_frame_id_by_hwnd[int(hwnd)] = self._local_frame_seq
+        self._frame_ts_by_hwnd[int(hwnd)] = time.time()
+
+        pil = Image.fromarray(frame_rgb, mode="RGB")
+        self._frame_size_by_hwnd[int(hwnd)] = pil.size
+        return pil
+
+    def _emit_command(self, hwnd: int, command_type: str, payload: Dict[str, Any]) -> None:
+        if command_type == "mouse_click":
+            self._mouse_click_local(
+                int(payload.get("hwnd", hwnd)),
+                int(payload["x"]),
+                int(payload["y"]),
+                button=str(payload.get("button", "right")),
+                clicks=int(payload.get("clicks", 1)),
+                coord_space=str(payload.get("coord_space", "client")),
+                force_fg=bool(payload.get("force_fg", True)),
+            )
+            return
+
+        if command_type == "attack_click":
+            self._attack_click_local(
+                int(payload.get("hwnd", hwnd)),
+                int(payload["x"]),
+                int(payload["y"]),
+                coord_space=str(payload.get("coord_space", "client")),
+                force_fg=bool(payload.get("force_fg", True)),
+            )
+            return
+
+        if command_type == "key_press":
+            self._tap_vk_local(
+                int(payload["vk_code"]),
+                hold_ms=int(payload.get("hold_ms", 25)),
+                hwnd=int(payload.get("hwnd", hwnd)),
+                force_fg=bool(payload.get("force_fg", True)),
+            )
+            return
+
+        if command_type == "key_event":
+            self._send_key_to_hwnd(
+                int(payload.get("hwnd", hwnd)),
+                int(payload["vk_code"]),
+                bool(payload["down"]),
+            )
+            return
+
+        if self.log:
+            self.log.warning(f"[LocalPlanner] unsupported command: {command_type}")
+
+    def _send_mouse_click_client(self, hwnd, x, y, button="right"):
+        self._mouse_click_local(
+            int(hwnd),
+            int(x),
+            int(y),
+            button=str(button),
+            clicks=1,
+            coord_space="client",
+        )
+
+    def _send_key_to_hwnd(self, hwnd, vk_code, down):
+        self._force_foreground(int(hwnd))
+        if bool(down):
+            self._key_down_local(int(vk_code))
+        else:
+            self._key_up_local(int(vk_code))
+
+    def _press_vk_global(self, vk: int, *, hold_ms: int = 25) -> None:
+        for hwnd in self.hwnds:
+            self._tap_vk_local(int(vk), hold_ms=hold_ms, hwnd=int(hwnd))
+
+    def _press_vk_for_hwnd(
+        self,
+        hwnd: int,
+        vk: int,
+        *,
+        hold_ms: int = 25,
+        force_fg: bool = True,
+    ) -> None:
+        self._tap_vk_local(int(vk), hold_ms=hold_ms, hwnd=int(hwnd), force_fg=force_fg)
+
+
+def _parse_hwnd(raw: str) -> int:
+    return int(str(raw), 0)
+
+
+def _find_current_dota_hwnd(preferred_hwnd: Optional[int] = None) -> Optional[int]:
+    import win32gui
+
+    def _title_matches(hwnd: int) -> bool:
+        try:
+            title = (win32gui.GetWindowText(int(hwnd)) or "").strip().lower()
+        except Exception:
+            return False
+        return "dota 2" in title
+
+    def _window_ok(hwnd: int) -> bool:
+        try:
+            return (
+                bool(win32gui.IsWindow(int(hwnd)))
+                and bool(win32gui.IsWindowVisible(int(hwnd)))
+                and not bool(win32gui.IsIconic(int(hwnd)))
+            )
+        except Exception:
+            return False
+
+    if preferred_hwnd is not None:
+        hwnd = int(preferred_hwnd)
+        if _window_ok(hwnd):
+            return hwnd
+        raise RuntimeError(f"hwnd is not a visible live window: {hwnd}")
+
+    foreground = win32gui.GetForegroundWindow()
+    if foreground and _window_ok(foreground) and _title_matches(foreground):
+        return int(foreground)
+
+    found: Optional[int] = None
+
+    def _enum_cb(hwnd, _):
+        nonlocal found
+        if found is not None:
+            return
+        if _window_ok(int(hwnd)) and _title_matches(int(hwnd)):
+            found = int(hwnd)
+
+    win32gui.EnumWindows(_enum_cb, None)
+    return found
+
+
+def _build_local_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run Planner locally against the current Dota 2 window via dxcam."
+    )
+    parser.add_argument("--hwnd", type=_parse_hwnd, default=None)
+    parser.add_argument("--side", choices=("radiant", "dire"), default="radiant")
+    parser.add_argument("--role", default="unknown")
+    parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument("--output-idx", type=int, default=0)
+    parser.add_argument("--no-input", action="store_true")
+    parser.add_argument("--no-preview", action="store_true")
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+    )
+    return parser
+
+
+def _run_local_main() -> int:
+    args = _build_local_arg_parser().parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level)),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    log = logging.getLogger("planner.local")
+
+    hwnd = _find_current_dota_hwnd(args.hwnd)
+    if hwnd is None:
+        log.error("Dota 2 window was not found. Focus Dota or pass --hwnd 0x...")
+        return 2
+
+    log.info(
+        "Local planner attached to hwnd=%s side=%s role=%s input=%s preview=%s",
+        hex(int(hwnd)),
+        args.side,
+        args.role,
+        "off" if args.no_input else "on",
+        "off" if args.no_preview else "on",
+    )
+
+    planner = LocalPlanner(
+        hwnds=[int(hwnd)],
+        roles=[str(args.role)],
+        side=str(args.side),
+        output_idx=int(args.output_idx),
+        logger=log,
+        show_preview=not bool(args.no_preview),
+    )
+    planner.block_input = not bool(args.no_input)
+
+    min_dt = 1.0 / max(0.1, float(args.fps))
+
+    try:
+        while True:
+            t0 = time.time()
+            try:
+                planner.tick_one()
+            except Exception:
+                log.exception("Local planner tick failed")
+                time.sleep(0.5)
+
+            if not args.no_preview:
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+
+            elapsed = time.time() - t0
+            sleep_s = min_dt - elapsed
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+    except KeyboardInterrupt:
+        log.info("Stopping local planner")
+    finally:
+        planner.close()
+        if not args.no_preview:
+            cv2.destroyAllWindows()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_local_main())
