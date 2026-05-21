@@ -136,6 +136,7 @@ class Planner:
         win_crop_min_dt: float = 0.01,
         show_preview: bool = True,
         logger=None,
+        collect_catboost_dataset: bool = False,
     ):
         self.hwnds = list(hwnds)
         self.roles = list(roles)
@@ -191,7 +192,7 @@ class Planner:
         self.cls2idx = {c: i for i, c in enumerate(self.classes)}
 
         self.brains: Dict[int, Brain] = {
-            hwnd: Brain(hwnd, planner=self, logger=logger, role=role)
+            hwnd: Brain(hwnd, planner=self, logger=logger, role=role,collect_catboost_dataset=collect_catboost_dataset)
             for hwnd, role in zip(self.hwnds, self.roles)
         }
 
@@ -294,6 +295,7 @@ class Planner:
                 brain.tick_one(
                     Snapshot(ts=snap.ts, hwnd=snap.hwnd, combined=snap.combined)
                 )
+
 
         return out
 
@@ -1053,6 +1055,7 @@ class LocalPlanner(Planner):
                 django_bridge=DjangoPlannerBridge(vm_id="local"),
                 logger=logger,
                 show_preview=show_preview,
+                collect_catboost_dataset=True
             )
         except Exception:
             self._local_capture.close()
@@ -1365,7 +1368,7 @@ def _build_local_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hwnd", type=_parse_hwnd, default=None)
     parser.add_argument("--side", choices=("radiant", "dire"), default="radiant")
     parser.add_argument("--role", default="unknown")
-    parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument("--fps", type=float, default=40.0)
     parser.add_argument("--output-idx", type=int, default=0)
     parser.add_argument("--no-input", action="store_true")
     parser.add_argument("--no-preview", action="store_true")
@@ -1417,6 +1420,7 @@ def _run_local_main() -> int:
             t0 = time.time()
             try:
                 planner.tick_one()
+
             except Exception:
                 log.exception("Local planner tick failed")
                 time.sleep(0.5)

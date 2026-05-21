@@ -288,6 +288,7 @@ class Brain:
         planner: "Planner",
         logger=None,
         role: str = "unknown",
+        collect_catboost_dataset: bool = False,
     ):
         self.hwnd = hwnd
         self.pl = planner
@@ -387,7 +388,7 @@ class Brain:
         self.catboost_dataset_csv_path: str = CATBOOST_DATASET_CSV_PATH
         self.use_catboost_brain_state: bool = True
         self._catboost_dataset_rows: List[Dict[str, Any]] = []
-        self.collect_catboost_dataset: bool = False
+        self.collect_catboost_dataset: bool = collect_catboost_dataset
 
         # --- lane farming FSM memory ---
         self._lane_farm_phase: LaneFarmPhase = LaneFarmPhase.SELECT_SEGMENT
@@ -470,8 +471,8 @@ class Brain:
                 predicted_state = self._predict_brain_state_with_catboost(features)
                 self._set_state(predicted_state)
             """
+
         self._collect_catboost_train_row(senses)
-        self._set_state(BrainState.LANING)
         self._tick_state(c, senses)
 
     def _tick_state(self, c: Dict[str, Any], s: Senses):

@@ -13,7 +13,7 @@ DEFAULT_LANDMARKS_DIR = Path("config/minimap_landmarks.json")
 DEFAULT_HERO_BUILDS_DIR = Path("config/hero_builds.json")
 
 OUT_FILE_PARSER_ITEMS = "config/items_parsed.json"
-CATBOOST_DATASET_CSV_PATH = "config/catboost_dataset_csv.csv"
+CATBOOST_DATASET_CSV_PATH = "runs/catboost_dataset.csv"
 
 os.environ["TCL_LIBRARY"] = (
     r"C:\Users\bajojo\AppData\Local\Programs\Python\Python313\tcl\tcl8.6"
@@ -66,7 +66,7 @@ JSON_ENSURE_ASCII = False
 HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)  # x1, y1, x2, y2
 GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
 LEVEL_ROI: Tuple[int, int, int, int] = (360, 500, 390, 530)
-TIME_ROI: Tuple[int, int, int, int] = (880, 15, 1020, 45)
+
 
 # tower_detectore
 TIMEOUT_SEC_TOWER_DETECTOR = 60.0
