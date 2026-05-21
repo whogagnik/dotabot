@@ -588,6 +588,7 @@ def build_full_augmented_dataset(
 def train_hp_seq_all(
     ls_json: str,
     project_root: str,
+    textarea_name: str = "hp_text",
     img_h: int = 32,
     img_w: int = 128,
     max_len: int = 8,
@@ -608,9 +609,9 @@ def train_hp_seq_all(
 
     print(f"[i] parsing LS export: {ls_json}")
     samples = parse_hp_ls_export(
-        ls_json, project_root=project_root, textarea_name="hp_text"
+        ls_json, project_root=project_root, textarea_name=textarea_name
     )
-    print(f"[i] got {len(samples)} labeled HP bars")
+    print(f"[i] got {len(samples)} labeled samples from textarea '{textarea_name}'")
 
     if not samples:
         raise RuntimeError("Нет размеченных сэмплов в LS JSON")
@@ -851,6 +852,7 @@ def main():
         help="Корень проекта (если в LS пути были относительные через /data/local-files/?d=...)",
     )
 
+    ap.add_argument("--textarea_name", type=str, default="hp_text")
     ap.add_argument("--img_h", type=int, default=56)
     ap.add_argument("--img_w", type=int, default=520)
     ap.add_argument("--max_len", type=int, default=9)
@@ -901,6 +903,7 @@ def main():
     train_hp_seq_all(
         ls_json=args.ls_json,
         project_root=args.project_root,
+        textarea_name=args.textarea_name,
         img_h=args.img_h,
         img_w=args.img_w,
         max_len=args.max_len,
