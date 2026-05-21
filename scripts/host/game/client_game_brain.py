@@ -1125,6 +1125,34 @@ class Brain:
         self.last_action_ts = now
         return True
 
+    def _right_click_on_screen_throttled(
+        self,
+        x: float,
+        y: float,
+        *,
+        y_offset: int = 10,
+        cooldown: Optional[float] = None,
+    ) -> bool:
+        """
+        Обычный правый клик по экранной цели без A-click.
+        Используется для фокуса enemy hero, где левый клик нежелателен.
+        """
+        now = time.time()
+        cd = self._attack_click_cooldown if cooldown is None else float(cooldown)
+        if now - self._last_attack_click_ts < cd:
+            return False
+
+        self.pl.click_on_screen(
+            self.hwnd,
+            int(x),
+            int(y) + int(y_offset),
+            mouse_button="right",
+            attack=False,
+        )
+        self._last_attack_click_ts = now
+        self.last_action_ts = now
+        return True
+
     def _minimap_click_throttled(
         self, x: float, y: float, *, cooldown: Optional[float] = None
     ) -> bool:
@@ -3118,14 +3146,16 @@ class Brain:
 
         # Если можем добить врага с низким hp — приоритетно бьём
         if enemy_hp is not None and enemy_hp <= 0.25:
-            attacked = self._attack_on_screen_throttled(ex, ey, y_offset=10, cooldown=1)
+            attacked = self._right_click_on_screen_throttled(
+                ex, ey, y_offset=10, cooldown=1
+            )
             if attacked:
                 self.last_action_ts = time.time()
             return
 
         # Если в радиусе атаки — атакуем
         if best_dist <= attack_dist_px:
-            attacked = self._attack_on_screen_throttled(
+            attacked = self._right_click_on_screen_throttled(
                 ex, ey, y_offset=10, cooldown=0.25
             )
             if attacked:
