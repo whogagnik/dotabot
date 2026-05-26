@@ -1638,9 +1638,6 @@ def _run_local_main() -> int:
             chr(level_key),
             chr(roi_key),
         )
-    if args.no_preview and level_writer:
-        log.warning("Level ROI capture needs the preview window to receive keypresses")
-
     def _save_gold_roi(reason: str) -> None:
         if gold_writer is None:
             return
@@ -1667,6 +1664,38 @@ def _run_local_main() -> int:
         except Exception:
             log.exception("Failed to save level ROI")
 
+    import win32api
+    import win32con
+
+    def _vk_from_key(value: str, fallback: str) -> int:
+        text = str(value or fallback).strip().lower()
+        if not text:
+            text = str(fallback).strip().lower()
+        if text in ("esc", "escape"):
+            return int(win32con.VK_ESCAPE)
+        if text.startswith("f") and text[1:].isdigit():
+            n = int(text[1:])
+            if 1 <= n <= 24:
+                return int(win32con.VK_F1 + n - 1)
+        return ord(text[0].upper())
+
+    roi_vk = _vk_from_key(args.roi_capture_key, "x")
+    gold_vk = _vk_from_key(args.gold_capture_key, "g")
+    level_vk = _vk_from_key(args.level_capture_key, "l")
+    quit_vk = ord("Q")
+    escape_vk = int(win32con.VK_ESCAPE)
+    pressed_keys: set[int] = set()
+
+    def _pressed_once(vk: int) -> bool:
+        vk = int(vk)
+        pressed = bool(win32api.GetAsyncKeyState(vk) & 0x8000)
+        was_pressed = vk in pressed_keys
+        if pressed:
+            pressed_keys.add(vk)
+            return not was_pressed
+        pressed_keys.discard(vk)
+        return False
+
     min_dt = 1.0 / max(0.1, float(args.fps))
 
     try:
@@ -1688,21 +1717,20 @@ def _run_local_main() -> int:
                 _save_gold_roi("auto")
                 last_gold_dump_ts = now
 
-            key = -1
             if not args.no_preview:
-                key = int(getattr(planner, "_last_preview_key", -1))
                 planner._last_preview_key = -1
-                if key in (27, ord("q")):
-                    break
-                if key == roi_key:
-                    _save_gold_roi("manual")
-                    _save_level_roi("manual")
-                    last_gold_dump_ts = time.time()
-                elif key == gold_key:
-                    _save_gold_roi("manual")
-                    last_gold_dump_ts = time.time()
-                elif key == level_key:
-                    _save_level_roi("manual")
+
+            if _pressed_once(escape_vk) or _pressed_once(quit_vk):
+                break
+            if _pressed_once(roi_vk):
+                _save_gold_roi("manual")
+                _save_level_roi("manual")
+                last_gold_dump_ts = time.time()
+            elif _pressed_once(gold_vk):
+                _save_gold_roi("manual")
+                last_gold_dump_ts = time.time()
+            elif _pressed_once(level_vk):
+                _save_level_roi("manual")
 
             elapsed = time.time() - t0
             sleep_s = min_dt - elapsed
