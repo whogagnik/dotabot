@@ -65,7 +65,7 @@ JSON_ENSURE_ASCII = False
 
 HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)  # x1, y1, x2, y2
 GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
-LEVEL_ROI: Tuple[int, int, int, int] = (360, 500, 390, 530)
+LEVEL_ROI: Tuple[int, int, int, int] = (228, 467, 236, 475)
 
 
 # tower_detectore
