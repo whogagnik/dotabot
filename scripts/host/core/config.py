@@ -67,6 +67,11 @@ HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)  # x1, y1, x2, y2
 GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
 LEVEL_ROI: Tuple[int, int, int, int] = (228, 467, 236, 475)
 
+LEVEL_TEMPLATES_DIR = Path("images/levels")
+LEVEL_MIN = 1
+LEVEL_MAX = 30
+LEVEL_MATCH_MIN_SCORE = 0.85
+
 HUD_HP_UPSCALE = 8
 HUD_HP_TEXT_RGB_MIN = (210, 210, 210)
 HUD_HP_TEXT_RGB_MAX = (255, 255, 255)

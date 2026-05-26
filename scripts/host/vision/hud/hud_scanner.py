@@ -17,7 +17,11 @@ from scripts.host.core.config import (
     HUD_HP_TEXT_RGB_MAX,
     HUD_HP_TEXT_RGB_MIN,
     HUD_HP_UPSCALE,
+    LEVEL_MATCH_MIN_SCORE,
+    LEVEL_MAX,
+    LEVEL_MIN,
     LEVEL_ROI,
+    LEVEL_TEMPLATES_DIR,
 )
 from scripts.host.ml.infer import load_hp_ocr_net
 
@@ -35,6 +39,7 @@ class SelfHud:
         self.hp_img_w: int = int(getattr(self.hp_net, "_hp_W"))
         self.hp_max_len: int = int(getattr(self.hp_net, "_hp_T"))
         self.hp_idx2char: Dict[int, str] = getattr(self.hp_net, "_hp_idx2char")
+        self.level_templates: Dict[int, np.ndarray] = self._load_level_templates()
 
     @staticmethod
     def _crop_roi_from_rgb(
@@ -61,6 +66,32 @@ class SelfHud:
             return int(digits)
         except ValueError:
             return None
+
+    @staticmethod
+    def _preprocess_level_image(img_rgb: np.ndarray) -> Optional[np.ndarray]:
+        if img_rgb is None or img_rgb.size == 0:
+            return None
+        if img_rgb.ndim == 2:
+            gray = img_rgb
+        else:
+            gray = cv2.cvtColor(img_rgb[:, :, :3], cv2.COLOR_RGB2GRAY)
+        return gray.astype(np.float32)
+
+    def _load_level_templates(self) -> Dict[int, np.ndarray]:
+        templates: Dict[int, np.ndarray] = {}
+        for level in range(int(LEVEL_MIN), int(LEVEL_MAX) + 1):
+            path = LEVEL_TEMPLATES_DIR / f"{level}.png"
+            img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                raise FileNotFoundError(f"Level template not found: {path}")
+
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            prepared = self._preprocess_level_image(img_rgb)
+            if prepared is None:
+                raise ValueError(f"Empty level template: {path}")
+            templates[level] = prepared
+
+        return templates
 
     def _preprocess_hp_roi_rawmask(self, img_rgb: np.ndarray) -> Optional[np.ndarray]:
         if img_rgb is None or img_rgb.size == 0:
@@ -166,9 +197,33 @@ class SelfHud:
         return float(cur_hp) / float(max_hp)
 
     def get_hero_level(self, window_rgb: np.ndarray) -> Optional[int]:
-        """Stub for future hero level OCR."""
         if window_rgb is None or window_rgb.size == 0:
             return None
 
-        self._crop_roi_from_rgb(window_rgb, LEVEL_ROI)
-        return None
+        crop = self._crop_roi_from_rgb(window_rgb, LEVEL_ROI)
+        prepared = self._preprocess_level_image(crop)
+        if prepared is None:
+            return None
+
+        best_level: Optional[int] = None
+        best_score = float("-inf")
+
+        for level, template in self.level_templates.items():
+            target = prepared
+            if target.shape != template.shape:
+                target = cv2.resize(
+                    target,
+                    (template.shape[1], template.shape[0]),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            mse = float(np.mean((target - template) ** 2))
+            score = 1.0 - mse / (255.0 * 255.0)
+            if score > best_score:
+                best_score = score
+                best_level = level
+
+        if best_level is None or best_score < LEVEL_MATCH_MIN_SCORE:
+            return None
+
+        return best_level
