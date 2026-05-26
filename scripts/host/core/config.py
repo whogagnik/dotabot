@@ -67,6 +67,13 @@ HP_ROI: Tuple[int, int, int, int] = (375, 453, 440, 460)  # x1, y1, x2, y2
 GOLD_ROI: Tuple[int, int, int, int] = (5, 460, 32, 471)
 LEVEL_ROI: Tuple[int, int, int, int] = (228, 467, 236, 475)
 
+HUD_HP_UPSCALE = 8
+HUD_HP_TEXT_RGB_MIN = (210, 210, 210)
+HUD_HP_TEXT_RGB_MAX = (255, 255, 255)
+HUD_HP_MORPH_KERNEL_SIZE = (2, 2)
+HUD_HP_MIN_COMBINED_DIGITS = 4
+HUD_HP_SPLIT_MAX_RATIO = 0.3
+
 
 # tower_detectore
 TIMEOUT_SEC_TOWER_DETECTOR = 60.0

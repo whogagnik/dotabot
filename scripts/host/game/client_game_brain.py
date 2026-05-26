@@ -161,6 +161,7 @@ class Senses:
     alive: bool
     t_game: float
     hp_ratio: Optional[float]
+    hero_level: Optional[int]
     low_hp: bool
 
     side: str
@@ -225,6 +226,7 @@ class Senses:
             "alive": bool(self.alive),
             "t_game": float(self.t_game),
             "hp_ratio": None if self.hp_ratio is None else float(self.hp_ratio),
+            "hero_level": self.hero_level,
             "low_hp": bool(self.low_hp),
             "side": self.side,
             "role": self.role,
@@ -515,6 +517,15 @@ class Brain:
 
         hp_ratio_from_hud = c.get("hp_ratio")
         hp_ratio_from_screen = c.get("heroes", {}).get("self", [])
+        hero_level_raw = c.get("hero_level")
+        hero_level: Optional[int] = None
+        if hero_level_raw is not None:
+            try:
+                parsed_level = int(hero_level_raw)
+                if parsed_level > 0:
+                    hero_level = parsed_level
+            except (TypeError, ValueError):
+                hero_level = None
 
         if len(hp_ratio_from_screen) == 0:
             hp_ratio_from_screen = None
@@ -576,6 +587,7 @@ class Brain:
             alive=alive,
             t_game=t_game,
             hp_ratio=hp_ratio,
+            hero_level=hero_level,
             low_hp=low_hp,
             side=self._get_side(),
             role=self._get_role(),

@@ -146,7 +146,7 @@ class Planner:
         self.show_preview = bool(show_preview)
         self._last_preview_key: int = -1
 
-        self.self_hp = SelfHud()
+        self.hud_scanner = SelfHud()
         self.game_start_ts: float = time.time()
 
         self.full_frame_min_dt = max(0.0, float(full_frame_min_dt))
@@ -719,7 +719,8 @@ class Planner:
         units = _filter_units_from_peaks(peaks, self.classes)
 
         frame = np.array(hay)
-        hp_cur, hp_max = self.self_hp.get_hp(frame)
+        hp_cur, hp_max = self.hud_scanner.get_hp(frame)
+        hero_level = self.hud_scanner.get_hero_level(frame)
 
         now_s = self._frame_ts_by_hwnd.get(hwnd, time.time())
         t_game = now_s - self.game_start_ts
@@ -746,6 +747,7 @@ class Planner:
             "landmarks": self.landmarks,
             "hp_pair": (hp_cur, hp_max),
             "hp_ratio": hp_ratio,
+            "hero_level": hero_level,
             "gold": 123,
             "alive": alive,
             "t_game": t_game,
@@ -784,6 +786,7 @@ def visualize_full_frame(
     units = combined.get("map", {})
     towers = combined.get("towers", {})
     hp_pair = combined.get("hp_pair")
+    hero_level = combined.get("hero_level")
 
     col_heroes = {
         "enemy": (0, 0, 255),
@@ -902,6 +905,18 @@ def visualize_full_frame(
             1,
             cv2.LINE_AA,
         )
+        y += 20
+
+    cv2.putText(
+        img,
+        f"Hero level: {hero_level if hero_level is not None else '?'}",
+        (10, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
 
     fps_text = f"{fps:5.1f} FPS"
     cv2.putText(
