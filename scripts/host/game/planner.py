@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
@@ -20,7 +21,10 @@ import numpy as np
 import cv2
 from PIL import Image
 
-from scripts.host.vision.screen_hp_scanner import scan_hp_bars_on_screen, HpBarBox
+from scripts.host.vision.screen_hp_scanner import (
+    HpBarBox,
+    scan_hp_bars_on_screen,
+)
 from scripts.host.core.config import *
 from scripts.host.vision.hud.hud_scanner import SelfHud
 from scripts.host.core.utils import debug_log_result
@@ -30,7 +34,9 @@ from scripts.host.ml.infer import (
     load_minimap_model,
 )
 from scripts.host.vision.tower_detector import TowerVisibilityTracker, load_landmarks  # type: ignore
-from scripts.host.game.client_game_brain import Brain
+from scripts.host.game.client_game_brain import Brain, BrainState
+from scripts.host.game.game_end import GameEndDetector
+from scripts.host.game.ai.preview import draw_brain_overlay
 from scripts.host.core.django_service import DjangoPlannerBridge
 
 MAX_UNITS = {
@@ -40,6 +46,19 @@ MAX_UNITS = {
 }
 
 MERGE_RADIUS_PCT = 3.0
+PLANNER_MOUSE_HOLD_MS = 25
+PLANNER_MOUSE_SETTLE_MS = 25
+PLANNER_MINIMAP_MOUSE_SETTLE_MS = 400
+PLANNER_MINIMAP_MOUSE_HOLD_MS = 400
+# Keep the cursor still after mouse-up before another planner action (notably
+# the periodic F1 camera-centre) can move it to a different Dota window.
+PLANNER_POST_CLICK_CURSOR_HOLD_MS = 30
+
+
+def _timed_hybrid_hp_scan(frame_rgb: np.ndarray):
+    started = perf_counter()
+    result = scan_hp_bars_on_screen(frame_rgb)
+    return result, (perf_counter() - started) * 1000.0
 
 
 def _to_rgb_array(img: Any) -> np.ndarray:
@@ -132,6 +151,7 @@ class Planner:
         django_bridge: DjangoPlannerBridge,
         side: str = "radiant",
         *,
+        heroes: Optional[List[str]] = None,
         full_frame_min_dt: float = 0.01,
         win_crop_min_dt: float = 0.01,
         show_preview: bool = True,
@@ -140,6 +160,9 @@ class Planner:
     ):
         self.hwnds = list(hwnds)
         self.roles = list(roles)
+        self.heroes = list(heroes or ["unknown"] * len(self.hwnds))
+        if len(self.heroes) != len(self.hwnds):
+            raise ValueError("hwnds and heroes must have same length")
         self.side = side.lower().strip()
         self.django_bridge = django_bridge
         self.log = logger
@@ -164,6 +187,15 @@ class Planner:
         self._fps_prev_ts: float = time.time()
         self._fps_smooth: float = 0.0
         self._current_frame_id_by_hwnd: Dict[int, int] = {}
+        # CPU HP detection runs while the main thread is waiting on CUDA.
+        self._hp_scan_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="planner-hp-scan"
+        )
+        self.trace_interval_sec: float = 5.0
+        self._trace_last_report_ts: float = time.monotonic()
+        self._trace_samples: Dict[str, deque] = defaultdict(lambda: deque(maxlen=300))
+        self.preview_interval_sec: float = 1.0 / 15.0
+        self._last_preview_ts: float = 0.0
 
         with open(DEFAULT_LANDMARKS_DIR, "r", encoding="utf-8") as f:
             _landmarks_raw = json.load(f)
@@ -193,8 +225,15 @@ class Planner:
         self.cls2idx = {c: i for i, c in enumerate(self.classes)}
 
         self.brains: Dict[int, Brain] = {
-            hwnd: Brain(hwnd, planner=self, logger=logger, role=role,collect_catboost_dataset=collect_catboost_dataset)
-            for hwnd, role in zip(self.hwnds, self.roles)
+            hwnd: Brain(
+                hwnd,
+                planner=self,
+                logger=logger,
+                role=role,
+                hero_name=hero,
+                collect_catboost_dataset=collect_catboost_dataset,
+            )
+            for hwnd, role, hero in zip(self.hwnds, self.roles, self.heroes)
         }
 
         self.forbidden_ui_rects = [
@@ -206,8 +245,61 @@ class Planner:
         ]
 
         self.block_input: bool = True
+        self.game_end_detector = GameEndDetector()
+        self.game_end_active = False
+        self.game_end_complete = False
+        self._game_end_lobby_hwnds: set[int] = set()
+        self._game_end_clicked_frame: Dict[int, int] = {}
+        self._recovery_phase_by_hwnd: Dict[int, str] = {}
+        self._recovery_clicked_frame: Dict[int, int] = {}
+        self._return_to_game_clicked_hwnds: set[int] = set()
+        self._spell_level_clicked_frame: Dict[int, int] = {}
         self._last_center_ts_by_hwnd: Dict[int, float] = {}
-        self._center_cooldown_sec: float = 0.15
+        self._center_cooldown_sec: float = 3.0
+
+    def _trace_timing(self, stage: str, started: float) -> None:
+        self._trace_samples[stage].append((perf_counter() - started) * 1000.0)
+
+    def _report_trace_if_due(self) -> None:
+        now = time.monotonic()
+        if now - self._trace_last_report_ts < self.trace_interval_sec:
+            return
+        self._trace_last_report_ts = now
+        if not self.log or not self._trace_samples:
+            return
+
+        rows = []
+        means: Dict[str, float] = {}
+        for stage, samples in self._trace_samples.items():
+            if not samples:
+                continue
+            values = sorted(samples)
+            mean = sum(values) / len(values)
+            means[stage] = mean
+            p50 = values[(len(values) - 1) // 2]
+            p95 = values[round((len(values) - 1) * .95)]
+            rows.append((mean, stage, p50, p95, values[-1], len(values)))
+        rows.sort(reverse=True)
+        summary = " | ".join(
+            f"{stage}: mean={mean:.2f} p50={p50:.2f} p95={p95:.2f} "
+            f"max={maximum:.2f} n={count}"
+            for mean, stage, p50, p95, maximum, count in rows
+        )
+        hp_overlap_saved = max(
+            0.0,
+            means.get("screen_hp_cpu", 0.0) - means.get("screen_hp_wait", 0.0),
+        )
+        self.log.debug(
+            "[PLANNER TRACE ms] hp_overlap_saved=%.2f | %s",
+            hp_overlap_saved,
+            summary,
+        )
+
+    def close(self) -> None:
+        """Release background workers owned by this planner instance."""
+        for brain in self.brains.values():
+            brain.flush_catboost_dataset_now()
+        self._hp_scan_pool.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------
     # Input frame access
@@ -251,6 +343,7 @@ class Planner:
 
     @debug_log_result
     def tick_one(self) -> Dict[int, Snapshot]:
+        tick_started = perf_counter()
         out: Dict[int, Snapshot] = {}
 
         # --- FPS ---
@@ -266,23 +359,35 @@ class Planner:
         )
 
         for hwnd in list(self.hwnds):
+            hwnd_started = perf_counter()
+            stage_started = perf_counter()
             hay = self._grab_window_pil(hwnd)
+            self._trace_timing("frame_fetch", stage_started)
 
             if hay is None:
                 continue
 
-            if self.block_input:
-                self.center_screen_on_self(hwnd, force_fg=True)
+            frame = np.asarray(hay)
+            if not self.game_end_active and self.game_end_detector.find_win(frame):
+                self.game_end_active = True
+                if self.log:
+                    self.log.info("[planner] match ended; closing result screen on all windows")
 
-            snap = self.collect_for_hwnd(hwnd, hay_pil=hay)
-            if snap is None:
+            if self.game_end_active:
+                self._tick_game_end_window(hwnd, hay)
                 continue
 
-            if self.show_preview:
-                v = visualize_full_frame(self, hwnd, snap, fps=self._fps_smooth)
-                if v is not None:
-                    cv2.imshow("planner", v)
-                    self._last_preview_key = cv2.waitKey(1) & 0xFF
+            if self._tick_game_recovery_window(hwnd, frame):
+                continue
+
+            if self._tick_spell_level_up_window(hwnd, frame):
+                continue
+
+            stage_started = perf_counter()
+            snap = self.collect_for_hwnd(hwnd, hay_pil=hay)
+            self._trace_timing("collect", stage_started)
+            if snap is None:
+                continue
 
             self.last_by_hwnd[hwnd] = snap
             out[hwnd] = snap
@@ -292,13 +397,131 @@ class Planner:
                 brain = Brain(hwnd, planner=self, logger=self.log, role="unknown")
                 self.brains[hwnd] = brain
 
-            if self.block_input:
-                brain.tick_one(
-                    Snapshot(ts=snap.ts, hwnd=snap.hwnd, combined=snap.combined)
-                )
+            brain.dry_run = not self.block_input
+            stage_started = perf_counter()
+            brain.tick_one(snap)
+            self._trace_timing("brain", stage_started)
+            # A frame with no emitted input has no acknowledgement to release
+            # it.  Let the bridge accept the next VM frame in that case.
+            if not self.django_bridge.has_pending_commands(hwnd):
+                self.django_bridge.release_processing_frame_if_done(hwnd)
+            # Draw AFTER the decision, on the exact image used to collect snap.
+            preview_now = time.monotonic()
+            if (
+                self.show_preview
+                and preview_now - self._last_preview_ts >= self.preview_interval_sec
+            ):
+                self._last_preview_ts = preview_now
+                stage_started = perf_counter()
+                v = visualize_full_frame(self, hwnd, snap, fps=self._fps_smooth, hay_pil=hay)
+                if v is not None:
+                    cv2.imshow("planner", v)
+                    self._last_preview_key = cv2.waitKey(1) & 0xFF
+                self._trace_timing("preview", stage_started)
+            self._trace_timing(f"window_total[{hex(hwnd)}]", hwnd_started)
 
-
+        self._trace_timing("tick_total", tick_started)
+        self._report_trace_if_due()
+        if self.game_end_active:
+            self.game_end_complete = len(self._game_end_lobby_hwnds) == len(self.hwnds)
         return out
+
+    def _tick_game_end_window(self, hwnd: int, hay: Image.Image) -> None:
+        """Click victory again on fresh frames until the Dota lobby is visible."""
+        if self.django_bridge.has_pending_commands(hwnd):
+            return
+        frame_id = self._current_frame_id_by_hwnd.get(int(hwnd))
+        if frame_id == self._game_end_clicked_frame.get(int(hwnd)):
+            self.django_bridge.release_processing_frame_if_done(hwnd)
+            return
+        frame = np.asarray(hay)
+        hit = self.game_end_detector.find_win(frame)
+        if hit is not None:
+            self._game_end_lobby_hwnds.discard(int(hwnd))
+            self._send_mouse_click_client(hwnd, *hit, button="left", hold_ms=100)
+            if frame_id is not None:
+                self._game_end_clicked_frame[int(hwnd)] = frame_id
+            if self.log:
+                self.log.info("[planner] clicked match result hwnd=%s", hex(int(hwnd)))
+            return
+        if self.game_end_detector.find(frame, "dota") is not None:
+            self._game_end_lobby_hwnds.add(int(hwnd))
+        else:
+            self._game_end_lobby_hwnds.discard(int(hwnd))
+        self.django_bridge.release_processing_frame_if_done(hwnd)
+
+    def _tick_game_recovery_window(self, hwnd: int, frame: np.ndarray) -> bool:
+        """Dismiss a kick dialog, then return to the match before brain actions."""
+        hwnd = int(hwnd)
+        phase = self._recovery_phase_by_hwnd.get(hwnd)
+        if phase is None:
+            if self.game_end_detector.find(frame, "ok_when_kicked") is not None:
+                phase = "ok"
+            elif self.game_end_detector.find(frame, "return_to_game") is not None:
+                phase = "return"
+            else:
+                return False
+            self._recovery_phase_by_hwnd[hwnd] = phase
+            if self.log:
+                self.log.info("[planner] recovery screen detected hwnd=%s phase=%s", hex(hwnd), phase)
+
+        if self.django_bridge.has_pending_commands(hwnd):
+            return True
+        frame_id = self._current_frame_id_by_hwnd.get(hwnd)
+        if frame_id == self._recovery_clicked_frame.get(hwnd):
+            self.django_bridge.release_processing_frame_if_done(hwnd)
+            return True
+
+        if phase == "ok":
+            hit = self.game_end_detector.find(frame, "ok_when_kicked")
+            if hit is not None:
+                self._send_mouse_click_client(hwnd, *hit, button="left", hold_ms=100)
+                if frame_id is not None:
+                    self._recovery_clicked_frame[hwnd] = frame_id
+                return True
+            self._recovery_phase_by_hwnd[hwnd] = phase = "return"
+
+        if self.game_end_detector.find(frame, "ok_when_kicked") is not None:
+            self._recovery_phase_by_hwnd[hwnd] = "ok"
+            self.django_bridge.release_processing_frame_if_done(hwnd)
+            return True
+
+        hit = self.game_end_detector.find(frame, "return_to_game")
+        if hit is not None:
+            self._send_mouse_click_client(hwnd, *hit, button="left", hold_ms=100)
+            self._return_to_game_clicked_hwnds.add(hwnd)
+            if frame_id is not None:
+                self._recovery_clicked_frame[hwnd] = frame_id
+        elif hwnd in self._return_to_game_clicked_hwnds:
+            self._recovery_phase_by_hwnd.pop(hwnd, None)
+            self._recovery_clicked_frame.pop(hwnd, None)
+            self._return_to_game_clicked_hwnds.discard(hwnd)
+            if self.log:
+                self.log.info("[planner] returned to game hwnd=%s", hex(hwnd))
+        self.django_bridge.release_processing_frame_if_done(hwnd)
+        return True
+
+    def _tick_spell_level_up_window(self, hwnd: int, frame: np.ndarray) -> bool:
+        """Spend an available spell point before issuing ordinary game input."""
+        hwnd = int(hwnd)
+        if hwnd in self._spell_level_clicked_frame and self.django_bridge.has_pending_commands(hwnd):
+            return True
+        hit = self.game_end_detector.find_spell_level_up(frame)
+        if hit is None:
+            self._spell_level_clicked_frame.pop(hwnd, None)
+            return False
+        if self.django_bridge.has_pending_commands(hwnd):
+            return True
+        frame_id = self._current_frame_id_by_hwnd.get(hwnd)
+        if frame_id == self._spell_level_clicked_frame.get(hwnd):
+            self.django_bridge.release_processing_frame_if_done(hwnd)
+            return True
+        self._send_mouse_click_client(hwnd, *hit, button="left", hold_ms=100)
+        if frame_id is not None:
+            self._spell_level_clicked_frame[hwnd] = frame_id
+        if self.log:
+            self.log.info("[planner] clicked spell level up hwnd=%s", hex(hwnd))
+        return True
 
     # ------------------------------------------------------------------
     # Geometry helpers
@@ -396,18 +619,35 @@ class Planner:
     # Command emitters
     # ------------------------------------------------------------------
 
-    def _emit_command(self, hwnd: int, command_type: str, payload: Dict[str, Any]) -> None:
+    def _emit_command(
+        self,
+        hwnd: int,
+        command_type: str,
+        payload: Dict[str, Any],
+        *,
+        sticky: bool = False,
+        coalesce_key: Optional[str] = None,
+    ) -> dict:
         frame_id = self._current_frame_id_by_hwnd.get(int(hwnd))
-        self.django_bridge.push_command(
+        return self.django_bridge.push_command(
             hwnd=hwnd,
             command_type=command_type,
             payload=payload,
             frame_id=frame_id,
+            sticky=sticky,
+            coalesce_key=coalesce_key,
         )
 
-    def _send_mouse_click_client(self, hwnd, x, y, button="right"):
-
-        self.django_bridge.push_command(
+    def _send_mouse_click_client(
+        self,
+        hwnd,
+        x,
+        y,
+        button="right",
+        *,
+        hold_ms: int = PLANNER_MOUSE_HOLD_MS,
+    ):
+        self._emit_command(
             hwnd,
             "mouse_click",
             {
@@ -416,12 +656,16 @@ class Planner:
                 "y": int(y),
                 "button": str(button),
                 "coord_space": "client",
+                "target_space": "screen",
                 "clicks": 1,
+                "hold_ms": max(0, int(hold_ms)),
+                "post_move_settle_ms": PLANNER_MOUSE_SETTLE_MS,
+                "post_click_settle_ms": PLANNER_POST_CLICK_CURSOR_HOLD_MS,
             },
         )
 
     def _send_key_to_hwnd(self, hwnd, vk_code, down):
-        self.django_bridge.push_command(
+        self._emit_command(
             hwnd,
             "key_event",
             {
@@ -450,8 +694,10 @@ class Planner:
         *,
         hold_ms: int = 25,
         force_fg: bool = True,
-    ) -> None:
-        self._emit_command(
+        sticky: bool = False,
+        coalesce_key: Optional[str] = None,
+    ) -> dict:
+        return self._emit_command(
             hwnd,
             "key_press",
             {
@@ -460,6 +706,8 @@ class Planner:
                 "hold_ms": int(hold_ms),
                 "force_fg": bool(force_fg),
             },
+            sticky=sticky,
+            coalesce_key=coalesce_key,
         )
 
     def center_screen_on_self(
@@ -468,24 +716,36 @@ class Planner:
         *,
         force_fg: bool = True,
         cooldown_sec: Optional[float] = 1,
-    ) -> None:
+        sticky: bool = True,
+    ) -> Optional[dict]:
         now = time.time()
         cd = self._center_cooldown_sec if cooldown_sec is None else float(cooldown_sec)
         last = self._last_center_ts_by_hwnd.get(hwnd, 0.0)
 
         if cd > 0 and (now - last) < cd:
-            return
+            return None
 
-        self._press_vk_for_hwnd(
-            hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=0, force_fg=force_fg
-        )
-        self._press_vk_for_hwnd(
-            hwnd, KEY_FOR_CENTER_SCREEN, hold_ms=0, force_fg=force_fg
+        command = self._press_vk_for_hwnd(
+            hwnd,
+            KEY_FOR_CENTER_SCREEN,
+            hold_ms=100,
+            force_fg=force_fg,
+            sticky=sticky,
+            coalesce_key="planner:center-screen",
         )
         self._last_center_ts_by_hwnd[hwnd] = now
+        return command
 
     @debug_log_result
-    def click_on_screen_walk(self, hwnd: int, x: int, y: int, *, attack: bool = False):
+    def click_on_screen_walk(
+        self,
+        hwnd: int,
+        x: int,
+        y: int,
+        *,
+        attack: bool = False,
+        hold_ms: int = PLANNER_MOUSE_HOLD_MS,
+    ):
         _, _, win_w, win_h = self._get_client_rect(hwnd)
 
         x = max(0, min(win_w - 1, int(x)))
@@ -501,10 +761,17 @@ class Planner:
                     "x": int(x_adj),
                     "y": int(y_adj),
                     "coord_space": "client",
+                    "target_space": "screen",
+                    "attack_hold_ms": max(0, int(hold_ms)),
+                    "hold_ms": max(0, int(hold_ms)),
+                    "post_move_settle_ms": PLANNER_MOUSE_SETTLE_MS,
+                    "post_click_settle_ms": PLANNER_POST_CLICK_CURSOR_HOLD_MS,
                 },
             )
         else:
-            self._send_mouse_click_client(hwnd, x_adj, y_adj, button="right")
+            self._send_mouse_click_client(
+                hwnd, x_adj, y_adj, button="right", hold_ms=hold_ms
+            )
 
     @debug_log_result
     def click_on_screen(
@@ -515,6 +782,7 @@ class Planner:
         *,
         mouse_button: str = "right",
         attack: bool = False,
+        hold_ms: int = PLANNER_MOUSE_HOLD_MS,
     ) -> None:
         _, _, win_w, win_h = self._get_client_rect(hwnd)
 
@@ -531,13 +799,28 @@ class Planner:
                     "x": int(x_adj),
                     "y": int(y_adj),
                     "coord_space": "client",
+                    "target_space": "screen",
+                    "attack_hold_ms": max(0, int(hold_ms)),
+                    "hold_ms": max(0, int(hold_ms)),
+                    "post_move_settle_ms": PLANNER_MOUSE_SETTLE_MS,
+                    "post_click_settle_ms": PLANNER_POST_CLICK_CURSOR_HOLD_MS,
                 },
             )
         else:
-            self._send_mouse_click_client(hwnd, x_adj, y_adj, button=mouse_button)
+            self._send_mouse_click_client(
+                hwnd, x_adj, y_adj, button=mouse_button, hold_ms=hold_ms
+            )
 
     @debug_log_result
-    def click_minimap_pct(self, hwnd: int, u: float, v: float, *, attack: bool = False):
+    def click_minimap_pct(
+        self,
+        hwnd: int,
+        u: float,
+        v: float,
+        *,
+        attack: bool = False,
+        hold_ms: int = PLANNER_MINIMAP_MOUSE_HOLD_MS,
+    ):
         if hwnd not in self._last_roi_by_hwnd:
             raise RuntimeError("ROI unknown; call collect_for_hwnd() first.")
 
@@ -554,6 +837,13 @@ class Planner:
                     "x": int(px),
                     "y": int(py),
                     "coord_space": "client",
+                    "target_space": "minimap",
+                    "u_pct": float(u),
+                    "v_pct": float(v),
+                    "attack_hold_ms": max(0, int(hold_ms)),
+                    "hold_ms": max(0, int(hold_ms)),
+                    "post_move_settle_ms": PLANNER_MINIMAP_MOUSE_SETTLE_MS,
+                    "post_click_settle_ms": PLANNER_POST_CLICK_CURSOR_HOLD_MS,
                 },
             )
         else:
@@ -566,9 +856,34 @@ class Planner:
                     "y": int(py),
                     "button": "right",
                     "coord_space": "client",
-                    "clicks": 3,
+                    "target_space": "minimap",
+                    "u_pct": float(u),
+                    "v_pct": float(v),
+                    "clicks": 1,
+                    "hold_ms": max(0, int(hold_ms)),
+                    "post_move_settle_ms": PLANNER_MINIMAP_MOUSE_SETTLE_MS,
+                    "post_click_settle_ms": PLANNER_POST_CLICK_CURSOR_HOLD_MS,
                 },
             )
+
+    @debug_log_result
+    def teleport_to_minimap_pct(self, hwnd: int, u: float, v: float) -> None:
+        """Cast the TP-scroll hotkey on a minimap tower: hover, T, left-click."""
+        if hwnd not in self._last_roi_by_hwnd:
+            raise RuntimeError("ROI unknown; call collect_for_hwnd() first.")
+        rx, ry, rw, rh = self._last_roi_by_hwnd[hwnd]
+        px = rx + _pct_to_px(u, rw)
+        py = ry + _pct_to_px(v, rh)
+        self._emit_command(hwnd, "mouse_move", {
+            "hwnd": int(hwnd), "x": int(px), "y": int(py),
+            "coord_space": "client", "target_space": "minimap",
+        })
+        self._press_vk_for_hwnd(hwnd, ord("T"), hold_ms=25)
+        self._emit_command(hwnd, "mouse_click", {
+            "hwnd": int(hwnd), "x": int(px), "y": int(py), "button": "left",
+            "coord_space": "client", "target_space": "minimap", "clicks": 1,
+            "u_pct": float(u), "v_pct": float(v),
+        })
 
     # ------------------------------------------------------------------
     # Vision pipeline
@@ -700,66 +1015,99 @@ class Planner:
     def collect_for_hwnd(
         self, hwnd: int, hay_pil: Optional[Image.Image] = None
     ) -> Optional[Snapshot]:
+        collect_started = perf_counter()
         hay = hay_pil or self._grab_window_pil(hwnd)
         if hay is None:
             return None
 
+        stage_started = perf_counter()
         try:
             mm_rgb, roi = self._crop_minimap_from_window(hwnd, hay)
         except Exception as e:
             if self.log:
                 self.log.error(f"[MM] crop failed hwnd={hex(hwnd)}: {e}", exc_info=True)
             return None
+        self._trace_timing("minimap_crop", stage_started)
 
-        t_total0 = perf_counter()
+        stage_started = perf_counter()
+        frame = np.array(hay)
+        frame_masked = self.mask_rects_white(frame, self.forbidden_ui_rects)
+        self._trace_timing("frame_prepare", stage_started)
+        hp_scan_future = self._hp_scan_pool.submit(_timed_hybrid_hp_scan, frame_masked)
 
         device = next(self.net.parameters()).device.type
+        stage_started = perf_counter()
         prob = infer_one_minimap(self.net, mm_rgb, size=self.size, device=device)
+        self._trace_timing("minimap_gpu", stage_started)
+
+        stage_started = perf_counter()
         peaks = find_peaks_per_channel(prob, thr=DEFAULT_THR, nms_kernel=DEFAULT_NMS)
         units = _filter_units_from_peaks(peaks, self.classes)
+        self._trace_timing("minimap_postprocess", stage_started)
 
-        frame = np.array(hay)
+        stage_started = perf_counter()
         hp_cur, hp_max = self.hud_scanner.get_hp(frame)
+        self._trace_timing("hud_hp_gpu", stage_started)
+
+        stage_started = perf_counter()
         hero_level = self.hud_scanner.get_hero_level(frame)
+        self._trace_timing("hud_level_cpu", stage_started)
 
         now_s = self._frame_ts_by_hwnd.get(hwnd, time.time())
         t_game = now_s - self.game_start_ts
 
+        stage_started = perf_counter()
         towers = self.tower_tracker.tick_one(mm_rgb, now=now_s, side=self.side)
+        self._trace_timing("tower_tracker", stage_started)
 
-        frame_masked = self.mask_rects_white(frame, self.forbidden_ui_rects)
-        screen_info = scan_hp_bars_on_screen(frame_masked)
+        stage_started = perf_counter()
+        screen_info, hp_scan_ms = hp_scan_future.result()
+        self._trace_timing("screen_hp_wait", stage_started)
+        self._trace_samples["screen_hp_cpu"].append(hp_scan_ms)
 
         raw_heroes = screen_info["heroes"]
         raw_creeps = screen_info["creeps"]
+        stage_started = perf_counter()
         stable_creeps = self._stabilize_creeps_for_hwnd(hwnd, raw_creeps)
+        self._trace_timing("creep_stabilize", stage_started)
 
-        if hp_cur is None or hp_max is None:
-            alive = False
+        if hp_cur is None or hp_max is None or hp_max <= 0:
+            alive = None  # Missing HUD data is not a reliable death event.
             hp_ratio = None
+        elif hp_cur <= 0:
+            # A valid maximum together with a zero current HP is the respawn
+            # screen's explicit death signal.  Keep it separate from missing OCR.
+            alive = False
+            hp_ratio = 0.0
         else:
             alive = hp_cur > 0
             hp_ratio = float(hp_cur) / float(hp_max) if hp_max > 0 else None
 
         combined = {
+            "frame_id": self._current_frame_id_by_hwnd.get(hwnd),
+            "screen_size": tuple(hay.size),
+            "minimap_rect": roi,
             "map": units,
             "towers": towers,
             "landmarks": self.landmarks,
             "hp_pair": (hp_cur, hp_max),
             "hp_ratio": hp_ratio,
             "hero_level": hero_level,
-            "gold": 123,
+            "gold": None,
             "alive": alive,
             "t_game": t_game,
             "heroes": raw_heroes,
             "creeps": stable_creeps,
+            "screen_enemy_tower": bool(screen_info.get("towers", {}).get("enemy")),
+            "screen_towers": screen_info.get("towers", {}),
         }
 
         self._last_roi_by_hwnd[hwnd] = roi
 
+        total_ms = (perf_counter() - collect_started) * 1000.0
+        self._trace_samples["collect_internal"].append(total_ms)
         if self.log:
-            t_total = (perf_counter() - t_total0) * 1000.0
-            self.log.debug(f"[TIMERS] hwnd={hex(hwnd)} TOTAL={t_total:.2f}ms")
+            self.log.debug(f"[TIMERS] hwnd={hex(hwnd)} TOTAL={total_ms:.2f}ms")
 
         return Snapshot(ts=now_s, hwnd=hwnd, combined=combined)
 
@@ -769,8 +1117,9 @@ def visualize_full_frame(
     hwnd: int,
     snap: Snapshot,
     fps: float = 0.0,
+    hay_pil=None,
 ) -> Optional[np.ndarray]:
-    hay = pl._grab_window_pil(hwnd)
+    hay = hay_pil if hay_pil is not None else pl._grab_window_pil(hwnd)
     if hay is None:
         if pl.log:
             pl.log.debug(f"[VIS] _grab_window_pil() returned None for hwnd={hex(hwnd)}")
@@ -783,6 +1132,7 @@ def visualize_full_frame(
     combined = snap.combined
     heroes = combined.get("heroes", {})
     creeps = combined.get("creeps", {})
+    screen_towers = combined.get("screen_towers", {})
     units = combined.get("map", {})
     towers = combined.get("towers", {})
     hp_pair = combined.get("hp_pair")
@@ -808,6 +1158,21 @@ def visualize_full_frame(
         for b in creeps.get(kind, []):
             cv2.rectangle(
                 img, (b.x0, b.y0), (b.x1, b.y1), color, 1, lineType=cv2.LINE_AA
+            )
+
+    # Tower HP bars use the creep palette with a small BGR shift: they stay
+    # visually related to the enemy wave but remain distinguishable at a glance.
+    tower_creep_color_delta = (35, -35, 0)
+    for side, bars in screen_towers.items():
+        creep_color = col_creeps.get(side, col_creeps["enemy"])
+        tower_color = tuple(
+            max(0, min(255, channel + delta))
+            for channel, delta in zip(creep_color, tower_creep_color_delta)
+        )
+        for b in bars:
+            cv2.rectangle(
+                img, (b.x0, b.y0), (b.x1, b.y1), tower_color, 2,
+                lineType=cv2.LINE_AA,
             )
 
     _, _, win_w, win_h = pl._get_client_rect(hwnd)
@@ -930,6 +1295,9 @@ def visualize_full_frame(
         cv2.LINE_AA,
     )
 
+    brain = pl.brains.get(hwnd)
+    if brain is not None:
+        img = draw_brain_overlay(img, brain, (mm_x0, mm_y0, MM_W, MM_H))
     img = cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST)
     return img
 
@@ -1054,6 +1422,7 @@ class LocalPlanner(Planner):
         hwnds: List[int],
         roles: List[str],
         *,
+        heroes: Optional[List[str]] = None,
         side: str = "radiant",
         output_idx: int = 0,
         logger=None,
@@ -1067,11 +1436,12 @@ class LocalPlanner(Planner):
             super().__init__(
                 hwnds=hwnds,
                 roles=roles,
+                heroes=heroes,
                 side=side,
                 django_bridge=DjangoPlannerBridge(vm_id="local"),
                 logger=logger,
                 show_preview=show_preview,
-                collect_catboost_dataset=True
+                collect_catboost_dataset=True,
             )
         except Exception:
             self._local_capture.close()
@@ -1092,6 +1462,7 @@ class LocalPlanner(Planner):
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
 
     def close(self) -> None:
+        super().close()
         self._local_capture.close()
 
     def _force_foreground(self, hwnd: int) -> None:
@@ -1158,6 +1529,27 @@ class LocalPlanner(Planner):
         time.sleep(max(0, int(hold_ms)) / 1000.0)
         self._key_up_local(vk_code)
 
+    def _mouse_move_local(
+        self,
+        hwnd: int,
+        x: int,
+        y: int,
+        *,
+        coord_space: str = "client",
+        force_fg: bool = True,
+    ) -> None:
+        hwnd = int(hwnd)
+        if force_fg:
+            self._force_foreground(hwnd)
+        if str(coord_space) == "screen":
+            sx, sy = int(x), int(y)
+        else:
+            win_x, win_y, win_w, win_h = self._local_capture.get_screen_client_rect(hwnd)
+            cx = max(0, min(win_w - 1, int(x)))
+            cy = max(0, min(win_h - 1, int(y)))
+            sx, sy = int(win_x + cx), int(win_y + cy)
+        self._win32api.SetCursorPos((sx, sy))
+
     def _mouse_click_local(
         self,
         hwnd: int,
@@ -1166,6 +1558,7 @@ class LocalPlanner(Planner):
         *,
         button: str = "right",
         clicks: int = 1,
+        hold_ms: int = PLANNER_MOUSE_HOLD_MS,
         coord_space: str = "client",
         force_fg: bool = True,
     ) -> None:
@@ -1201,7 +1594,7 @@ class LocalPlanner(Planner):
 
         for _ in range(max(1, int(clicks))):
             self._win32api.mouse_event(down_flag, 0, 0, 0, 0)
-            time.sleep(0.02)
+            time.sleep(max(0, int(hold_ms)) / 1000.0)
             self._win32api.mouse_event(up_flag, 0, 0, 0, 0)
             time.sleep(0.03)
 
@@ -1213,10 +1606,11 @@ class LocalPlanner(Planner):
         *,
         coord_space: str = "client",
         force_fg: bool = True,
+        hold_ms: int = PLANNER_MOUSE_HOLD_MS,
     ) -> None:
         if force_fg:
             self._force_foreground(int(hwnd))
-        self._tap_vk_local(ord("A"), hold_ms=25, hwnd=hwnd, force_fg=False)
+        self._tap_vk_local(ord("A"), hold_ms=70, hwnd=hwnd, force_fg=False)
         time.sleep(0.03)
         self._mouse_click_local(
             hwnd,
@@ -1224,6 +1618,7 @@ class LocalPlanner(Planner):
             y,
             button="left",
             clicks=1,
+            hold_ms=hold_ms,
             coord_space=coord_space,
             force_fg=False,
         )
@@ -1268,6 +1663,14 @@ class LocalPlanner(Planner):
         return _crop_roi_from_rgb(frame, roi)
 
     def _emit_command(self, hwnd: int, command_type: str, payload: Dict[str, Any]) -> None:
+        if command_type == "mouse_move":
+            self._mouse_move_local(
+                int(payload.get("hwnd", hwnd)), int(payload["x"]), int(payload["y"]),
+                coord_space=str(payload.get("coord_space", "client")),
+                force_fg=bool(payload.get("force_fg", True)),
+            )
+            return
+
         if command_type == "mouse_click":
             self._mouse_click_local(
                 int(payload.get("hwnd", hwnd)),
@@ -1277,6 +1680,7 @@ class LocalPlanner(Planner):
                 clicks=int(payload.get("clicks", 1)),
                 coord_space=str(payload.get("coord_space", "client")),
                 force_fg=bool(payload.get("force_fg", True)),
+                hold_ms=int(payload.get("hold_ms", PLANNER_MOUSE_HOLD_MS)),
             )
             return
 
@@ -1287,6 +1691,7 @@ class LocalPlanner(Planner):
                 int(payload["y"]),
                 coord_space=str(payload.get("coord_space", "client")),
                 force_fg=bool(payload.get("force_fg", True)),
+                hold_ms=int(payload.get("hold_ms", PLANNER_MOUSE_HOLD_MS)),
             )
             return
 
@@ -1310,13 +1715,22 @@ class LocalPlanner(Planner):
         if self.log:
             self.log.warning(f"[LocalPlanner] unsupported command: {command_type}")
 
-    def _send_mouse_click_client(self, hwnd, x, y, button="right"):
+    def _send_mouse_click_client(
+        self,
+        hwnd,
+        x,
+        y,
+        button="right",
+        *,
+        hold_ms: int = PLANNER_MOUSE_HOLD_MS,
+    ):
         self._mouse_click_local(
             int(hwnd),
             int(x),
             int(y),
             button=str(button),
             clicks=1,
+            hold_ms=hold_ms,
             coord_space="client",
         )
 
@@ -1338,8 +1752,10 @@ class LocalPlanner(Planner):
         *,
         hold_ms: int = 25,
         force_fg: bool = True,
-    ) -> None:
+        sticky: bool = False,
+    ) -> dict:
         self._tap_vk_local(int(vk), hold_ms=hold_ms, hwnd=int(hwnd), force_fg=force_fg)
+        return {"id": 0, "type": "key_press", "sticky": bool(sticky)}
 
 
 def _parse_hwnd(raw: str) -> int:
@@ -1551,10 +1967,12 @@ def _build_local_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hwnd", type=_parse_hwnd, default=None)
     parser.add_argument("--side", choices=("radiant", "dire"), default="radiant")
     parser.add_argument("--role", default="unknown")
+    parser.add_argument("--hero", default="unknown")
     parser.add_argument("--fps", type=float, default=40.0)
     parser.add_argument("--output-idx", type=int, default=0)
     parser.add_argument("--no-input", action="store_true")
     parser.add_argument("--no-preview", action="store_true")
+    parser.add_argument("--brain-state", choices=[s.name.lower() for s in BrainState], default=None)
     parser.add_argument(
         "--capture-gold-roi",
         "--capture_gold_roi",
@@ -1610,12 +2028,16 @@ def _run_local_main() -> int:
     planner = LocalPlanner(
         hwnds=[int(hwnd)],
         roles=[str(args.role)],
+        heroes=[str(args.hero)],
         side=str(args.side),
         output_idx=int(args.output_idx),
         logger=log,
         show_preview=not bool(args.no_preview),
     )
     planner.block_input = not bool(args.no_input)
+    if args.brain_state:
+        for brain in planner.brains.values():
+            brain.set_state(BrainState[args.brain_state.upper()], manual=True)
 
     gold_writer = (
         _LocalGoldRoiWriter(args.gold_dump_dir, args.gold_textarea_name)
@@ -1714,6 +2136,7 @@ def _run_local_main() -> int:
     min_dt = 1.0 / max(0.1, float(args.fps))
 
     try:
+        stop_vk = ord("P")  # кнопка P
         while True:
             t0 = time.time()
             try:
@@ -1735,7 +2158,7 @@ def _run_local_main() -> int:
             if not args.no_preview:
                 planner._last_preview_key = -1
 
-            if _pressed_once(escape_vk) or _pressed_once(quit_vk):
+            if _pressed_once(escape_vk) :
                 break
             if _pressed_once(roi_vk):
                 _save_gold_roi("manual")

@@ -135,6 +135,24 @@ class SubmitFrameRawView(View):
                 status=404,
             )
 
+        try:
+            frame_generation = int(request.GET.get("planner_generation", 0))
+        except (TypeError, ValueError):
+            return JsonResponse({"ok": False, "error": "Bad planner_generation"}, status=400)
+
+        expected_generation = int(getattr(vm, "planner_generation", 0))
+        if bool(getattr(vm, "planner_active", False)) and frame_generation != expected_generation:
+            # An MM capture may be in flight while the planner starts.  It
+            # must not repopulate the bridge after activation cleared it.
+            return JsonResponse(
+                {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "stale_planner_generation",
+                    "planner_generation": expected_generation,
+                }
+            )
+
         controller.touch_vm(vm_id)
 
         entry = planner_runtime.get_entry(vm_id)
@@ -166,6 +184,7 @@ class SubmitFrameRawView(View):
                 "hwnd": hwnd,
                 "frame_id": frame_id,
                 "shape": [height, width, channels],
+                "planner_generation": expected_generation,
             }
         )
 
@@ -199,6 +218,8 @@ class GetCommandView(View):
             {
                 "ok": True,
                 "command": cmd,
+                "planner_active": bool(vm.planner_active),
+                "planner_generation": int(getattr(vm, "planner_generation", 0)),
             }
         )
 
@@ -251,6 +272,68 @@ class AckCommandView(View):
         )
 
         return JsonResponse({"ok": bool(ok)})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class GetPlannerCommandView(View):
+    """Return a short FIFO batch of planner commands for one Dota window."""
+
+    def get(self, request: HttpRequest):
+        vm_id = str(request.GET.get("vm_id") or "").strip()
+        try:
+            hwnd = int(request.GET["hwnd"])
+        except Exception:
+            return JsonResponse({"ok": False, "error": "hwnd is required"}, status=400)
+
+        controller, err = _controller_or_503()
+        if err is not None:
+            return err
+        controller.touch_vm(vm_id)
+        entry = planner_runtime.get_entry(vm_id)
+        if entry is None:
+            return JsonResponse({"ok": False, "error": "Unknown VM"}, status=404)
+        try:
+            limit = int(request.GET.get("limit", 4))
+        except (TypeError, ValueError):
+            limit = 4
+        commands = entry.bridge.get_next_commands(hwnd, limit=limit)
+        # Keep `command` for old clients while new clients execute the full
+        # ordered batch from `commands`.
+        return JsonResponse(
+            {
+                "ok": True,
+                "command": commands[0] if commands else None,
+                "commands": commands,
+            }
+        )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AckPlannerCommandView(View):
+    """Acknowledge a planner input command after the VM executed it."""
+
+    def post(self, request: HttpRequest):
+        body = _json_body(request)
+        vm_id = str(body.get("vm_id") or "").strip()
+        try:
+            hwnd = int(body["hwnd"])
+            command_id = int(body["command_id"])
+        except Exception:
+            return JsonResponse(
+                {"ok": False, "error": "hwnd and command_id are required"},
+                status=400,
+            )
+
+        controller, err = _controller_or_503()
+        if err is not None:
+            return err
+        controller.touch_vm(vm_id)
+        entry = planner_runtime.get_entry(vm_id)
+        if entry is None:
+            return JsonResponse({"ok": False, "error": "Unknown VM"}, status=404)
+        return JsonResponse(
+            {"ok": bool(entry.bridge.ack_command(command_id, hwnd))}
+        )
 
 
 @method_decorator(csrf_exempt, name="dispatch")

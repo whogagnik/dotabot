@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from typing import Any, Optional
 
 import requests
@@ -19,8 +20,14 @@ class PlannerApiClient:
         self.debug = bool(debug)
 
         self.session = requests.Session()
+        # Frame upload runs independently from command polling.  A separate
+        # session avoids concurrent use of requests.Session from two threads.
+        self.frame_session = requests.Session()
+        self._frame_session_local = threading.local()
         self.vm_id: Optional[str] = None
         self.capacity: int = 5
+        self.planner_active: bool = False
+        self.planner_generation: int = 0
 
     def _log(self, message: str) -> None:
         if self.debug:
@@ -28,6 +35,8 @@ class PlannerApiClient:
 
     def reset_registration(self) -> None:
         self.vm_id = None
+        self.planner_active = False
+        self.planner_generation = 0
 
     def register_vm(self) -> dict[str, Any]:
         self._log("register_vm -> {}")
@@ -71,6 +80,8 @@ class PlannerApiClient:
         )
         resp.raise_for_status()
         data = resp.json()
+        self.planner_active = bool(data.get("planner_active", False))
+        self.planner_generation = int(data.get("planner_generation", 0) or 0)
 
         cmd = data.get("command")
         self._log(f"get_command(vm_id={self.vm_id}) <- {cmd}")
@@ -102,6 +113,48 @@ class PlannerApiClient:
         data = resp.json()
         self._log(f"ack_command <- {data}")
         return data
+
+    def get_planner_commands(self, hwnd: int, limit: int = 4) -> list[dict[str, Any]]:
+        if not self.vm_id:
+            raise RuntimeError("vm_id is not initialized")
+        resp = self.session.get(
+            f"{self.base_url}/planner/get-planner-command",
+            params={"vm_id": self.vm_id, "hwnd": int(hwnd), "limit": int(limit)},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        commands = data.get("commands")
+        if not isinstance(commands, list):
+            command = data.get("command")
+            commands = [] if command is None else [command]
+        commands = [command for command in commands if isinstance(command, dict)]
+        if commands:
+            self._log(
+                f"get_planner_commands(hwnd={int(hwnd)}) <- "
+                f"ids={[int(command.get('id', 0)) for command in commands]}"
+            )
+        return commands
+
+    def get_planner_command(self, hwnd: int) -> Optional[dict[str, Any]]:
+        """Compatibility helper for callers that only need the queue head."""
+        commands = self.get_planner_commands(hwnd, limit=1)
+        return commands[0] if commands else None
+
+    def ack_planner_command(self, hwnd: int, command_id: int) -> bool:
+        if not self.vm_id:
+            raise RuntimeError("vm_id is not initialized")
+        resp = self.session.post(
+            f"{self.base_url}/planner/ack-planner-command",
+            json={"vm_id": self.vm_id, "hwnd": int(hwnd), "command_id": int(command_id)},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        ok = bool(resp.json().get("ok"))
+        self._log(
+            f"ack_planner_command(hwnd={int(hwnd)}, command_id={int(command_id)}) <- {ok}"
+        )
+        return ok
     def _sanitize_for_log(self, value: Any, *, max_string_len: int = 1000) -> Any:
         try:
             if isinstance(value, dict):
@@ -170,6 +223,7 @@ class PlannerApiClient:
         hwnd: int,
         frame_rgb,
         ts_client: Optional[float] = None,
+        planner_generation: Optional[int] = None,
     ) -> dict[str, Any]:
         if not self.vm_id:
             raise RuntimeError("vm_id is not initialized")
@@ -191,13 +245,23 @@ class PlannerApiClient:
             "dtype": "uint8",
             "layout": "HWC",
             "color": "RGB",
+            "planner_generation": int(
+                self.planner_generation if planner_generation is None else planner_generation
+            ),
         }
 
         self._log(
             f"submit_frame_raw -> hwnd={int(hwnd)} shape=({height}, {width}, {channels}) ts={ts_client:.3f}"
         )
 
-        resp = self.session.post(
+        # A requests.Session cannot be shared safely by concurrent uploader
+        # threads. Keep connection reuse, but give every worker its own one.
+        frame_session = getattr(self._frame_session_local, "session", None)
+        if frame_session is None:
+            frame_session = requests.Session()
+            self._frame_session_local.session = frame_session
+
+        resp = frame_session.post(
             f"{self.base_url}/planner/submit-frame-raw",
             params=params,
             data=frame_rgb.tobytes(),

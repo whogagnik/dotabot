@@ -34,12 +34,18 @@ PICK_PHASE_ROLES = {
     "cores": PICK_CORE_ROLES,
     "mid": PICK_MID_ROLES,
 }
+PICK_PHASE_TIMEOUT_SEC = 60.0
+# Try both known offsets in the party member row.  The second point is kept
+# intentionally: it must receive a real right-click, not be skipped.
 LEAVE_PARTY_CLICK_POINTS = [(30, 455), (50, 455)]
+LEAVE_PARTY_ICON_SETTLE_MS = 3000
+PARTY_INVITE_STEP_TIMEOUT_SEC = 30.0
 
 
 class MmStage:
     IDLE = "idle"
     WAIT_DOTA_READY = "wait_dota_ready"
+    SET_SETTINGS = "set_settings"
     LEAVE_PARTY = "leave_party"
     BUILD_PARTY = "build_party"
     WAIT_ACCEPT_GAME = "wait_accept_game"
@@ -70,6 +76,7 @@ class HwndState:
     latest_frame_ts: float = 0.0
     self_found: bool = False
     last_log_ts: float = 0.0
+    last_popup_log_ts: float = 0.0
 
 
 @dataclass
@@ -91,6 +98,7 @@ class VmMmState:
     last_action_ts: float = 0.0
     inflight: bool = False
     start_game_step: int = 0
+    replay_start_game: bool = False
 
     party_search_done: bool = False
     party_search_clicked: bool = False
@@ -100,6 +108,14 @@ class VmMmState:
     party_return_to_dota_pending: bool = False
     party_invited_indices: List[int] = field(default_factory=list)
     party_retry_invite_active: bool = False
+    party_invite_started_ts: float = 0.0
+
+    settings_hwnd_index: int = 0
+    settings_step: int = 0
+    settings_capture_wait_pending: bool = False
+    settings_escape_pending: bool = False
+    settings_escape_verify_pending: bool = False
+    settings_escape_attempts: int = 0
 
     pick_role_by_hwnd: Dict[int, str] = field(default_factory=dict)
     pick_hwnd_by_role: Dict[str, int] = field(default_factory=dict)
@@ -253,6 +269,9 @@ class StartMmDota2:
 
             "close_welcome_ru": "lobby_close_welcome_ru",
             "close_welcome_ru2": "lobby_close_welcome_ru2",
+            "cross": "lobby_cross",
+            "cross2": "lobby_cross2",
+            "settings": "lobby_settings",
 
             # game
             "detect_radiant": "game_detect_radiant",
@@ -309,6 +328,32 @@ class StartMmDota2:
         """
         self.mark_command_done(vm_id)
 
+        if cmd_type == HostCommandType.KEY_PRESS and payload.get("vk_code") == 0x1B:
+            self.log.info(
+                f"[MM] Esc result vm={vm_id} hwnd={payload.get('hwnd')} "
+                f"status={status} method={result.get('escape_method')} "
+                f"executor={result.get('executor_version')} error={result.get('error')}"
+            )
+            state = self._vm.get(vm_id)
+            if (state and state.stage == MmStage.SET_SETTINGS
+                    and state.settings_escape_pending
+                    and state.settings_hwnd_index < len(state.hwnds)
+                    and payload.get("hwnd") == state.hwnds[state.settings_hwnd_index]):
+                if status == "done":
+                    state.settings_escape_verify_pending = True
+                    self._clear_frame(vm_id, int(payload["hwnd"]))
+
+        if cmd_type == HostCommandType.MOUSE_CLICK and payload.get("template_key"):
+            message = (
+                f"[MM] popup click result vm={vm_id} hwnd={payload.get('hwnd')} "
+                f"template={payload['template_key']} status={status} "
+                f"point=({payload.get('x')},{payload.get('y')}) error={result.get('error')}"
+            )
+            if status == "done":
+                self.log.info(message)
+            else:
+                self.log.warning(message)
+
         if cmd_type != HostCommandType.CAPTURE_FRAME:
             return
 
@@ -328,12 +373,14 @@ class StartMmDota2:
             return
 
         frame = self._decode_capture_frame_result(result)
+        if frame is None and bool(result.get("frame_uploaded")):
+            frame = self._get_bridge_latest_frame_rgb(vm_id, hwnd_i)
         if frame is None:
             self._log_throttled(
                 vm_id,
                 hwnd_i,
                 f"[MM] capture_frame returned no image vm={vm_id} hwnd={hwnd_i} "
-                f"keys={list(result.keys())}",
+                f"error={result.get('error')} keys={list(result.keys())}",
                 interval=2.0,
             )
             return
@@ -376,51 +423,29 @@ class StartMmDota2:
     def _get_entry(self, vm_id: str):
         return planner_runtime.get_entry(vm_id)
 
+    def _get_bridge_latest_frame_rgb(self, vm_id: str, hwnd: int) -> Optional[np.ndarray]:
+        entry = self._get_entry(vm_id)
+        if entry is None:
+            return None
+        try:
+            frame_id = entry.bridge.get_latest_frame_id(int(hwnd))
+            if frame_id is None:
+                return None
+            return entry.bridge.get_frame_rgb(int(hwnd), frame_id)
+        except Exception:
+            return None
+
     def _get_latest_frame_rgb(self, vm_id: str, hwnd: int) -> Optional[np.ndarray]:
         hwnd_i = int(hwnd)
 
         cached = self._frame_cache.get((vm_id, hwnd_i))
         if cached is not None:
             return cached
-
-        # Fallback на planner bridge, если он уже есть.
-        entry = self._get_entry(vm_id)
-        if entry is None:
-            return None
-
-        try:
-            frame = entry.bridge.get_latest_frame(hwnd_i)
-        except Exception:
-            return None
-
-        if frame is None:
-            return None
-
-        arr = getattr(frame, "image_rgb", None)
-        if arr is None:
-            arr = getattr(frame, "frame_rgb", None)
-        if arr is None:
-            arr = getattr(frame, "image", None)
-        if arr is None:
-            return None
-
-        if not isinstance(arr, np.ndarray):
-            return None
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            return None
-        if arr.dtype != np.uint8:
-            try:
-                arr = arr.astype(np.uint8)
-            except Exception:
-                return None
-
-        self._frame_cache[(vm_id, hwnd_i)] = arr
-
-        state = self._vm.get(vm_id)
-        if state is not None and hwnd_i in state.windows:
-            state.windows[hwnd_i].latest_frame_ts = time.time()
-
-        return arr
+        # MM consumes only frames placed here by the matching capture command.
+        # Falling back to the bridge is unsafe: it can return a frame captured
+        # before a context-menu click, even after _clear_frame() intentionally
+        # discarded that image.
+        return None
 
     def _match(
         self,
@@ -463,6 +488,46 @@ class StartMmDota2:
             "h": int(th),
             "key": key,
         }
+
+    def _match_lock_in_by_color_state(
+        self,
+        frame_rgb: np.ndarray,
+        key: str,
+        confidence: Optional[float] = None,
+        *,
+        enabled: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Locate lock-in by glyphs, then distinguish its state by colour.
+
+        Full-colour template matching is too brittle across Dota UI shading.
+        The text/shape is still best located in grayscale; only the matched
+        button region is checked for saturation. Enabled lock-in is coloured,
+        whereas the post-lock button is grey.
+        """
+        hit = self._match(frame_rgb, key, confidence=confidence)
+        if hit is None:
+            return None
+        try:
+            x0 = max(0, int(hit["x"] - hit["w"] // 2))
+            y0 = max(0, int(hit["y"] - hit["h"] // 2))
+            x1 = min(frame_rgb.shape[1], x0 + int(hit["w"]))
+            y1 = min(frame_rgb.shape[0], y0 + int(hit["h"]))
+            roi = frame_rgb[y0:y1, x0:x1]
+            if roi.size == 0:
+                return None
+            hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+            saturation = float(np.median(hsv[:, :, 1]))
+        except Exception:
+            return None
+
+        # Templates measure around 90 for enabled and 12 for disabled.  The
+        # gap leaves room for anti-aliasing, compression and UI brightness.
+        if enabled and saturation < 40.0:
+            return None
+        if not enabled and saturation > 35.0:
+            return None
+        hit["saturation"] = round(saturation, 1)
+        return hit
 
     def count_match(
         self,
@@ -584,6 +649,26 @@ class StartMmDota2:
             state.inflight = False
             state.last_action_ts = time.time()
 
+    def restart_after_game(self, vm_id: str, hwnds: List[int]) -> None:
+        """Keep the existing party and windows, but reset the match flow."""
+        ordered = list(dict.fromkeys(int(hwnd) for hwnd in hwnds))
+        self._vm[vm_id] = VmMmState(
+            vm_id=vm_id,
+            stage=MmStage.START_GAME,
+            hwnds=ordered,
+            windows={hwnd: HwndState(hwnd=hwnd, dota_ready=True) for hwnd in ordered},
+            party_built=True,
+            replay_start_game=True,
+            last_stage_ts=time.time(),
+        )
+        for key in list(self._frame_cache):
+            if key[0] == vm_id:
+                self._frame_cache.pop(key, None)
+        for key in list(self._last_capture_request_ts):
+            if key[0] == vm_id:
+                self._last_capture_request_ts.pop(key, None)
+        self.log.info("[MM] %s: new match from START_GAME", vm_id)
+
     # ---------------------------------------------------------
     # low-level host->client helpers
     # ---------------------------------------------------------
@@ -591,11 +676,11 @@ class StartMmDota2:
     def _clear_frame(self, vm_id: str, hwnd: int) -> None:
         self._frame_cache.pop((vm_id, int(hwnd)), None)
 
-    def _enqueue_focus(self, vm_id: str, hwnd: int) -> None:
+    def _enqueue_focus(self, vm_id: str, hwnd: int, *, settle_ms: int = 0) -> None:
         self.queue_command(
             vm_id,
             HostCommandType.FOCUS_WINDOW,
-            {"hwnd": int(hwnd)},
+            {"hwnd": int(hwnd), "settle_ms": max(0, int(settle_ms))},
         )
 
     def _enqueue_click(
@@ -606,6 +691,10 @@ class StartMmDota2:
         y: int,
         *,
         button: str = "left",
+        clicks: int = 1,
+        hold_ms: int = 400,
+        settle_ms: int = 250,
+        template_key: Optional[str] = None,
     ) -> None:
         self._clear_frame(vm_id, hwnd)
 
@@ -618,18 +707,28 @@ class StartMmDota2:
                 "y": int(y),
                 "coord_space": "client",
                 "button": str(button),
-                "clicks": 1,
+                "clicks": max(1, int(clicks)),
+                "hold_ms": max(0, int(hold_ms)),
+                "settle_ms": max(0, int(settle_ms)),
                 "force_fg": True,
+                **({"template_key": template_key} if template_key else {}),
             },
         )
 
-    def _enqueue_capture(self, vm_id: str, hwnd: int, purpose: str = "") -> bool:
+    def _enqueue_capture(
+        self,
+        vm_id: str,
+        hwnd: int,
+        purpose: str = "",
+        *,
+        require_fresh: bool = False,
+    ) -> bool:
         hwnd_i = int(hwnd)
         key = (vm_id, hwnd_i)
         now = time.time()
 
         last_ts = self._last_capture_request_ts.get(key, 0.0)
-        if now - last_ts < 0.35:
+        if now - last_ts < 0.10:
             return False
 
         self._last_capture_request_ts[key] = now
@@ -637,6 +736,8 @@ class StartMmDota2:
         payload = {"hwnd": hwnd_i}
         if purpose:
             payload["purpose"] = purpose
+        if require_fresh:
+            payload["require_fresh"] = True
 
         self.queue_command(
             vm_id,
@@ -666,7 +767,8 @@ class StartMmDota2:
             },
         )
 
-    def _enqueue_key(self, vm_id: str, hwnd: int, vk_code: int, hold_ms: int = 25) -> None:
+    def _enqueue_key(self, vm_id: str, hwnd: int, vk_code: int, hold_ms: int = 25,
+                     *, escape_method: str = "virtual_key") -> None:
         self._clear_frame(vm_id, hwnd)
 
         self.queue_command(
@@ -676,6 +778,8 @@ class StartMmDota2:
                 "hwnd": int(hwnd),
                 "vk_code": int(vk_code),
                 "hold_ms": int(hold_ms),
+                "focus_settle_ms": 30,
+                **({"escape_method": escape_method} if int(vk_code) == 0x1B else {}),
                 "force_fg": True,
             },
         )
@@ -978,14 +1082,31 @@ class StartMmDota2:
         )
 
     def _find_lock_in(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
-        return self._find_any(
-            frame,
-            ["lock_in_ru", "lock_in_eng", "lock_in"],
-            confidence=0.80,
-        )
+        """Return the lock-in button to click for the current pick.
+
+        Dota may render the Russian ``ВЫБРАТЬ`` button with the grey styling
+        captured by ``lock_in_disabled_ru`` even when it is the actionable
+        button.  Prefer the coloured templates, but use that Russian template
+        as a fallback instead of treating it as a reason to skip the click.
+        """
+        best = None
+        for key in ("lock_in_ru", "lock_in_eng", "lock_in"):
+            hit = self._match_lock_in_by_color_state(
+                frame, key, confidence=0.80, enabled=True
+            )
+            if hit is not None and (best is None or hit["score"] > best["score"]):
+                best = hit
+        if best is not None:
+            return best
+
+        # This fallback intentionally does not use the colour-state guard:
+        # the template is the exact clickable Russian button variant.
+        return self._match(frame, "lock_in_disabled_ru", confidence=0.80)
 
     def _find_disabled_lock_in(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
-        return self._match(frame, "lock_in_disabled_ru", confidence=0.80)
+        return self._match_lock_in_by_color_state(
+            frame, "lock_in_disabled_ru", confidence=0.80, enabled=False
+        )
 
     def _request_pick_refresh(
         self,
@@ -1137,12 +1258,13 @@ class StartMmDota2:
         state.pick_selected_hero_by_hwnd[hwnd] = hero_name
         self._enqueue_focus(state.vm_id, hwnd)
         self._enqueue_click(state.vm_id, hwnd, hero_hit["x"], hero_hit["y"])
-        self._clear_frame(state.vm_id, hwnd)
-        state.inflight = True
+
         self.log.info(
             f"[MM] {state.vm_id}: selected hero hwnd={hex(hwnd)} "
             f"role={role} hero={hero_name} by {template_key}"
         )
+        self._clear_frame(state.vm_id, hwnd)
+        state.inflight = True
         return False
 
     def _begin_pick_wait(
@@ -1203,6 +1325,23 @@ class StartMmDota2:
         phase_roles = self._current_pick_phase_roles(state)
         phase_hwnds = self._pick_hwnds_for_roles(state, phase_roles)
         if not phase_hwnds:
+            return False
+
+        elapsed = time.time() - state.pick_phase_started_ts
+        if state.pick_phase_started_ts > 0 and elapsed >= PICK_PHASE_TIMEOUT_SEC:
+            pending_roles = [
+                state.pick_role_by_hwnd.get(hwnd, "unknown")
+                for hwnd in phase_hwnds
+                if hwnd not in state.pick_finalized_hwnds
+            ]
+            for hwnd in phase_hwnds:
+                self._append_unique(state.pick_finalized_hwnds, hwnd)
+                self._clear_frame(state.vm_id, hwnd)
+            self.log.warning(
+                f"[MM] {state.vm_id}: pick phase timeout phase={state.pick_phase} "
+                f"elapsed={elapsed:.1f}s skipped_roles={pending_roles}"
+            )
+            self._advance_pick_phase(state)
             return False
 
         pending_hwnds = [
@@ -1419,26 +1558,46 @@ class StartMmDota2:
                 return True
             return False
 
-        hit = self._find_any(
-            frame,
-            [
-                "close_welcome_ru",
-                "close_welcome_ru2",
-                "accept_reward_ru"
-            ],
-            confidence=0.87,
-        )
+        threshold = 0.87
+        hit = None
+        diagnostics = []
+        for key in ("close_welcome_ru", "close_welcome_ru2", "accept_reward_ru", "cross", "cross2"):
+            if self._templates.get(key) is None:
+                diagnostics.append(f"{key}=missing_template")
+                continue
+            candidate = self._match(frame, key, confidence=-1.0)
+            diagnostics.append(
+                f"{key}={candidate['score']:.3f}" if candidate else f"{key}=unmatchable"
+            )
+            if hit is None and candidate is not None and candidate["score"] >= threshold:
+                hit = candidate
 
         if hit is None:
+            w = state.windows.get(hwnd)
+            now = time.time()
+            if w is None or now - w.last_popup_log_ts >= 2.0:
+                self.log.info(
+                    f"[MM] popup not detected vm={state.vm_id} hwnd={hex(hwnd)} "
+                    f"threshold={threshold} matches={', '.join(diagnostics)}"
+                )
+                if w is not None:
+                    w.last_popup_log_ts = now
             return False
 
-        self._enqueue_focus(state.vm_id, hwnd)
-        self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
+        # On non-primary windows Dota can ignore the first input immediately
+        # after activation.  Keep the window foregrounded long enough before
+        # issuing the image-based click.
+        self._enqueue_focus(state.vm_id, hwnd, settle_ms=500)
+        self._enqueue_click(
+            state.vm_id, hwnd, hit["x"], hit["y"], template_key=hit["key"]
+        )
         self._enqueue_sleep(state.vm_id, 300)
+        self._enqueue_capture(state.vm_id, hwnd, purpose="after_popup_click", require_fresh=True)
 
         state.inflight = True
         self.log.info(
-            f"[MM] {state.vm_id}: closed first-run popup on hwnd={hex(hwnd)} by {hit['key']}"
+            f"[MM] {state.vm_id}: popup detected; click queued hwnd={hex(hwnd)} "
+            f"template={hit['key']} score={hit['score']:.3f} point=({hit['x']},{hit['y']})"
         )
         return True
 
@@ -1488,18 +1647,242 @@ class StartMmDota2:
         if not all_ready:
             return False
 
-        state.stage = MmStage.LEAVE_PARTY
+        # Settings are applied on every Dota window before party operations.
+        # Discard the ready frames so the first settings click also uses a
+        # newly captured image.
+        state.settings_hwnd_index = 0
+        state.settings_step = 0
+        state.settings_capture_wait_pending = False
+        for hwnd in state.hwnds:
+            self._clear_frame(state.vm_id, hwnd)
+        state.stage = MmStage.SET_SETTINGS
         state.last_stage_ts = time.time()
         self.log.info(f"[MM] {state.vm_id}: all dota windows are ready")
         return False
+
+    def _tick_set_settings(self, state: VmMmState) -> bool:
+        """Set the required lobby options, refreshing the frame after each click."""
+        steps = [
+            "settings",
+            "lobby_settings_game",
+            "lobby_settings_camera",
+            "lobby_settings_select1",
+            "lobby_settings_select2",
+        ]
+
+        if state.settings_hwnd_index >= len(state.hwnds):
+            state.stage = MmStage.LEAVE_PARTY
+            state.last_stage_ts = time.time()
+            self.log.info(f"[MM] {state.vm_id}: settings stage done")
+            return False
+
+        hwnd = state.hwnds[state.settings_hwnd_index]
+        if state.settings_escape_pending:
+            if state.settings_escape_verify_pending:
+                frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+                if frame is None:
+                    self._enqueue_sleep(state.vm_id, 300)
+                    if self._enqueue_capture(
+                        state.vm_id, hwnd, purpose="verify_settings_closed", require_fresh=True
+                    ):
+                        state.inflight = True
+                    return False
+                settings_visible = any(
+                    self._match(frame, key, confidence=0.95) is not None
+                    for key in ("lobby_settings_game", "lobby_settings_camera")
+                )
+                lobby_visible = (
+                    self._match(frame, "dota", confidence=0.75) is not None
+                    and self._match(frame, "settings", confidence=0.95) is not None
+                )
+                if not settings_visible and lobby_visible:
+                    state.settings_escape_pending = False
+                    state.settings_escape_verify_pending = False
+                    state.settings_escape_attempts = 0
+                    state.settings_hwnd_index += 1
+                    self._clear_frame(state.vm_id, hwnd)
+                    self.log.info(f"[MM] {state.vm_id}: settings closed confirmed hwnd={hex(hwnd)}")
+                    return False
+                self._clear_frame(state.vm_id, hwnd)
+                if not settings_visible:
+                    # An ambiguous frame is not a reason to press Esc again:
+                    # that could reopen a menu which has already closed.
+                    if self._enqueue_capture(
+                        state.vm_id, hwnd, purpose="verify_settings_closed_retry", require_fresh=True
+                    ):
+                        state.inflight = True
+                    return False
+                state.settings_escape_verify_pending = False
+                close_hit, close_scores = self._find_settings_close_control(frame)
+                self.log.warning(
+                    f"[MM] {state.vm_id}: settings still open hwnd={hex(hwnd)} "
+                    f"close attempts={state.settings_escape_attempts} cross_scores={close_scores}"
+                )
+                if close_hit is not None:
+                    self._enqueue_click(
+                        state.vm_id, hwnd, close_hit["x"], close_hit["y"],
+                        template_key=close_hit["key"],
+                    )
+                    self._enqueue_sleep(state.vm_id, 500)
+                    state.settings_escape_attempts += 1
+                    state.settings_escape_verify_pending = True
+                    state.inflight = True
+                    self.log.info(
+                        f"[MM] {state.vm_id}: settings close button queued hwnd={hex(hwnd)} "
+                        f"template={close_hit['key']} score={close_hit['score']:.3f} "
+                        f"point=({close_hit['x']},{close_hit['y']})"
+                    )
+                    return False
+            state.settings_escape_attempts += 1
+            self._enqueue_key(state.vm_id, hwnd, 0x1B, hold_ms=70, escape_method="virtual_key")
+            state.inflight = True
+            return False
+        target = steps[state.settings_step]
+        frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
+        if frame is None:
+            self._request_settings_frame(state, hwnd, target)
+            return False
+
+        hit = self._match(frame, target, confidence=0.95)
+        if hit is None:
+            # Do not advance on a stale or transitional UI.  The next tick
+            # retries the same action from a fresh screenshot.
+            self._clear_frame(state.vm_id, hwnd)
+            self._request_settings_frame(state, hwnd, target, retry=True)
+            return False
+
+        self._enqueue_focus(state.vm_id, hwnd)
+        self._enqueue_click(state.vm_id, hwnd, hit["x"], hit["y"])
+        state.settings_step += 1
+        if state.settings_step >= len(steps):
+            state.settings_step = 0
+            # Let Dota apply the final setting before dismissing the dialog.
+            # All three commands are queued together, so their order is
+            # fixed: final click -> pause -> Esc.
+            self._enqueue_sleep(state.vm_id, 750)
+            state.settings_escape_pending = True
+            state.settings_escape_verify_pending = False
+            state.settings_escape_attempts = 1
+            self._enqueue_key(state.vm_id, hwnd, 0x1B, hold_ms=200)
+            self.log.info(f"[MM] {state.vm_id}: queued Esc for hwnd={hex(hwnd)}")
+
+        # _enqueue_click clears the cached frame.  The next action therefore
+        # always starts by requesting a fresh one.
+        state.inflight = True
+        self.log.info(
+            f"[MM] {state.vm_id}: settings hwnd={hex(hwnd)} clicked {target}"
+        )
+        return False
+
+    def _find_settings_close_control(
+        self, frame_rgb: np.ndarray
+    ) -> tuple[Optional[Dict[str, Any]], Dict[str, float]]:
+        """Find the top-right settings close control, allowing UI recolouring."""
+        height, width = frame_rgb.shape[:2]
+        candidates: list[Dict[str, Any]] = []
+        scores: Dict[str, float] = {}
+        for key in ("cross", "cross2"):
+            hit = self._match(frame_rgb, key, confidence=-1.0)
+            if hit is None:
+                continue
+            scores[key] = round(float(hit["score"]), 3)
+            # The settings window close control is in the upper/right part
+            # of the Dota client. This avoids selecting an unrelated X.
+            if hit["x"] >= width // 2 and hit["y"] <= height * 2 // 3:
+                candidates.append(hit)
+        eligible = [hit for hit in candidates if hit["score"] >= 0.60]
+        if not eligible:
+            return None, scores
+        return max(eligible, key=lambda hit: hit["score"]), scores
+
+    def _request_settings_frame(
+        self,
+        state: VmMmState,
+        hwnd: int,
+        target: str,
+        *,
+        retry: bool = False,
+    ) -> None:
+        """Wait for the settings UI to settle before requesting a fresh frame."""
+        if not state.settings_capture_wait_pending:
+            self._enqueue_sleep(state.vm_id, 2000)
+            state.settings_capture_wait_pending = True
+            state.inflight = True
+            return
+
+        purpose_prefix = "set_settings_retry" if retry else "set_settings"
+        if self._enqueue_capture(
+            state.vm_id,
+            hwnd,
+            purpose=f"{purpose_prefix}_{target}",
+            require_fresh=True,
+        ):
+            state.settings_capture_wait_pending = False
+            state.inflight = True
 
     def _enter_build_party(self, state: VmMmState, reason: str) -> None:
         state.leave_party_done = True
         state.leave_party_done_hwnds = list(state.hwnds)
         state.leave_party_click_index_by_hwnd = {}
+        state.party_invite_started_ts = 0.0
         state.stage = MmStage.BUILD_PARTY
         state.last_stage_ts = time.time()
         self.log.info(f"[MM] {state.vm_id}: leave_party stage done reason={reason}")
+
+    def _return_to_leave_party(self, state: VmMmState, reason: str) -> None:
+        """Reset a stalled party build and retry from a known solo state."""
+        state.leave_party_done = False
+        state.leave_party_done_hwnds = []
+        state.leave_party_click_index_by_hwnd = {}
+        state.party_built = False
+        state.party_search_done = False
+        state.party_search_clicked = False
+        state.party_add_done = False
+        state.party_accept_done = False
+        state.party_invite_index = 1
+        state.party_return_to_dota_pending = False
+        state.party_invited_indices = []
+        state.party_retry_invite_active = False
+        state.party_invite_started_ts = 0.0
+        state.inflight = False
+        state.stage = MmStage.LEAVE_PARTY
+        state.last_stage_ts = time.time()
+        for hwnd in state.hwnds:
+            self._clear_frame(state.vm_id, hwnd)
+        self.log.warning(
+            f"[MM] {state.vm_id}: build_party timeout -> leave_party; reason={reason}"
+        )
+
+    def _retry_party_invite_via_dota(
+        self,
+        state: VmMmState,
+        *,
+        leader: int,
+        member_index: int,
+        reason: str,
+    ) -> None:
+        """Return the leader to Dota, then retry exactly one party member."""
+        member_index = int(member_index)
+        state.party_invite_index = member_index
+        state.party_search_done = False
+        state.party_search_clicked = False
+        state.party_add_done = False
+        state.party_accept_done = False
+        state.party_return_to_dota_pending = True
+        state.party_retry_invite_active = True
+        state.party_invite_started_ts = 0.0
+        self._remove_value(state.party_invited_indices, member_index)
+
+        if 0 <= member_index < len(state.hwnds):
+            member = state.windows[state.hwnds[member_index]]
+            member.invite_sent_ts = 0.0
+            member.invite_accepted = False
+
+        self._clear_frame(state.vm_id, leader)
+        self.log.warning(
+            f"[MM] {state.vm_id}: retry party invite index={member_index} "
+            f"via Dota; reason={reason}"
+        )
 
     def _tick_leave_party(self, state: VmMmState) -> bool:
         if state.leave_party_done:
@@ -1520,9 +1903,13 @@ class StartMmDota2:
 
         hwnd = pending_hwnds[0]
         frame = self._get_latest_frame_rgb(state.vm_id, hwnd)
-
         if frame is None:
-            if self._enqueue_capture(state.vm_id, hwnd, purpose="leave_party_check"):
+            if self._enqueue_capture(
+                state.vm_id,
+                hwnd,
+                purpose="leave_party_check",
+                require_fresh=True,
+            ):
                 state.inflight = True
             return False
 
@@ -1573,19 +1960,69 @@ class StartMmDota2:
                 )
                 return False
 
+        # Preserve whether an icon was already clicked before wrapping back
+        # to slot zero: second -> first needs the same Dota click as first -> second.
+        return_to_dota = click_index > 0
         if click_index >= len(LEAVE_PARTY_CLICK_POINTS):
             click_index = 0
 
         x, y = LEAVE_PARTY_CLICK_POINTS[click_index]
-        state.leave_party_click_index_by_hwnd[hwnd] = click_index + 1
 
+        if return_to_dota:
+            # The context menu from the previous party icon can remain open.
+            # Click the in-game Dota UI icon before trying the other party
+            # icon. Without it the cursor/right-click is often consumed by
+            # the old context menu rather than the next party slot.
+            dota_hit = self._match(frame, "dota", confidence=0.75)
+            if not dota_hit:
+                if self._enqueue_capture(
+                    state.vm_id,
+                    hwnd,
+                    purpose="leave_party_find_dota_between_icons",
+                    require_fresh=True,
+                ):
+                    state.inflight = True
+                return False
+
+            self._enqueue_focus(state.vm_id, hwnd)
+            self._enqueue_click(
+                state.vm_id,
+                hwnd,
+                dota_hit["x"],
+                dota_hit["y"],
+                hold_ms=100,
+                settle_ms=100,
+            )
+            self._enqueue_sleep(state.vm_id, LEAVE_PARTY_ICON_SETTLE_MS)
+            self.log.info(
+                f"[MM] {state.vm_id}: clicked dota between party icons "
+                f"hwnd={hex(hwnd)}"
+            )
+
+        # Dota reliably accepts the party-slot right click only after an
+        # explicit focus transition.  The next frame is still forced to come
+        # from capture_frame, never from the pre-click bridge image.
         self._enqueue_focus(state.vm_id, hwnd)
-        self._enqueue_click(state.vm_id, hwnd, x, y, button="right")
+        self._enqueue_click(
+            state.vm_id,
+            hwnd,
+            x,
+            y,
+            button="right",
+            # The party menu is especially sensitive to a click sent during
+            # focus switching.  Keep the button down long enough for Dota to
+            # create the context menu before releasing it.
+            hold_ms=220,
+            settle_ms=100,
+        )
+        state.leave_party_click_index_by_hwnd[hwnd] = click_index + 1
+        self._enqueue_sleep(state.vm_id, LEAVE_PARTY_ICON_SETTLE_MS)
         self._clear_frame(state.vm_id, hwnd)
         state.inflight = True
         self.log.info(
             f"[MM] {state.vm_id}: right-clicked party slot hwnd={hex(hwnd)} "
-            f"pos=({x},{y}) player_icons={player_icon_count}"
+            f"pos=({x},{y}) clicks=1 "
+            f"player_icons={player_icon_count}"
         )
         return False
 
@@ -1619,6 +2056,10 @@ class StartMmDota2:
                 if dota_hit:
                     self._enqueue_focus(state.vm_id, leader)
                     self._enqueue_click(state.vm_id, leader, dota_hit["x"], dota_hit["y"])
+                    # This recovery path is entered only after an invite UI
+                    # element timed out. Close any remaining dialog/menu
+                    # after returning through the in-game Dota icon.
+                    self._enqueue_key(state.vm_id, leader, 0x1B, hold_ms=70)
                     self._enqueue_sleep(state.vm_id, between_invites_sleep_ms)
 
                     state.party_return_to_dota_pending = False
@@ -1626,10 +2067,12 @@ class StartMmDota2:
 
                     if state.party_retry_invite_active:
                         state.party_retry_invite_active = False
-                        state.party_add_done = True
-                        state.party_invite_index = len(state.hwnds)
+                        state.party_search_done = False
+                        state.party_add_done = False
+                        state.party_invite_started_ts = time.time()
                     else:
                         state.party_invite_index += 1
+                        state.party_invite_started_ts = 0.0
 
                         if state.party_invite_index >= len(state.hwnds):
                             state.party_add_done = True
@@ -1673,6 +2116,20 @@ class StartMmDota2:
                 return False
 
             current_friend_id = str(current_friend_id)
+
+            if state.party_invite_started_ts <= 0:
+                state.party_invite_started_ts = time.time()
+            elif time.time() - state.party_invite_started_ts >= PARTY_INVITE_STEP_TIMEOUT_SEC:
+                self._retry_party_invite_via_dota(
+                    state,
+                    leader=leader,
+                    member_index=state.party_invite_index,
+                    reason=(
+                        "invite UI element was not found within "
+                        f"{PARTY_INVITE_STEP_TIMEOUT_SEC:.0f}s"
+                    ),
+                )
+                return False
 
             if not state.party_search_done:
                 hit_add_party = self._match(frame, "add_party")
@@ -1797,18 +2254,15 @@ class StartMmDota2:
                         w.invite_sent_ts > 0
                         and now - w.invite_sent_ts >= MM_PARTY_INVITE_TIMEOUT_SEC
                     ):
-                        self.log.warning(
-                            f"[MM] {state.vm_id}: party invite timeout "
-                            f"index={member_index} hwnd={hex(hwnd)} "
-                            f"timeout={MM_PARTY_INVITE_TIMEOUT_SEC:.1f}s, retry invite"
+                        self._retry_party_invite_via_dota(
+                            state,
+                            leader=leader,
+                            member_index=member_index,
+                            reason=(
+                                "accept-invite button was not found within "
+                                f"{MM_PARTY_INVITE_TIMEOUT_SEC:.0f}s"
+                            ),
                         )
-                        state.party_invite_index = member_index
-                        state.party_search_done = False
-                        state.party_search_clicked = False
-                        state.party_add_done = False
-                        state.party_return_to_dota_pending = False
-                        state.party_retry_invite_active = True
-                        self._clear_frame(state.vm_id, leader)
                         return False
 
                     if self._enqueue_capture(state.vm_id, hwnd, purpose="party_accept_invite"):
@@ -2092,6 +2546,9 @@ class StartMmDota2:
         if state.stage == MmStage.WAIT_DOTA_READY:
             return self._tick_wait_dota_ready(state)
 
+        if state.stage == MmStage.SET_SETTINGS:
+            return self._tick_set_settings(state)
+
         if state.stage == MmStage.LEAVE_PARTY:
             return self._tick_leave_party(state)
 
@@ -2099,8 +2556,9 @@ class StartMmDota2:
             return self._tick_build_party(state, friend_ids=friend_ids)
 
         if state.stage == MmStage.START_GAME:
+            if state.replay_start_game:
+                return self._tick_start_game_stub(state)
             state.stage = MmStage.DETECT_SIDE
-            self._enqueue_sleep(vm_id,30000)
             return False
             return self._tick_start_game_stub(state)
 
@@ -2171,6 +2629,29 @@ class StartMmDota2:
         ]
         roles_by_hwnd = self.get_role_by_hwnd(vm_id)
         return [roles_by_hwnd.get(hwnd, "unknown") for hwnd in ordered_hwnds]
+
+    def get_hero_by_hwnd(self, vm_id: str) -> Dict[int, str]:
+        state = self._vm.get(vm_id)
+        if state is None:
+            return {}
+        return {
+            int(hwnd): str(hero or "unknown")
+            for hwnd, hero in state.pick_selected_hero_by_hwnd.items()
+        }
+
+    def get_heroes(
+        self,
+        vm_id: str,
+        hwnds: Optional[List[int]] = None,
+    ) -> List[str]:
+        state = self._vm.get(vm_id)
+        if state is None:
+            return []
+        ordered_hwnds = [
+            int(hwnd) for hwnd in (hwnds if hwnds is not None else state.hwnds)
+        ]
+        heroes_by_hwnd = self.get_hero_by_hwnd(vm_id)
+        return [heroes_by_hwnd.get(hwnd, "unknown") for hwnd in ordered_hwnds]
 
     # ---------------------------------------------------------
     # logging

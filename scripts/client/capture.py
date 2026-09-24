@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Optional
 import numpy as np
 import dxcam
@@ -12,6 +13,10 @@ from dota_window import get_client_rect
 class DotaCapture:
     def __init__(self):
         self.cam = dxcam.create(output_idx=0, output_color="RGB")
+        # DXcam returns None when Desktop Duplication has no newer desktop
+        # frame.  MM menus can be completely static, so keep the last actual
+        # DXcam image only for explicit capture_frame requests.
+        self._last_frame_by_hwnd: dict[int, np.ndarray] = {}
 
     @staticmethod
     def _desktop_bounds() -> tuple[int, int, int, int]:
@@ -61,7 +66,13 @@ class DotaCapture:
         except Exception:
             return False
 
-    def grab_window_rgb(self, hwnd: int) -> Optional[np.ndarray]:
+    def grab_window_rgb(
+        self,
+        hwnd: int,
+        *,
+        allow_cached: bool = False,
+        wait_for_fresh_ms: int = 0,
+    ) -> Optional[np.ndarray]:
         if not self._window_ok(int(hwnd)):
             return None
 
@@ -82,15 +93,23 @@ class DotaCapture:
         if region is None:
             return None
 
-        try:
-            frame = self.cam.grab(region=region)
-        except ValueError:
-            return None
-        except Exception:
-            return None
+        deadline = time.monotonic() + max(0, int(wait_for_fresh_ms)) / 1000.0
+        frame = None
+        while True:
+            try:
+                frame = self.cam.grab(region=region)
+            except ValueError:
+                return None
+            except Exception:
+                return None
+
+            if frame is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
 
         if frame is None:
-            return None
+            cached = self._last_frame_by_hwnd.get(int(hwnd))
+            return None if not allow_cached or cached is None else cached.copy()
 
         if not isinstance(frame, np.ndarray):
             return None
@@ -101,4 +120,6 @@ class DotaCapture:
         if frame.dtype != np.uint8:
             frame = frame.astype(np.uint8, copy=False)
 
-        return frame.copy()
+        frame = frame.copy()
+        self._last_frame_by_hwnd[int(hwnd)] = frame
+        return frame

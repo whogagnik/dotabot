@@ -16,6 +16,7 @@ class PlannerRuntimeEntry:
     planner: Optional[Planner] = None
     hwnds: Optional[List[int]] = None
     roles: Optional[List[str]] = None
+    heroes: Optional[List[str]] = None
     side: str = "radiant"
     tick_fail_count: int = 0
     last_tick_error_log_ts: float = 0.0
@@ -69,38 +70,73 @@ class PlannerRuntimeRegistry:
         hwnds: List[int],
         roles: List[str],
         side: str,
+        heroes: Optional[List[str]] = None,
         logger=None,
     ) -> PlannerRuntimeEntry:
         vm_id = str(vm_id)
         hwnds = [int(x) for x in hwnds]
         roles = [str(x) for x in roles]
+        heroes = [str(x) for x in (heroes or ["unknown"] * len(hwnds))]
         side = str(side or "radiant")
 
         if len(hwnds) != len(roles):
             raise ValueError("hwnds and roles must have same length")
+        if len(hwnds) != len(heroes):
+            raise ValueError("hwnds and heroes must have same length")
 
         with self._lock:
             entry = self._entries.get(vm_id)
             if entry is None:
                 entry = self.register_vm(vm_id)
 
+            old_planner = entry.planner
+
+            # Frames are already accepted while the VM reaches the match.
+            # They can be a hero-selection/menu image.  A newly activated
+            # planner must start from frames captured after its hwnd list was
+            # confirmed, never from that pre-game backlog.
+            for hwnd in set((entry.hwnds or []) + hwnds):
+                entry.bridge.clear_hwnd_state(hwnd)
+
             entry.hwnds = list(hwnds)
             entry.roles = list(roles)
+            entry.heroes = list(heroes)
             entry.side = side
 
             entry.planner = Planner(
                 hwnds=entry.hwnds,
                 roles=entry.roles,
+                heroes=entry.heroes,
                 side=entry.side,
                 django_bridge=entry.bridge,
                 logger=logger,
             )
+            if old_planner is not None:
+                old_planner.close()
             return entry
 
     def unregister_planner(self, vm_id: str) -> None:
         vm_id = str(vm_id)
         with self._lock:
-            self._entries.pop(vm_id, None)
+            entry = self._entries.pop(vm_id, None)
+        if entry is not None and entry.planner is not None:
+            entry.planner.close()
+
+    def detach_planner(self, vm_id: str) -> None:
+        """Destroy the match planner while keeping the VM's frame bridge."""
+        with self._lock:
+            entry = self._entries.get(str(vm_id))
+            if entry is None:
+                return
+            planner = entry.planner
+            entry.planner = None
+            for hwnd in entry.hwnds or []:
+                entry.bridge.clear_hwnd_state(hwnd)
+            entry.hwnds = None
+            entry.roles = None
+            entry.heroes = None
+        if planner is not None:
+            planner.close()
 
     # ---------------------------------------------------------
     # accessors
@@ -124,10 +160,11 @@ class PlannerRuntimeRegistry:
     # ticking
     # ---------------------------------------------------------
 
-    def tick_all(self) -> None:
+    def tick_all(self) -> List[str]:
         with self._lock:
             entries = list(self._entries.values())
 
+        completed: List[str] = []
         for entry in entries:
             planner = entry.planner
             if planner is None:
@@ -138,6 +175,8 @@ class PlannerRuntimeRegistry:
 
             try:
                 planner.tick_one()
+                if getattr(planner, "game_end_complete", False):
+                    completed.append(entry.vm_id)
                 entry.tick_fail_count = 0
                 entry.next_tick_after_ts = 0.0
             except Exception:
@@ -168,6 +207,8 @@ class PlannerRuntimeRegistry:
                     except Exception:
                         pass
 
+        return completed
+
     # ---------------------------------------------------------
     # debug helpers
     # ---------------------------------------------------------
@@ -183,6 +224,7 @@ class PlannerRuntimeRegistry:
                 "planner_active": entry.planner is not None,
                 "hwnds": list(entry.hwnds or []),
                 "roles": list(entry.roles or []),
+                "heroes": list(entry.heroes or []),
                 "side": entry.side,
             })
         return rows

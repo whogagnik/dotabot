@@ -70,7 +70,7 @@ LEVEL_ROI: Tuple[int, int, int, int] = (228, 467, 236, 475)
 LEVEL_TEMPLATES_DIR = Path("images/levels")
 LEVEL_MIN = 1
 LEVEL_MAX = 30
-LEVEL_MATCH_MIN_SCORE = 0.85
+LEVEL_MATCH_MIN_SCORE = 0.75
 
 HUD_HP_UPSCALE = 8
 HUD_HP_TEXT_RGB_MIN = (210, 210, 210)
@@ -102,24 +102,25 @@ TILE_GAP = 8
 TILE_BOTTOM_HEIGHT = 420
 GRID_WRAP_AT = 1920
 FIND_LOGIN_WINDOW_TIMEOUT_SEC = 30.0
-FIND_DOTA_WINDOW_TIMEOUT_SEC = 60
-MM_PARTY_INVITE_TIMEOUT_SEC = 20.0
+FIND_DOTA_WINDOW_TIMEOUT_SEC = 120
+MM_PARTY_INVITE_TIMEOUT_SEC = 30.0
 POLL_SECONDS = 10
 APP_ID_DOTA = 570
 DOTA_LAUNCH_OPTS = [
     "-novid",
     "-sw",
     "-480",
-    "+fps_max",
-    "30",
     "-threads",
     "1",
     "-nosound",
+    "+fps_max",
+    "30",
     "+engine_no_focus_sleep",
     "1",
     "-nobigpicture",
     "-noreactlogin",
     "-silent",
+    "-prewarm"
 ]
 
 heroes = [x for x in range(0, 126)]

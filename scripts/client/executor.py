@@ -19,9 +19,44 @@ import win32process
 from PIL import Image
 
 
-EXECUTOR_VERSION = "executor_real_dota_window_filter_v6"
+EXECUTOR_VERSION = "executor_login_hwnd_recovery_v33"
+DOTA_PRIORITY_CLASS = psutil.BELOW_NORMAL_PRIORITY_CLASS
+# Each Dota client gets the same lowest Windows scheduler weight.  Unlike a
+# hard rate cap, a weight never freezes a game's threads at interval boundary.
+DOTA_CPU_SCHEDULER_WEIGHT = 1
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+JOB_OBJECT_CPU_RATE_CONTROL_ENABLE = 0x1
+JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED = 0x2
+JobObjectCpuRateControlInformation = 15
+PROCESS_TERMINATE = 0x0001
+PROCESS_SET_QUOTA = 0x0100
+
+
+class _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+    _fields_ = (
+        ("ControlFlags", wintypes.DWORD),
+        ("Value", wintypes.DWORD),
+    )
+
+
+kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+kernel32.SetInformationJobObject.argtypes = (
+    wintypes.HANDLE,
+    ctypes.c_int,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+)
+kernel32.SetInformationJobObject.restype = wintypes.BOOL
+kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
@@ -72,6 +107,7 @@ class _INPUT(ctypes.Structure):
 
 
 INPUT_KEYBOARD = 1
+INPUT_MOUSE = 0
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 
@@ -97,6 +133,7 @@ class HostCommandType:
     CAPTURE_DESKTOP = "capture_desktop"
     LOG = "log"
     DISMISS_STEAM_POPUPS = "dismiss_steam_popups"
+    CLOSE_STEAM_WINDOWS = "close_steam_windows"
 
 
 def _desktop_bounds() -> dict[str, int]:
@@ -317,32 +354,112 @@ def _any_login_hwnd_for_pids(pids: set[int]) -> Optional[int]:
     return found
 
 
-def _force_foreground(hwnd: int) -> None:
+def _any_visible_steam_login_hwnd(exclude_hwnds: set[int] | None = None) -> Optional[int]:
+    """Find the visible Steam sign-in window when Steam detached from launch PID."""
+    found = None
+
+    def cb(hwnd, _):
+        nonlocal found
+        if found is not None or int(hwnd) in (exclude_hwnds or set()) or not win32gui.IsWindowVisible(hwnd):
+            return
+        if not _login_window_title_match(hwnd):
+            return
+        try:
+            pid = _window_pid(hwnd)
+            process_name = (psutil.Process(pid).name() or "").lower() if pid else ""
+        except (psutil.Error, OSError):
+            return
+        if process_name in {"steam.exe", "steamwebhelper.exe"}:
+            found = int(hwnd)
+
     try:
-        if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-
-        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
-
-        fore = win32gui.GetForegroundWindow()
-        ftid = win32process.GetWindowThreadProcessId(fore)[0] if fore else 0
-        ctid = win32api.GetCurrentThreadId()
-
-        user32.AttachThreadInput(ftid, ctid, True)
-        try:
-            win32gui.BringWindowToTop(hwnd)
-            win32gui.SetForegroundWindow(hwnd)
-            win32gui.SetActiveWindow(hwnd)
-        finally:
-            user32.AttachThreadInput(ftid, ctid, False)
-
-        time.sleep(0.06)
+        win32gui.EnumWindows(cb, None)
     except Exception:
+        return None
+    return found
+
+
+def _force_foreground(
+    hwnd: int, *, settle_ms: int = 60, activation_wait_ms: int = 50,
+    retry_wait_ms: int = 100, fast_if_visible: bool = False,
+) -> None:
+    """Bring an input window to the foreground and its thread to keyboard focus."""
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        attached_threads: list[int] = []
         try:
-            win32gui.SetForegroundWindow(hwnd)
-            time.sleep(0.06)
-        except Exception:
-            pass
+            iconic = win32gui.IsIconic(hwnd)
+            if iconic:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            if not (fast_if_visible and attempt == 0 and not iconic):
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+                win32gui.SetWindowPos(
+                    hwnd, win32con.HWND_TOP, 0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+                )
+
+            fore = win32gui.GetForegroundWindow()
+            ftid = win32process.GetWindowThreadProcessId(fore)[0] if fore else 0
+            target_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+            ctid = win32api.GetCurrentThreadId()
+            for thread_id in dict.fromkeys((ftid, target_tid)):
+                if thread_id and thread_id != ctid and user32.AttachThreadInput(ctid, thread_id, True):
+                    attached_threads.append(thread_id)
+            try:
+                # SwitchToThisWindow bypasses cases where Steam keeps its
+                # web-helper window visible but declines SetForegroundWindow.
+                user32.SwitchToThisWindow(hwnd, True)
+                win32gui.BringWindowToTop(hwnd)
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.SetActiveWindow(hwnd)
+                user32.SetFocus(hwnd)
+            finally:
+                for thread_id in reversed(attached_threads):
+                    user32.AttachThreadInput(ctid, thread_id, False)
+
+            if activation_wait_ms > 0:
+                time.sleep(activation_wait_ms / 1000.0)
+            _require_foreground(hwnd)
+            if settle_ms > 0:
+                time.sleep(max(0, int(settle_ms)) / 1000.0)
+            return
+        except Exception as error:
+            last_error = error
+            if attempt < 2 and retry_wait_ms > 0:
+                time.sleep(retry_wait_ms / 1000.0)
+
+    raise RuntimeError(f"could not foreground hwnd={hwnd} after 3 attempts: {last_error}")
+
+
+def _require_foreground(hwnd: int) -> None:
+    actual = int(win32gui.GetForegroundWindow())
+    if actual != int(hwnd):
+        raise RuntimeError(f"foreground mismatch: expected hwnd={hwnd}, actual hwnd={actual}")
+
+
+def _verify_click_target(hwnd: int, sx: int, sy: int) -> None:
+    _require_foreground(hwnd)
+    actual = tuple(win32api.GetCursorPos())
+    if actual != (sx, sy):
+        raise RuntimeError(f"cursor mismatch for hwnd={hwnd}: expected={(sx, sy)}, actual={actual}")
+    hit = win32gui.WindowFromPoint((sx, sy))
+    root = win32gui.GetAncestor(hit, win32con.GA_ROOT) if hit else 0
+    if int(root) != int(hwnd):
+        raise RuntimeError(f"click target mismatch: expected hwnd={hwnd}, actual hwnd={root}")
+
+
+def _absolute_mouse_point(sx: int, sy: int) -> tuple[int, int]:
+    # SendInput absolute coordinates cover the entire virtual desktop,
+    # including monitors left/above the primary monitor.
+    left = win32api.GetSystemMetrics(win32con.SM_XVIRTUALSCREEN)
+    top = win32api.GetSystemMetrics(win32con.SM_YVIRTUALSCREEN)
+    width = win32api.GetSystemMetrics(win32con.SM_CXVIRTUALSCREEN)
+    height = win32api.GetSystemMetrics(win32con.SM_CYVIRTUALSCREEN)
+    if width <= 0 or height <= 0 or not (left <= sx < left + width and top <= sy < top + height):
+        raise ValueError(f"mouse point outside virtual desktop: ({sx},{sy})")
+    # Aim at the centre of the destination pixel, not its left/top boundary.
+    return (min(65535, int((sx - left + 0.5) * 65536 / width)),
+            min(65535, int((sy - top + 0.5) * 65536 / height)))
 
 
 def _require_live_window(hwnd: Optional[int], purpose: str) -> int:
@@ -396,7 +513,29 @@ def _key_up(vk_code: int) -> None:
     win32api.keybd_event(vk_code, _vk_scan_code(vk_code), win32con.KEYEVENTF_KEYUP, 0)
 
 
-def _tap_vk(vk_code: int, hold_ms: int = 25) -> None:
+def _tap_vk(vk_code: int, hold_ms: int = 25, *, escape_method: str = "scan_code") -> None:
+    if int(vk_code) == win32con.VK_ESCAPE:
+        if escape_method not in {"scan_code", "virtual_key"}:
+            raise ValueError(f"unsupported Escape input method: {escape_method}")
+        def send_escape(up: bool) -> None:
+            flags = (0x0008 if escape_method == "scan_code" else 0) | (win32con.KEYEVENTF_KEYUP if up else 0)
+            events = (_INPUT * 1)(_INPUT(
+                type=INPUT_KEYBOARD,
+                union=_INPUT_UNION(ki=_KEYBDINPUT(
+                    0 if escape_method == "scan_code" else win32con.VK_ESCAPE,
+                    0x01, flags, 0, 0,
+                )),
+            ))
+            ctypes.set_last_error(0)
+            if user32.SendInput(1, events, ctypes.sizeof(_INPUT)) != 1:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+        send_escape(False)
+        try:
+            time.sleep(max(0, int(hold_ms)) / 1000.0)
+        finally:
+            send_escape(True)
+        return
     _key_down(vk_code)
     time.sleep(max(0, int(hold_ms)) / 1000.0)
     _key_up(vk_code)
@@ -493,6 +632,17 @@ def _get_client_rect(hwnd: int) -> tuple[int, int, int, int]:
         return l, t, max(1, r - l), max(1, b - t)
 
 
+def _client_center_screen(hwnd: int) -> tuple[int, int]:
+    x, y, width, height = _get_client_rect(int(hwnd))
+    return int(x + width // 2), int(y + height // 2)
+
+
+def _center_cursor_in_client(hwnd: int) -> tuple[int, int]:
+    center_x, center_y = _client_center_screen(hwnd)
+    win32api.SetCursorPos((center_x, center_y))
+    return center_x, center_y
+
+
 class CommandExecutor:
     def __init__(self, capture: Any = None, api: Any = None):
         print(f"[EXECUTOR] loaded version: {EXECUTOR_VERSION}")
@@ -505,6 +655,9 @@ class CommandExecutor:
         self._login_hwnd_by_account: dict[str, int] = {}
         self._dota_hwnd_by_account: dict[str, int] = {}
         self._dota_pid_by_account: dict[str, int] = {}
+        # Handles must remain open: closing the last Job handle silently
+        # removes its CPU policy from the process.
+        self._dota_cpu_jobs: dict[int, int] = {}
 
     # ---------------------------------------------------------
     # helpers
@@ -538,6 +691,126 @@ class CommandExecutor:
             pass
 
         return res
+
+    @staticmethod
+    def _running_dota_process_count() -> int:
+        """Count live Dota processes before accepting another launch command."""
+        count = 0
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if str(proc.info.get("name") or "").lower() == "dota2.exe":
+                    count += 1
+            except (psutil.Error, OSError):
+                continue
+        return count
+
+    def known_dota_hwnds(self) -> list[int]:
+        # HWND values are allocated by Windows and have no meaningful order.
+        # Preserve the account launch order so every planner pass always goes
+        # first client -> second client -> ... deterministically.
+        ordered_logins = sorted(
+            self._dota_hwnd_by_account,
+            key=lambda login: (self._launch_ts_by_account.get(login, float("inf")), login),
+        )
+        seen: set[int] = set()
+        hwnds: list[int] = []
+        for login in ordered_logins:
+            hwnd = self._dota_hwnd_by_account.get(login)
+            if not hwnd:
+                continue
+            hwnd_i = int(hwnd)
+            if hwnd_i not in seen:
+                seen.add(hwnd_i)
+                hwnds.append(hwnd_i)
+        return hwnds
+
+    @staticmethod
+    def _deprioritize_dota_process(pid: int) -> dict[str, Any]:
+        """Let the capture/client agent run ahead of background Dota clients."""
+        pid = int(pid)
+        try:
+            proc = psutil.Process(pid)
+            if (proc.name() or "").lower() != "dota2.exe":
+                return {"applied": False, "pid": pid, "error": "not_dota2"}
+            proc.nice(DOTA_PRIORITY_CLASS)
+            return {"applied": True, "pid": pid, "priority": "below_normal"}
+        except (psutil.Error, OSError) as error:
+            return {"applied": False, "pid": pid, "error": str(error)}
+
+    def _apply_dota_cpu_cap(self, pid: int) -> dict[str, Any]:
+        """Give one Dota PID an equal, non-blocking scheduler share.
+
+        A Job is kept alive for the lifetime of this executor.  The prior CPU
+        limiter could lose its Job handle, which made Windows drop the policy;
+        this version controls only the actual dota2.exe process and never
+        suspends it, changes its affinity, or uses a hard CPU interval cap.
+        """
+        pid = int(pid)
+        try:
+            proc = psutil.Process(pid)
+            if (proc.name() or "").lower() != "dota2.exe":
+                return {"applied": False, "pid": pid, "error": "not_dota2"}
+
+            if pid in self._dota_cpu_jobs:
+                return {
+                    "applied": True,
+                    "pid": pid,
+                    "mode": "per_process_equal_share",
+                    "weight": DOTA_CPU_SCHEDULER_WEIGHT,
+                    "reused": True,
+                }
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            try:
+                policy = _JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
+                    ControlFlags=(
+                        JOB_OBJECT_CPU_RATE_CONTROL_ENABLE
+                        | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED
+                    ),
+                    Value=DOTA_CPU_SCHEDULER_WEIGHT,
+                )
+                if not kernel32.SetInformationJobObject(
+                    job,
+                    JobObjectCpuRateControlInformation,
+                    ctypes.byref(policy),
+                    ctypes.sizeof(policy),
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+                process = kernel32.OpenProcess(
+                    PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                    False,
+                    pid,
+                )
+                if not process:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                try:
+                    if not kernel32.AssignProcessToJobObject(job, process):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                finally:
+                    kernel32.CloseHandle(process)
+            except Exception:
+                kernel32.CloseHandle(job)
+                raise
+
+            self._dota_cpu_jobs[pid] = int(job)
+            return {
+                "applied": True,
+                "pid": pid,
+                "mode": "per_process_equal_share",
+                "weight": DOTA_CPU_SCHEDULER_WEIGHT,
+                "reused": False,
+            }
+        except (psutil.Error, OSError, ctypes.ArgumentError) as error:
+            return {"applied": False, "pid": pid, "error": str(error)}
+
+    def _release_dota_cpu_cap(self, pid: int) -> None:
+        job = self._dota_cpu_jobs.pop(int(pid), None)
+        if job:
+            kernel32.CloseHandle(wintypes.HANDLE(job))
 
     def _find_hwnd_from_payload(self, payload: dict[str, Any]) -> Optional[int]:
         hwnd = payload.get("hwnd")
@@ -707,6 +980,19 @@ class CommandExecutor:
         args = [str(x) for x in payload.get("args", [])]
         account_login = str(payload.get("account_login", ""))
 
+        try:
+            max_dota_clients = int(payload.get("max_dota_clients", 0) or 0)
+        except (TypeError, ValueError):
+            max_dota_clients = 0
+        if max_dota_clients > 0:
+            current_dota_clients = self._running_dota_process_count()
+            if current_dota_clients >= max_dota_clients:
+                raise RuntimeError(
+                    "refusing Dota launch: "
+                    f"{current_dota_clients} clients already running "
+                    f"(limit {max_dota_clients})"
+                )
+
         launch_ts = time.time()
         proc = subprocess.Popen([exe_path, *args])
 
@@ -732,6 +1018,7 @@ class CommandExecutor:
 
         proc = psutil.Process(int(pid))
         children = proc.children(recursive=True)
+        terminated_pids = {int(proc.pid), *(int(child.pid) for child in children)}
 
         for ch in children:
             try:
@@ -751,6 +1038,9 @@ class CommandExecutor:
             except Exception:
                 pass
 
+        for terminated_pid in terminated_pids:
+            self._release_dota_cpu_cap(terminated_pid)
+
         return self._result_ok(pid=int(pid), killed=True)
 
     def find_login_window(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -762,12 +1052,30 @@ class CommandExecutor:
             timeout_ms = int(payload.get("timeout_ms", 30000))
         deadline = time.time() + (timeout_ms / 1000.0)
         last_tree_pids: list[int] = []
+        excluded = {int(h) for login, h in self._login_hwnd_by_account.items()
+                    if login != account_login and h and win32gui.IsWindow(int(h))}
 
         while time.time() < deadline:
             pids = set(self._proc_tree_pids(account_login))
             last_tree_pids = sorted(int(x) for x in pids)
 
             if not pids:
+                # Steam sometimes hands the login UI to a process outside the
+                # launcher's original process tree.  Its visible sign-in
+                # window is still the correct target in this VM.
+                detached_login = _any_visible_steam_login_hwnd(excluded)
+                if detached_login:
+                    _force_foreground(detached_login)
+                    self._login_hwnd_by_account[account_login] = int(detached_login)
+                    return self._result_ok(
+                        found=True,
+                        hwnd=int(detached_login),
+                        account_login=account_login,
+                        tree_pids=[],
+                        process_tree_alive=False,
+                        fallback_used=True,
+                        detached_process=True,
+                    )
                 time.sleep(0.4)
                 continue
 
@@ -789,6 +1097,11 @@ class CommandExecutor:
                 account_login,
                 only_title_steam=True,
             )
+            if not steam_hwnds:
+                steam_hwnds = self._steamwebhelper_hwnds_in_tree(
+                    account_login,
+                    only_title_steam=False,
+                )
             if steam_hwnds:
                 fallback = int(steam_hwnds[0])
                 _force_foreground(fallback)
@@ -801,6 +1114,18 @@ class CommandExecutor:
                     process_tree_alive=bool(last_tree_pids),
                     steamwebhelper_hwnds=[int(x) for x in steam_hwnds],
                     fallback_used=True,
+                )
+
+            # A live launcher does not imply that the web-helper remains its
+            # descendant. The old fallback ran only when the tree was empty.
+            detached_login = _any_visible_steam_login_hwnd(excluded)
+            if detached_login:
+                _force_foreground(detached_login)
+                self._login_hwnd_by_account[account_login] = int(detached_login)
+                return self._result_ok(
+                    found=True, hwnd=int(detached_login), account_login=account_login,
+                    tree_pids=last_tree_pids, process_tree_alive=bool(last_tree_pids),
+                    fallback_used=True, detached_process=True,
                 )
 
             time.sleep(0.4)
@@ -875,6 +1200,8 @@ class CommandExecutor:
 
                         self._dota_hwnd_by_account[account_login] = hwnd_i
                         self._dota_pid_by_account[account_login] = pid_i
+                        process_priority = self._deprioritize_dota_process(pid_i)
+                        cpu_limit = self._apply_dota_cpu_cap(pid_i)
 
                         return self._result_ok(
                             found=True,
@@ -887,6 +1214,8 @@ class CommandExecutor:
                             exclude_pids=sorted(exclude_pids),
                             exclude_hwnds=sorted(exclude_hwnds),
                             window_info=_window_info(hwnd_i),
+                            process_priority=process_priority,
+                            cpu_limit=cpu_limit,
                         )
                 except Exception:
                     continue
@@ -901,6 +1230,8 @@ class CommandExecutor:
 
                 self._dota_hwnd_by_account[account_login] = int(hwnd)
                 self._dota_pid_by_account[account_login] = int(pid)
+                process_priority = self._deprioritize_dota_process(int(pid))
+                cpu_limit = self._apply_dota_cpu_cap(int(pid))
 
                 return self._result_ok(
                     found=True,
@@ -914,6 +1245,8 @@ class CommandExecutor:
                     exclude_pids=sorted(exclude_pids),
                     exclude_hwnds=sorted(exclude_hwnds),
                     window_info=_window_info(int(hwnd)),
+                    process_priority=process_priority,
+                    cpu_limit=cpu_limit,
                 )
 
             time.sleep(0.25)
@@ -933,12 +1266,78 @@ class CommandExecutor:
     # window / input commands
     # ---------------------------------------------------------
 
+    def _current_login_hwnd(self, account_login: str) -> Optional[int]:
+        """Find the current Steam sign-in window without a long polling loop."""
+        pids = set(self._proc_tree_pids(account_login))
+        if pids:
+            hwnd = _any_login_hwnd_for_pids(pids)
+            if hwnd:
+                return int(hwnd)
+            for only_title in (True, False):
+                hwnds = self._steamwebhelper_hwnds_in_tree(
+                    account_login, only_title_steam=only_title,
+                )
+                if hwnds:
+                    return int(hwnds[0])
+
+        excluded = {
+            int(hwnd) for login, hwnd in self._login_hwnd_by_account.items()
+            if login != account_login and hwnd and win32gui.IsWindow(int(hwnd))
+        }
+        return _any_visible_steam_login_hwnd(excluded)
+
     def focus_window(self, payload: dict[str, Any]) -> dict[str, Any]:
         hwnd = self._find_hwnd_from_payload(payload)
-        hwnd = _require_live_window(hwnd, "focus_window")
+        account_login = str(payload.get("account_login") or "")
+        original_hwnd = hwnd
+        try:
+            hwnd = _require_live_window(hwnd, "focus_window")
+        except ValueError:
+            if not account_login or payload.get("field") == "dota":
+                raise
+            hwnd = _require_live_window(self._current_login_hwnd(account_login), "focus_window")
+            self._login_hwnd_by_account[account_login] = hwnd
 
-        _force_foreground(hwnd)
-        return self._result_ok(hwnd=int(hwnd))
+        # Resolve the target centre first. The pointer still moves only after
+        # foregrounding, but no geometry calls remain in that critical gap.
+        if bool(payload.get("center_cursor", False)):
+            center_x, center_y = _client_center_screen(hwnd)
+        else:
+            center_x = center_y = None
+
+        # Activate the target first, then immediately put the pointer in its
+        # client-area centre. This keeps cursor placement bound to the window
+        # that has just become foreground.
+        # Planner focus must centre the pointer immediately after foreground,
+        # rather than waiting for the generic 60 ms activation pause.
+        focus_kwargs = dict(
+            settle_ms=0,
+            activation_wait_ms=max(0, int(payload.get("activation_wait_ms", 50))),
+            retry_wait_ms=max(0, int(payload.get("retry_wait_ms", 100))),
+            fast_if_visible=bool(payload.get("fast_if_visible", False)),
+        )
+        try:
+            _force_foreground(hwnd, **focus_kwargs)
+        except Exception:
+            if not account_login or payload.get("field") == "dota" or win32gui.IsWindow(hwnd):
+                raise
+            hwnd = _require_live_window(self._current_login_hwnd(account_login), "focus_window")
+            self._login_hwnd_by_account[account_login] = hwnd
+            if center_x is not None:
+                center_x, center_y = _client_center_screen(hwnd)
+            _force_foreground(hwnd, **focus_kwargs)
+        if account_login and payload.get("field") != "dota":
+            self._login_hwnd_by_account[account_login] = hwnd
+        if center_x is not None:
+            win32api.SetCursorPos((center_x, center_y))
+        settle_ms = max(0, int(payload.get("settle_ms", 0)))
+        if settle_ms:
+            time.sleep(settle_ms / 1000.0)
+        if center_x is not None:
+            return self._result_ok(hwnd=int(hwnd), x=center_x, y=center_y, settle_ms=settle_ms,
+                                   replaced_hwnd=original_hwnd if original_hwnd != hwnd else None)
+        return self._result_ok(hwnd=int(hwnd), settle_ms=settle_ms,
+                               replaced_hwnd=original_hwnd if original_hwnd != hwnd else None)
 
     def move_window(self, payload: dict[str, Any]) -> dict[str, Any]:
         hwnd = self._find_hwnd_from_payload(payload)
@@ -985,15 +1384,31 @@ class CommandExecutor:
         return self._result_ok(x=sx, y=sy)
 
     def mouse_click(self, payload: dict[str, Any]) -> dict[str, Any]:
-        hwnd = self._find_hwnd_from_payload(payload)
+        # The Steam password-form click uses a freshly captured desktop point.
+        # Steam frequently recreates its web-helper HWND before that click;
+        # resolving account_login here would revive the stale handle and make
+        # target validation reject the otherwise correct screen click.
+        foreground_only = bool(payload.get("foreground_only", False))
+        hwnd = None if foreground_only else self._find_hwnd_from_payload(payload)
         x = int(payload["x"])
         y = int(payload["y"])
         button = str(payload.get("button", "right")).lower()
         clicks = int(payload.get("clicks", 1))
+        hold_ms = max(0, int(payload.get("hold_ms", 20)))
+        # Optional activation delay for callers that request foreground here.
+        # Planner focuses separately with a 30 ms switching delay: its 5 FPS
+        # processing cadence is independent of the game's 60 FPS rendering.
+        settle_ms = max(0, int(payload.get("settle_ms", 80)))
+        post_move_settle_ms = max(0, int(payload.get("post_move_settle_ms", 0)))
+        post_click_settle_ms = max(0, int(payload.get("post_click_settle_ms", 30)))
         coord_space = str(payload.get("coord_space", "client"))
-        force_fg = bool(payload.get("force_fg", True))
+        force_fg = bool(payload.get("force_fg", True)) and not foreground_only
 
         if coord_space == "screen":
+            if hwnd is not None and force_fg:
+                _force_foreground(hwnd)
+                if settle_ms:
+                    time.sleep(settle_ms / 1000.0)
             sx = x
             sy = y
         else:
@@ -1002,6 +1417,8 @@ class CommandExecutor:
 
             if force_fg:
                 _force_foreground(hwnd)
+                if settle_ms:
+                    time.sleep(settle_ms / 1000.0)
 
             if coord_space == "client":
                 win_x, win_y, win_w, win_h = _get_client_rect(hwnd)
@@ -1014,7 +1431,29 @@ class CommandExecutor:
                 sy = int(y)
 
         win32api.SetCursorPos((sx, sy))
-        time.sleep(0.01)
+        absolute_input = payload.get("target_space") == "minimap"
+        input_x = input_y = move_flags = 0
+        if absolute_input:
+            input_x, input_y = _absolute_mouse_point(sx, sy)
+            move_flags = (win32con.MOUSEEVENTF_MOVE | win32con.MOUSEEVENTF_ABSOLUTE
+                          | win32con.MOUSEEVENTF_VIRTUALDESK)
+            move = (_INPUT * 1)(_INPUT(
+                type=INPUT_MOUSE,
+                union=_INPUT_UNION(mi=_MOUSEINPUT(input_x, input_y, 0, move_flags, 0, 0)),
+            ))
+            ctypes.set_last_error(0)
+            if user32.SendInput(1, move, ctypes.sizeof(_INPUT)) != 1:
+                raise RuntimeError(
+                    f"SendInput mouse_move rejected: winerror={ctypes.get_last_error()} hwnd={hwnd}"
+                )
+        time.sleep(
+            post_move_settle_ms / 1000.0
+            if post_move_settle_ms
+            else 0.01
+        )
+
+        if hwnd is not None:
+            _verify_click_target(hwnd, sx, sy)
 
         if button == "left":
             down_flag = win32con.MOUSEEVENTF_LEFTDOWN
@@ -1027,10 +1466,47 @@ class CommandExecutor:
             up_flag = win32con.MOUSEEVENTF_RIGHTUP
 
         for _ in range(max(1, clicks)):
-            win32api.mouse_event(down_flag, 0, 0, 0, 0)
-            time.sleep(0.02)
-            win32api.mouse_event(up_flag, 0, 0, 0, 0)
-            time.sleep(0.03)
+            if hwnd is not None:
+                _verify_click_target(hwnd, sx, sy)
+            # Cursor movement, Windows accepting input, and the game acting
+            # on it are separate events. Report rejected button events by phase.
+            down = (_INPUT * 1)(
+                _INPUT(
+                    type=INPUT_MOUSE,
+                    union=_INPUT_UNION(
+                        mi=_MOUSEINPUT(input_x, input_y, 0, down_flag | move_flags, 0, 0)
+                    ),
+                )
+            )
+            up = (_INPUT * 1)(
+                _INPUT(
+                    type=INPUT_MOUSE,
+                    union=_INPUT_UNION(
+                        mi=_MOUSEINPUT(input_x, input_y, 0, up_flag | move_flags, 0, 0)
+                    ),
+                )
+            )
+            def send_button(events, phase: str) -> None:
+                ctypes.set_last_error(0)
+                accepted = user32.SendInput(1, events, ctypes.sizeof(_INPUT))
+                if accepted != 1:
+                    error_code = ctypes.get_last_error()
+                    raise RuntimeError(
+                        f"SendInput {phase} rejected: accepted={accepted}/1 "
+                        f"winerror={error_code} hwnd={hwnd} button={button} "
+                        f"point=({sx},{sy}) executor={EXECUTOR_VERSION}"
+                    )
+
+            send_button(down, "mouse_down")
+            try:
+                time.sleep(hold_ms / 1000.0)
+            finally:
+                # Do not leave the button held if the hold is interrupted.
+                send_button(up, "mouse_up")
+            # Keep the cursor in place after mouse-up while Dota consumes the
+            # completed click. The planner input lock remains held here, so
+            # F1 or the next planner command cannot move it prematurely.
+            time.sleep(post_click_settle_ms / 1000.0)
 
         return self._result_ok(
             hwnd=hwnd,
@@ -1038,7 +1514,14 @@ class CommandExecutor:
             y=sy,
             button=button,
             clicks=clicks,
+            hold_ms=hold_ms,
+            post_move_settle_ms=post_move_settle_ms,
+            post_click_settle_ms=post_click_settle_ms,
             coord_space=coord_space,
+            input_method="SendInput",
+            pointer_method="SendInput_absolute" if absolute_input else "SetCursorPos",
+            executor_version=EXECUTOR_VERSION,
+            button_events_accepted=2 * max(1, clicks),
         )
 
     def dismiss_steam_popups(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1066,19 +1549,66 @@ class CommandExecutor:
         result["template_name"] = template_name
         return result
 
+    def close_steam_windows(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Close visible Steam UI windows without stopping any Steam process."""
+        closed: list[int] = []
+        names = {"steam.exe", "steamwebhelper.exe"}
+
+        def cb(hwnd, _):
+            hwnd_i = int(hwnd)
+            if not win32gui.IsWindowVisible(hwnd_i):
+                return
+            pid = _window_pid(hwnd_i)
+            if not pid:
+                return
+            try:
+                process_name = (psutil.Process(int(pid)).name() or "").lower()
+            except (psutil.Error, OSError):
+                return
+            if process_name not in names:
+                return
+            try:
+                # WM_CLOSE requests the application's normal window-close
+                # path.  It deliberately does not terminate the process.
+                win32gui.PostMessage(hwnd_i, win32con.WM_CLOSE, 0, 0)
+                closed.append(hwnd_i)
+            except Exception:
+                pass
+
+        win32gui.EnumWindows(cb, None)
+        return self._result_ok(closed_hwnds=closed, closed_count=len(closed))
+
     def key_press(self, payload: dict[str, Any]) -> dict[str, Any]:
-        hwnd = self._find_hwnd_from_payload(payload)
         vk_code = int(payload["vk_code"])
-        hold_ms = int(payload.get("hold_ms", 25))
-        force_fg = bool(payload.get("force_fg", True))
-        hwnd = _require_live_window(hwnd, "key_press")
+        min_hold_ms = 0 if bool(payload.get("allow_short_hold", False)) else 70
+        hold_ms = max(min_hold_ms, int(payload.get("hold_ms", 70)))
+        foreground_only = bool(payload.get("foreground_only", False))
+        force_fg = bool(payload.get("force_fg", True)) and not foreground_only
+        focus_settle_ms = max(0, int(payload.get("focus_settle_ms", 80)))
+        if foreground_only:
+            # Password authentication intentionally preserves the focus that
+            # the field click established. Steam may recreate its web-helper
+            # HWND in that gap, so use the still-focused live window instead
+            # of rejecting an obsolete handle from the earlier lookup.
+            hwnd = _require_live_window(win32gui.GetForegroundWindow(), "key_press")
+            force_fg = False
+        else:
+            hwnd = _require_live_window(self._find_hwnd_from_payload(payload), "key_press")
 
         if force_fg:
-            _force_foreground(hwnd)
+            _force_foreground(hwnd, settle_ms=0)
+            if focus_settle_ms:
+                time.sleep(focus_settle_ms / 1000.0)
 
-        _tap_vk(vk_code, hold_ms)
+        _require_foreground(hwnd)
+        escape_method = str(payload.get("escape_method", "virtual_key"))
+        _tap_vk(vk_code, hold_ms, escape_method=escape_method)
 
-        return self._result_ok(vk_code=vk_code, hold_ms=hold_ms, hwnd=hwnd)
+        return self._result_ok(
+            vk_code=vk_code, hold_ms=hold_ms, hwnd=hwnd,
+            escape_method=escape_method if vk_code == win32con.VK_ESCAPE else None,
+            executor_version=EXECUTOR_VERSION,
+        )
 
     def key_event(self, payload: dict[str, Any]) -> dict[str, Any]:
         hwnd = self._find_hwnd_from_payload(payload)
@@ -1089,6 +1619,9 @@ class CommandExecutor:
 
         if force_fg:
             _force_foreground(hwnd)
+            focus_settle_ms = max(0, int(payload.get("focus_settle_ms", 80)))
+            if focus_settle_ms:
+                time.sleep(focus_settle_ms / 1000.0)
 
         if down:
             _key_down(vk_code)
@@ -1098,15 +1631,23 @@ class CommandExecutor:
         return self._result_ok(vk_code=vk_code, down=down, hwnd=hwnd)
 
     def write_text(self, payload: dict[str, Any]) -> dict[str, Any]:
-        hwnd = self._find_hwnd_from_payload(payload)
         text = str(payload.get("text", ""))
         clear_before = bool(payload.get("clear_before", False))
         field = str(payload.get("field", ""))
         input_method = str(payload.get("input_method", "clipboard_unicode_paste")).lower().strip()
         char_interval_ms = int(payload.get("char_interval_ms", 5))
-        hwnd = _require_live_window(hwnd, "write_text")
+        foreground_only = bool(payload.get("foreground_only", False))
+        force_fg = bool(payload.get("force_fg", True)) and not foreground_only
+        if foreground_only:
+            hwnd = _require_live_window(win32gui.GetForegroundWindow(), "write_text")
+            force_fg = False
+        else:
+            hwnd = _require_live_window(self._find_hwnd_from_payload(payload), "write_text")
 
-        _force_foreground(hwnd)
+        if force_fg:
+            _force_foreground(hwnd)
+        else:
+            _require_foreground(hwnd)
         _switch_keyboard_layout_en()
         time.sleep(0.12)
 
@@ -1130,6 +1671,7 @@ class CommandExecutor:
             hwnd=hwnd,
             field=field,
             method=method,
+            force_fg=force_fg,
         )
 
     def hotkey(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1157,11 +1699,21 @@ class CommandExecutor:
 
         hwnd = int(payload["hwnd"])
         purpose = str(payload.get("purpose", ""))
+        require_fresh = bool(payload.get("require_fresh", False))
 
         if self.capture is None:
             raise RuntimeError("CommandExecutor.capture is not initialized")
 
-        frame_rgb = self.capture.grab_window_rgb(hwnd)
+        # MM pages can be static; DXcam then correctly reports no *new* frame.
+        # A last verified DXcam frame is still the right image for template
+        # matching in this command path.
+        frame_rgb = self.capture.grab_window_rgb(
+            hwnd,
+            allow_cached=not require_fresh,
+            # After a click MM must observe the newly opened menu, not reuse
+            # the preceding static DXcam frame immediately.
+            wait_for_fresh_ms=500 if require_fresh else 150,
+        )
 
         if frame_rgb is None:
             return self._result_ok(
@@ -1194,6 +1746,22 @@ class CommandExecutor:
             frame_rgb = np.ascontiguousarray(frame_rgb)
 
         height, width = frame_rgb.shape[:2]
+
+        # MM needs frequent frames while the pick timer is running.  The raw
+        # transport avoids PNG encoding and base64 JSON expansion on every
+        # capture request.
+        if self.api is not None and getattr(self.api, "vm_id", None):
+            submit_response = self.api.submit_frame_raw(hwnd=hwnd, frame_rgb=frame_rgb)
+            return self._result_ok(
+                capture_sent=True,
+                frame_uploaded=True,
+                hwnd=hwnd,
+                purpose=purpose,
+                width=int(width),
+                height=int(height),
+                submit_response=submit_response,
+                ts=time.time(),
+            )
 
         img = Image.fromarray(frame_rgb, mode="RGB")
         buf = io.BytesIO()
@@ -1263,8 +1831,23 @@ class CommandExecutor:
             return self.mouse_move(payload)
         if cmd_type == HostCommandType.MOUSE_CLICK:
             return self.mouse_click(payload)
+        if cmd_type == "attack_click":
+            hwnd = self._find_hwnd_from_payload(payload)
+            hwnd = _require_live_window(hwnd, "attack_click")
+            if bool(payload.get("force_fg", True)):
+                _force_foreground(hwnd)
+                time.sleep(max(0, int(payload.get("focus_settle_ms", 80))) / 1000.0)
+            _tap_vk(ord("A"), hold_ms=max(70, int(payload.get("attack_hold_ms", 70))))
+            time.sleep(0.04)
+            click_payload = dict(payload)
+            click_payload["hwnd"] = int(hwnd)
+            click_payload["button"] = "left"
+            click_payload["force_fg"] = False
+            return self.mouse_click(click_payload)
         if cmd_type == HostCommandType.DISMISS_STEAM_POPUPS:
             return self.dismiss_steam_popups(payload)
+        if cmd_type == HostCommandType.CLOSE_STEAM_WINDOWS:
+            return self.close_steam_windows(payload)
         if cmd_type == HostCommandType.KEY_PRESS:
             return self.key_press(payload)
         if cmd_type == HostCommandType.KEY_EVENT:

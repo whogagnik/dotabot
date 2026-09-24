@@ -57,6 +57,7 @@ class HostCommandType:
     CAPTURE_DESKTOP = "capture_desktop"
     LOG = "log"
     DISMISS_STEAM_POPUPS = "dismiss_steam_popups"
+    CLOSE_STEAM_WINDOWS = "close_steam_windows"
 
 
 @dataclass
@@ -80,6 +81,9 @@ class VmAccountState:
     auth_started: bool = False
     auth_done: bool = False
     auth_capture_requested: bool = False
+    auth_login_field_capture_requested: bool = False
+    auth_login_field_click_requested: bool = False
+    auth_login_field_clicked: bool = False
     last_auth_capture_ts: float = 0.0
     auth_capture_fail_count: int = 0
     auth_flow_in_progress: bool = False
@@ -100,6 +104,7 @@ class VmAccountState:
     last_dota_find_ts: float = 0.0
     dota_wait_started_ts: float = 0.0
     dota_wait_fail_count: int = 0
+    steam_restart_pending: bool = False
 
     last_error: Optional[str] = None
 
@@ -143,6 +148,8 @@ class VmState:
     roles: List[str] = field(default_factory=list)
 
     planner_active: bool = False
+    planner_generation: int = 0
+    steam_windows_close_sent: bool = False
     last_ping_ts: float = 0.0
     last_log_ts: float = 0.0
 
@@ -150,6 +157,7 @@ class VmState:
     windows_arrange_sent: bool = False
     windows_arrange_attempts: int = 0
     windows_arrange_pending_ids: List[int] = field(default_factory=list)
+    windows_arrange_settle_queued: bool = False
 
     command_queue: List[VmCommand] = field(default_factory=list)
     current_command_id: Optional[int] = None
@@ -248,7 +256,8 @@ class Controller:
                 self.mark_stale_vms()
 
             self.activate_planners_for_ready_vms()
-            planner_runtime.tick_all()
+            for vm_id in planner_runtime.tick_all() or []:
+                self._restart_match(vm_id)
 
             self._tick_error_count = 0
 
@@ -290,9 +299,12 @@ class Controller:
             return fallback
 
         if cmd_type == HostCommandType.FIND_LOGIN_WINDOW:
-            return payload_timeout_sec(self.find_login_window_timeout_sec) + 5.0
+            # The client performs the complete polling interval before it can
+            # ACK.  Leave room for the last poll and the HTTP round trip so the
+            # host does not expire a command that has just finished.
+            return payload_timeout_sec(self.find_login_window_timeout_sec) + 30.0
         if cmd_type == HostCommandType.FIND_DOTA_WINDOW:
-            return payload_timeout_sec(self.find_dota_window_timeout_sec) + 3.0
+            return payload_timeout_sec(self.find_dota_window_timeout_sec) + 30.0
         if cmd_type == HostCommandType.SLEEP:
             duration_ms = 0
             if payload:
@@ -302,9 +314,9 @@ class Controller:
                     duration_ms = 0
             return max(5.0, duration_ms / 1000.0 + 5.0)
         if cmd_type == HostCommandType.CAPTURE_FRAME:
-            return 8.0
+            return 30.0
         if cmd_type == HostCommandType.CAPTURE_DESKTOP:
-            return 8.0
+            return 30.0
         if cmd_type in (
             HostCommandType.FOCUS_WINDOW,
             HostCommandType.WRITE_TEXT,
@@ -406,6 +418,7 @@ class Controller:
         self,
         vm_id: str,
         threshold: float = 0.88,
+        names: Optional[set[str]] = None,
     ) -> Optional[dict[str, Any]]:
         frame_rgb = self._desktop_frames.get(vm_id)
         if frame_rgb is None or not self._steam_templates:
@@ -424,6 +437,13 @@ class Controller:
         best: Optional[dict[str, Any]] = None
 
         for tpl in self._steam_templates:
+            # This is an input field, not a popup-control. It is selected
+            # explicitly by the password-auth flow. Treating it as a generic
+            # popup clicked the login form again during authentication.
+            if names is None and str(tpl["name"]) == "login_or_password.png":
+                continue
+            if names is not None and str(tpl["name"]) not in names:
+                continue
             tpl_img = tpl["image"]
             th = tpl["h"]
             tw = tpl["w"]
@@ -639,6 +659,7 @@ class Controller:
                 )
                 for a in batch
             ]
+            vm.steam_windows_close_sent = False
             vm.status = VmStatus.ACCOUNTS_ASSIGNED
             free_accounts = free_accounts[self.batch_size :]
 
@@ -1000,6 +1021,9 @@ class Controller:
         acc.auth_started = False
         acc.auth_done = False
         acc.auth_capture_requested = False
+        acc.auth_login_field_capture_requested = False
+        acc.auth_login_field_click_requested = False
+        acc.auth_login_field_clicked = False
         acc.auth_flow_in_progress = False
 
         acc.popup_capture_requested = False
@@ -1014,6 +1038,8 @@ class Controller:
         acc.last_dota_find_ts = 0.0
         acc.dota_wait_started_ts = 0.0
         acc.dota_wait_fail_count = wait_fail_count
+        acc.steam_restart_pending = False
+        vm.steam_windows_close_sent = False
 
         acc.last_error = reason
         self._clear_desktop_frame(vm.vm_id)
@@ -1035,6 +1061,7 @@ class Controller:
             vm.windows_arrange_sent = False
             vm.windows_arranged = False
             vm.windows_arrange_pending_ids.clear()
+            vm.windows_arrange_settle_queued = False
             return
 
         pending = {
@@ -1051,6 +1078,16 @@ class Controller:
         if not vm.windows_arrange_pending_ids:
             vm.windows_arrange_sent = False
             vm.windows_arranged = True
+            if not vm.windows_arrange_settle_queued:
+                self._push_command(
+                    vm,
+                    HostCommandType.SLEEP,
+                    {
+                        "duration_ms": 90000,
+                        "purpose": "arrange_dota_windows_settle",
+                    },
+                )
+                vm.windows_arrange_settle_queued = True
             self.logger.info(f"{vm.vm_id}: window arrangement acknowledged")
 
     def _cancel_queued_account_commands(
@@ -1075,6 +1112,23 @@ class Controller:
         )
         acc = self._get_vm_account(vm, account_login) if account_login else None
 
+        # The Dota discovery watchdog explicitly restarts the Steam process
+        # tree.  Complete the state reset only after the VM has acknowledged
+        # that kill command, so a new launch can never overlap the old client.
+        if (
+            cmd.type == HostCommandType.KILL_PROCESS_TREE
+            and acc is not None
+            and acc.steam_restart_pending
+        ):
+            acc.steam_restart_pending = False
+            self._reset_account_for_relaunch(
+                vm,
+                acc,
+                "Steam restarted after Dota discovery watchdog",
+                count_dota_wait_failure=True,
+            )
+            return
+
         soft_failure = False
 
         if cmd.status == "failed":
@@ -1086,6 +1140,10 @@ class Controller:
 
                 elif cmd.type == HostCommandType.FIND_LOGIN_WINDOW:
                     acc.login_find_in_progress = False
+                    # A delayed/missed acknowledgement is recoverable.  The
+                    # next bootstrap tick will simply search the already-open
+                    # Steam window again instead of stopping the whole VM.
+                    soft_failure = True
 
                 elif cmd.type == HostCommandType.CAPTURE_FRAME:
                     soft_failure = True
@@ -1109,6 +1167,14 @@ class Controller:
 
                 elif cmd.type == HostCommandType.CAPTURE_DESKTOP:
                     acc.popup_capture_requested = False
+                    acc.auth_login_field_capture_requested = False
+                    soft_failure = True
+
+                elif (
+                    cmd.type == HostCommandType.MOUSE_CLICK
+                    and cmd.payload.get("purpose") == "auth_login_field"
+                ):
+                    acc.auth_login_field_click_requested = False
                     soft_failure = True
 
                 elif cmd.type == HostCommandType.DISMISS_STEAM_POPUPS:
@@ -1175,6 +1241,10 @@ class Controller:
                     found = bool((cmd.result or {}).get("found"))
                     hwnd = (cmd.result or {}).get("hwnd")
                     acc.login_window_found = found
+                    if not found:
+                        self.logger.warning(
+                            f"{vm.vm_id}: login window search returned no match for {acc.username}: {cmd.result}"
+                        )
                     acc.login_hwnd = None if hwnd is None else int(hwnd)
                     if found and acc.login_hwnd is not None:
                         acc.auth_capture_fail_count = 0
@@ -1188,6 +1258,30 @@ class Controller:
                             acc,
                             "steam process tree disappeared while finding login window",
                         )
+
+            elif cmd.type == HostCommandType.FOCUS_WINDOW:
+                if acc is not None and not acc.auth_done:
+                    focused_hwnd = (cmd.result or {}).get("hwnd")
+                    if focused_hwnd is not None:
+                        focused_hwnd = int(focused_hwnd)
+                        previous_hwnd = acc.login_hwnd
+                        if previous_hwnd != focused_hwnd:
+                            if previous_hwnd is not None:
+                                vm.login_hwnds = [
+                                    h for h in vm.login_hwnds if int(h) != int(previous_hwnd)
+                                ]
+                            acc.login_hwnd = focused_hwnd
+                            if focused_hwnd not in vm.login_hwnds:
+                                vm.login_hwnds.append(focused_hwnd)
+                            for pending in vm.command_queue:
+                                if (pending.status == "queued"
+                                        and pending.payload.get("account_login") == acc.username
+                                        and pending.payload.get("hwnd") == previous_hwnd):
+                                    pending.payload["hwnd"] = focused_hwnd
+                            self.logger.info(
+                                f"{vm.vm_id}: Steam login HWND refreshed for {acc.username}: "
+                                f"{previous_hwnd} -> {focused_hwnd}"
+                            )
 
             elif cmd.type == HostCommandType.KEY_PRESS:
                 if acc is not None:
@@ -1218,6 +1312,59 @@ class Controller:
                 self._store_desktop_frame_from_result(vm.vm_id, cmd.result)
                 if acc is not None:
                     acc.popup_capture_requested = False
+                    if acc.auth_login_field_capture_requested:
+                        acc.auth_login_field_capture_requested = False
+                        match = self._find_desktop_steam_popup_match(
+                            vm.vm_id,
+                            threshold=0.80,
+                            names={"login_or_password.png"},
+                        )
+                        if match is None:
+                            self.logger.warning(
+                                f"{vm.vm_id}: login_or_password field not found -> {acc.username}"
+                            )
+                        else:
+                            self._push_command(
+                                vm,
+                                HostCommandType.MOUSE_CLICK,
+                                {
+                                    "account_login": acc.username,
+                                    "x": int(match["x"]),
+                                    "y": int(match["y"]),
+                                    "coord_space": "screen",
+                                    "button": "left",
+                                    "clicks": 1,
+                                    # The desktop image and its screen point
+                                    # are current, while Steam can recreate
+                                    # its web-login HWND between capture and
+                                    # this command.  Do not activate a stale
+                                    # HWND; click the freshly captured point.
+                                    "force_fg": False,
+                                    "foreground_only": True,
+                                    "purpose": "auth_login_field",
+                                    "template_name": "login_or_password.png",
+                                    "score": float(match["score"]),
+                                },
+                            )
+                            acc.auth_login_field_click_requested = True
+                            self.logger.info(
+                                f"{vm.vm_id}: queued login_or_password click -> {acc.username} "
+                                f"score={match['score']:.3f}"
+                            )
+
+            elif cmd.type == HostCommandType.MOUSE_CLICK:
+                if acc is not None and cmd.payload.get("purpose") == "auth_login_field":
+                    acc.auth_login_field_click_requested = False
+                    acc.auth_login_field_clicked = True
+                    self._push_command(
+                        vm,
+                        HostCommandType.SLEEP,
+                        {
+                            "account_login": acc.username,
+                            "duration_ms": 3000,
+                            "purpose": "auth_login_field_settle",
+                        },
+                    )
 
             elif cmd.type == HostCommandType.DISMISS_STEAM_POPUPS:
                 if acc is not None:
@@ -1303,6 +1450,21 @@ class Controller:
                                 f"hwnd={hwnd_i} pid={pid_i} source={source} "
                                 f"outer={win_w}x{win_h} desktop={vm.desktop_width}x{vm.desktop_height}"
                             )
+
+                            if (
+                                not vm.steam_windows_close_sent
+                                and vm.assigned_accounts
+                                and all(item.dota_window_found for item in vm.assigned_accounts)
+                            ):
+                                self._push_command(
+                                    vm,
+                                    HostCommandType.CLOSE_STEAM_WINDOWS,
+                                    {},
+                                )
+                                vm.steam_windows_close_sent = True
+                                self.logger.info(
+                                    f"{vm.vm_id}: all Dota windows found -> close Steam windows"
+                                )
                     else:
                         acc.dota_window_found = False
                         acc.dota_hwnd = None
@@ -1352,6 +1514,7 @@ class Controller:
                         "account_login": acc.username,
                         "exe_path": self.steam_path,
                         "args": ["-applaunch", str(self.app_id), *self.launch_opts],
+                        "max_dota_clients": int(vm.capacity),
                     },
                 )
                 acc.launch_sent = True
@@ -1432,22 +1595,35 @@ class Controller:
                     continue
 
                 acc.auth_branch = "password"
-                self._push_command(
-                    vm,
-                    HostCommandType.FOCUS_WINDOW,
-                    {
-                        "account_login": acc.username,
-                        "hwnd": int(acc.login_hwnd),
-                    },
-                )
-                self._push_command(
-                    vm,
-                    HostCommandType.SLEEP,
-                    {
-                        "account_login": acc.username,
-                        "duration_ms": 5000,
-                    },
-                )
+                if not acc.auth_login_field_clicked:
+                    if acc.auth_login_field_capture_requested or acc.auth_login_field_click_requested:
+                        continue
+                    self._push_command(
+                        vm,
+                        HostCommandType.FOCUS_WINDOW,
+                        {
+                            "account_login": acc.username,
+                            "hwnd": int(acc.login_hwnd),
+                            "settle_ms": 100,
+                        },
+                    )
+                    self._push_command(
+                        vm,
+                        HostCommandType.SLEEP,
+                        {"account_login": acc.username, "duration_ms": 5000},
+                    )
+                    self._push_command(
+                        vm,
+                        HostCommandType.CAPTURE_DESKTOP,
+                        {"account_login": acc.username, "purpose": "auth_login_field"},
+                    )
+                    acc.auth_login_field_capture_requested = True
+                    vm.status = VmStatus.LOGIN
+                    self.logger.info(f"{vm.vm_id}: locate login_or_password field -> {acc.username}")
+                    continue
+                # The preceding click and its three-second settle delay leave
+                # this exact Steam field focused. Do not activate the window
+                # again here: that can steal focus from the web form.
                 self._push_command(
                     vm,
                     HostCommandType.WRITE_TEXT,
@@ -1458,6 +1634,8 @@ class Controller:
                         "text": acc.username,
                         "clear_before": True,
                         "input_method": "sendinput_unicode",
+                        "force_fg": False,
+                        "foreground_only": True,
                     },
                 )
                 self._push_command(
@@ -1468,7 +1646,8 @@ class Controller:
                         "hwnd": int(acc.login_hwnd),
                         "vk_code": 0x09,
                         "hold_ms": 25,
-                        "force_fg": True,
+                        "force_fg": False,
+                        "foreground_only": True,
                     },
                 )
                 self._push_command(
@@ -1481,6 +1660,8 @@ class Controller:
                         "text": acc.password,
                         "clear_before": True,
                         "input_method": "sendinput_unicode",
+                        "force_fg": False,
+                        "foreground_only": True,
                     },
                 )
                 self._push_command(
@@ -1491,7 +1672,8 @@ class Controller:
                         "hwnd": int(acc.login_hwnd),
                         "vk_code": 0x0D,
                         "hold_ms": 25,
-                        "force_fg": True,
+                        "force_fg": False,
+                        "foreground_only": True,
                     },
                 )
                 acc.auth_started = True
@@ -1502,17 +1684,24 @@ class Controller:
             if not acc.dota_window_found or acc.dota_hwnd is None:
                 now = time.time()
 
+                if acc.steam_restart_pending:
+                    # Do not queue searches against a Steam tree that is in
+                    # the process of being terminated and restarted.
+                    continue
+
                 if acc.dota_wait_started_ts <= 0:
                     acc.dota_wait_started_ts = now
                 elif now - acc.dota_wait_started_ts > self.dota_wait_timeout_sec:
-                    self._reset_account_for_relaunch(
+                    acc.steam_restart_pending = True
+                    acc.last_error = "dota discovery watchdog elapsed; restarting Steam"
+                    self._push_command(
                         vm,
-                        acc,
-                        (
-                            "dota window did not appear within "
-                            f"{self.dota_wait_timeout_sec:.0f}s after auth"
-                        ),
-                        count_dota_wait_failure=True,
+                        HostCommandType.KILL_PROCESS_TREE,
+                        {"account_login": acc.username},
+                    )
+                    self.logger.warning(
+                        f"{vm.vm_id}: dota discovery watchdog elapsed for "
+                        f"{acc.username}; restarting Steam"
                     )
                     continue
 
@@ -1690,6 +1879,7 @@ class Controller:
         vm.windows_arrange_attempts += 1
         vm.windows_arrange_sent = True
         vm.windows_arranged = False
+        vm.windows_arrange_settle_queued = False
 
         self.logger.info(
             f"{vm.vm_id}: queued arrange for {len(vm.dota_hwnds)} dota windows "
@@ -1744,6 +1934,30 @@ class Controller:
                 )
             roles = ["unknown"] * len(vm.dota_hwnds)
         return roles
+
+    def _heroes_for_planner(self, vm: VmState) -> List[str]:
+        if self.mm_starter is None:
+            return ["unknown"] * len(vm.dota_hwnds)
+        get_heroes = getattr(self.mm_starter, "get_heroes", None)
+        if get_heroes is None:
+            return ["unknown"] * len(vm.dota_hwnds)
+        try:
+            heroes = [str(hero or "unknown") for hero in get_heroes(vm.vm_id, vm.dota_hwnds)]
+        except Exception as error:
+            self.logger.warning(f"{vm.vm_id}: failed to get MM heroes for planner: {error}")
+            return ["unknown"] * len(vm.dota_hwnds)
+        return heroes if len(heroes) == len(vm.dota_hwnds) else ["unknown"] * len(vm.dota_hwnds)
+
+    def _restart_match(self, vm_id: str) -> None:
+        with self._lock:
+            vm = self.vms.get(vm_id)
+            if vm is None or not vm.planner_active or self.mm_starter is None:
+                return
+            planner_runtime.detach_planner(vm_id)
+            self.mm_starter.restart_after_game(vm_id, vm.dota_hwnds)
+            vm.planner_active = False
+            vm.status = VmStatus.MM_PREPARE
+            self.logger.info("%s: result screen closed on all windows; starting next game", vm_id)
 
     def activate_planners_for_ready_vms(self) -> None:
         for vm in self.vms.values():
@@ -1834,16 +2048,21 @@ class Controller:
                     continue
 
             roles = self._roles_for_planner(vm)
+            heroes = self._heroes_for_planner(vm)
             planner_runtime.attach_hwnds(
                 vm_id=vm.vm_id,
                 hwnds=vm.dota_hwnds,
                 roles=roles,
+                heroes=heroes,
                 side=vm.side,
                 logger=self.logger,
             )
+            vm.planner_generation += 1
             vm.planner_active = True
             vm.status = VmStatus.PLANNER_ACTIVE
-            self.logger.info(f"Planner activated for {vm.vm_id} roles={roles}")
+            self.logger.info(
+                f"Planner activated for {vm.vm_id} roles={roles} heroes={heroes}"
+            )
 
     # -----------------------------------------------------
     # vm logs / misc

@@ -5,18 +5,67 @@ import sys
 import time
 import logging
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from scripts.host.app.gui_handler import GuiHandler
 from scripts.host.app.controller import Controller
 from scripts.host.core.config import DEFAULT_MAFILES_DIR
 
 
 from scripts.host.app.controller import Controller, set_host_controller
+
+
+class TkLogHandler(logging.Handler):
+    """Thread-safe logging bridge owned by the Tk application."""
+
+    def __init__(self, text_widget: tk.Text, flush_interval_ms: int = 100):
+        super().__init__()
+        self.text_widget = text_widget
+        self.flush_interval_ms = flush_interval_ms
+        self._lines: deque[str] = deque(maxlen=2000)
+        self._lock = threading.Lock()
+        self._started = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+        except Exception:
+            return
+        with self._lock:
+            self._lines.append(line)
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        try:
+            self.text_widget.after(self.flush_interval_ms, self._flush)
+        except tk.TclError:
+            self._started = False
+
+    def _flush(self) -> None:
+        with self._lock:
+            lines = list(self._lines)
+            self._lines.clear()
+
+        try:
+            if lines:
+                self.text_widget.configure(state="normal")
+                self.text_widget.insert("end", "\n".join(lines) + "\n")
+                self.text_widget.see("end")
+                if int(self.text_widget.index("end-1c").split(".")[0]) > 3000:
+                    self.text_widget.delete("1.0", "500.0")
+                self.text_widget.configure(state="disabled")
+        finally:
+            if self._started:
+                self._schedule_flush()
 
 
 def make_logger(gui_text: tk.Text) -> logging.Logger:
@@ -28,15 +77,20 @@ def make_logger(gui_text: tk.Text) -> logging.Logger:
 
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S")
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-
-    gh = GuiHandler(gui_text, flush_interval_ms=100, max_batch=200)
+    # Keep GUI delivery independent from the optional console output.  A record
+    # reaches the queue before any console stream can block or fail.
+    gh = TkLogHandler(gui_text, flush_interval_ms=100)
     gh.setLevel(logging.INFO)
     gh.setFormatter(fmt)
     logger.addHandler(gh)
+
+    # In a windowed build stdout can be None.  Do not let an unavailable
+    # console interfere with delivery of records to the GUI handler.
+    if sys.stdout is not None:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
 
     logger.propagate = False
     return logger
@@ -45,7 +99,10 @@ def set_logger_level(logger: logging.Logger, level_name: str):
     lvl = getattr(logging, level_name.upper(), logging.INFO)
     logger.setLevel(lvl)
     for h in logger.handlers:
-        h.setLevel(lvl)
+        # DEBUG records can be produced much faster than Tk can render them.
+        # Keep the GUI queue reserved for actionable records so it cannot starve
+        # INFO/WARNING/ERROR output from the controller.
+        h.setLevel(logging.INFO if isinstance(h, TkLogHandler) else lvl)
 
 
 class App(tk.Tk):
@@ -75,6 +132,7 @@ class App(tk.Tk):
         self.log_text.configure(state="disabled")
 
         self.logger = make_logger(self.log_text)
+        self._start_gui_log_polling()
         self.controller = Controller(self.logger, self.set_status)
         set_host_controller(self.controller)
         global _HOST_CONTROLLER
@@ -92,7 +150,6 @@ class App(tk.Tk):
         self._build_mid()
         self._build_bottom()
 
-        self.after(0, self._start_gui_log_polling)
         self.refresh_accounts_table()
         self.after(1000, self._refresh_vm_table_loop)
 
@@ -302,8 +359,8 @@ class App(tk.Tk):
 
     def _start_gui_log_polling(self):
         for handler in self.logger.handlers:
-            if isinstance(handler, GuiHandler):
-                handler.start_polling()
+            if isinstance(handler, TkLogHandler):
+                handler.start()
 
     def _start_django_server_on_boot(self):
         try:

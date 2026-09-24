@@ -185,6 +185,28 @@ class ControllerStabilityTests(unittest.TestCase):
         self.assertEqual(vm.current_command_id, cmd.id)
         self.assertEqual(vm.command_queue, [cmd])
 
+    def test_expired_login_window_search_is_retried_not_vm_error(self):
+        vm, acc = self.add_vm_account(has_mafile=False)
+        acc.launched = True
+        acc.login_find_in_progress = True
+        cmd = self.controller._push_command(
+            vm,
+            controller_mod.HostCommandType.FIND_LOGIN_WINDOW,
+            {"account_login": "alice", "timeout_ms": 1},
+        )
+        self.controller.get_next_command(vm.vm_id)
+        cmd.sent_ts = time.time() - 40
+
+        self.controller._expire_stale_commands()
+
+        self.assertFalse(acc.login_find_in_progress)
+        self.assertNotEqual(vm.status, controller_mod.VmStatus.ERROR)
+        self.controller.drive_vm_bootstrap()
+        self.assertEqual(
+            vm.command_queue[0].type,
+            controller_mod.HostCommandType.FIND_LOGIN_WINDOW,
+        )
+
     def test_password_auth_queues_client_sleep_without_blocking_controller(self):
         vm, acc = self.add_vm_account(has_mafile=False)
         acc.launched = True
@@ -201,12 +223,14 @@ class ControllerStabilityTests(unittest.TestCase):
             [
                 controller_mod.HostCommandType.FOCUS_WINDOW,
                 controller_mod.HostCommandType.SLEEP,
-                controller_mod.HostCommandType.WRITE_TEXT,
-                controller_mod.HostCommandType.KEY_PRESS,
-                controller_mod.HostCommandType.WRITE_TEXT,
-                controller_mod.HostCommandType.KEY_PRESS,
+                controller_mod.HostCommandType.CAPTURE_DESKTOP,
             ],
         )
+        focus_commands = [
+            command for command in vm.command_queue
+            if command.type == controller_mod.HostCommandType.FOCUS_WINDOW
+        ]
+        self.assertEqual([command.payload["settle_ms"] for command in focus_commands], [100])
         self.assertFalse(acc.auth_done)
 
     def test_failed_auth_command_cancels_queued_tail_and_refinds_login(self):
@@ -226,6 +250,79 @@ class ControllerStabilityTests(unittest.TestCase):
         self.assertIsNone(acc.login_hwnd)
         self.assertEqual(vm.command_queue, [])
         self.assertNotEqual(vm.status, controller_mod.VmStatus.ERROR)
+
+    def test_recovered_focus_updates_queued_login_capture_hwnd(self):
+        vm, acc = self.add_vm_account(has_mafile=True)
+        acc.launched = True
+        acc.login_window_found = True
+        acc.login_hwnd = 100
+        vm.login_hwnds = [100]
+        self.controller.drive_vm_bootstrap()
+        focus, capture = vm.command_queue[-2:]
+        self.assertEqual(capture.payload["hwnd"], 100)
+
+        focus.status = "done"
+        focus.result = {"hwnd": 200, "replaced_hwnd": 100}
+        self.controller._handle_command_result(vm, focus)
+
+        self.assertEqual(acc.login_hwnd, 200)
+        self.assertEqual(vm.login_hwnds, [200])
+        self.assertEqual(capture.payload["hwnd"], 200)
+
+    def test_password_auth_clicks_login_or_password_before_typing(self):
+        vm, acc = self.add_vm_account(has_mafile=False)
+        acc.launched = True
+        acc.login_window_found = True
+        acc.login_hwnd = 100
+        self.controller.drive_vm_bootstrap()
+        capture = vm.command_queue[-1]
+        capture.status = "done"
+        capture.result = {"image_b64": "not-needed-for-mocked-match"}
+        self.controller._store_desktop_frame_from_result = lambda *_: None
+        self.controller._find_desktop_steam_popup_match = lambda *args, **kwargs: {
+            "x": 500, "y": 300, "score": 0.95,
+        }
+        self.controller._handle_command_result(vm, capture)
+        click = vm.command_queue[-1]
+        self.assertEqual(click.type, controller_mod.HostCommandType.MOUSE_CLICK)
+        self.assertEqual(click.payload["purpose"], "auth_login_field")
+        self.assertEqual((click.payload["x"], click.payload["y"]), (500, 300))
+        self.assertFalse(click.payload["force_fg"])
+        self.assertTrue(click.payload["foreground_only"])
+        self.assertNotIn("hwnd", click.payload)
+        click.status = "done"
+        click.result = {}
+        self.controller._handle_command_result(vm, click)
+        self.assertTrue(acc.auth_login_field_clicked)
+        self.assertTrue(acc.login_window_found)
+        self.assertEqual(acc.login_hwnd, 100)
+        settle = vm.command_queue[-1]
+        self.assertEqual(settle.type, controller_mod.HostCommandType.SLEEP)
+        self.assertEqual(settle.payload["duration_ms"], 3000)
+        self.assertEqual(settle.payload["purpose"], "auth_login_field_settle")
+
+        # Mark the old commands complete, then use the still-focused Steam
+        # form for credentials without activating or refinding it.
+        for command in vm.command_queue:
+            command.status = "done"
+        vm.current_command_id = None
+        self.controller.drive_vm_bootstrap()
+        types = [command.type for command in vm.command_queue if command.status == "queued"]
+        self.assertEqual(types, [
+            controller_mod.HostCommandType.WRITE_TEXT,
+            controller_mod.HostCommandType.KEY_PRESS,
+            controller_mod.HostCommandType.WRITE_TEXT,
+            controller_mod.HostCommandType.KEY_PRESS,
+        ])
+        credential_commands = [
+            command for command in vm.command_queue
+            if command.status == "queued" and command.type in {
+                controller_mod.HostCommandType.WRITE_TEXT,
+                controller_mod.HostCommandType.KEY_PRESS,
+            }
+        ]
+        self.assertTrue(all(command.payload["force_fg"] is False for command in credential_commands))
+        self.assertTrue(all(command.payload["foreground_only"] for command in credential_commands))
 
     def test_mafile_auth_in_progress_prevents_capture_loop(self):
         vm, acc = self.add_vm_account(has_mafile=True)
@@ -341,7 +438,7 @@ class ControllerStabilityTests(unittest.TestCase):
             controller_mod.HostCommandType.LAUNCH_PROCESS,
         )
 
-    def test_wait_dota_timeout_resets_before_desktop_capture_loop(self):
+    def test_wait_dota_timeout_restarts_steam_before_relaunch(self):
         vm, acc = self.add_vm_account(has_mafile=False)
         acc.launched = True
         acc.login_window_found = True
@@ -355,18 +452,22 @@ class ControllerStabilityTests(unittest.TestCase):
 
         self.controller.drive_vm_bootstrap()
 
-        self.assertEqual(vm.command_queue, [])
-        self.assertFalse(acc.launched)
-        self.assertFalse(acc.auth_done)
-        self.assertEqual(acc.dota_wait_fail_count, 1)
-
-        self.controller.drive_vm_bootstrap()
-
+        self.assertTrue(acc.steam_restart_pending)
         self.assertEqual(len(vm.command_queue), 1)
         self.assertEqual(
             vm.command_queue[0].type,
-            controller_mod.HostCommandType.LAUNCH_PROCESS,
+            controller_mod.HostCommandType.KILL_PROCESS_TREE,
         )
+
+        kill = vm.command_queue[0]
+        kill.status = "done"
+        kill.result = {"account_login": acc.username, "killed": True}
+        self.controller._handle_command_result(vm, kill)
+
+        self.assertFalse(acc.steam_restart_pending)
+        self.assertFalse(acc.launched)
+        self.assertFalse(acc.auth_done)
+        self.assertEqual(acc.dota_wait_fail_count, 1)
 
     def test_window_arrangement_waits_for_all_acks(self):
         vm = self.controller.register_vm()
@@ -413,6 +514,13 @@ class ControllerStabilityTests(unittest.TestCase):
         focus_second.result = {}
         self.controller._handle_command_result(vm, focus_second)
 
+        self.assertEqual(vm.command_queue[0].type, controller_mod.HostCommandType.SLEEP)
+        self.assertEqual(vm.command_queue[0].payload["duration_ms"], 90000)
+        self.assertEqual(vm.command_queue[0].payload["purpose"], "arrange_dota_windows_settle")
+        settle = vm.command_queue[0]
+        settle.status = "done"
+        settle.result = {}
+        self.controller._handle_command_result(vm, settle)
         self.assertEqual(vm.command_queue, [])
 
     def test_mm_roles_are_forwarded_to_planner_runtime(self):

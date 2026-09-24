@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import time
 from threading import RLock
 from typing import Optional, Dict, Any, Deque
 
@@ -14,9 +15,14 @@ class InMemoryFrame:
     frame_id: int
     rgb: np.ndarray
     ts_client: float
+    received_monotonic: float
 
 
 class DjangoPlannerBridge:
+    # One planner action can consist of a short sequence (move -> key ->
+    # click). Keep the sequence for one frame, but retain at most one newer
+    # intent while that sequence executes.
+    MAX_COMMANDS_PER_FRAME = 4
     """
     На каждый hwnd держим:
     - processing_frame: кадр, который сейчас обрабатывается planner / уже обработан, но его команды ещё не завершены
@@ -41,19 +47,13 @@ class DjangoPlannerBridge:
     # frame lifecycle
     # ------------------------------------------------------------------
 
-    def _make_frame(self, frame_rgb: np.ndarray, ts_client: float) -> InMemoryFrame:
+    @staticmethod
+    def _copy_frame_rgb(frame_rgb: np.ndarray) -> np.ndarray:
         if frame_rgb.dtype != np.uint8:
             frame_rgb = frame_rgb.astype(np.uint8, copy=False)
         if frame_rgb.ndim != 3 or frame_rgb.shape[2] != 3:
             raise ValueError(f"Expected RGB HWC uint8 frame, got {frame_rgb.shape}")
-
-        frame = InMemoryFrame(
-            frame_id=self._next_frame_id,
-            rgb=np.ascontiguousarray(frame_rgb.copy()),
-            ts_client=float(ts_client),
-        )
-        self._next_frame_id += 1
-        return frame
+        return np.ascontiguousarray(frame_rgb).copy()
 
     def store_frame_rgb(self, *, hwnd: int, frame_rgb: np.ndarray, ts_client: float) -> int:
         """
@@ -63,8 +63,17 @@ class DjangoPlannerBridge:
         """
         hwnd = int(hwnd)
 
+        # A full-frame copy can take several milliseconds.  Do it outside the
+        # queue lock so planner input commands never wait for image memory I/O.
+        rgb = self._copy_frame_rgb(frame_rgb)
         with self._lock:
-            frame = self._make_frame(frame_rgb, ts_client)
+            frame = InMemoryFrame(
+                frame_id=self._next_frame_id,
+                rgb=rgb,
+                ts_client=float(ts_client),
+                received_monotonic=time.monotonic(),
+            )
+            self._next_frame_id += 1
             self._latest_frame_by_hwnd[hwnd] = frame
             return frame.frame_id
 
@@ -99,6 +108,15 @@ class DjangoPlannerBridge:
         with self._lock:
             processing = self._processing_frame_by_hwnd.get(hwnd)
             if processing is not None:
+                # The queued action already contains its coordinates.  It is
+                # safe to keep waiting for its ACK while the planner renders
+                # and analyses a newer image instead of freezing on the old
+                # processing frame.
+                latest = self._latest_frame_by_hwnd.get(hwnd)
+                if latest is not None:
+                    self._processing_frame_by_hwnd[hwnd] = latest
+                    self._latest_frame_by_hwnd[hwnd] = None
+                    return latest.frame_id
                 return processing.frame_id
 
             latest = self._latest_frame_by_hwnd.get(hwnd)
@@ -146,9 +164,19 @@ class DjangoPlannerBridge:
             return None
 
     def get_frame_pil(self, hwnd: int, frame_id: int) -> Optional[Image.Image]:
-        rgb = self.get_frame_rgb(hwnd, frame_id)
-        if rgb is None:
-            return None
+        hwnd = int(hwnd)
+        frame_id = int(frame_id)
+        with self._lock:
+            processing = self._processing_frame_by_hwnd.get(hwnd)
+            if processing is not None and processing.frame_id == frame_id:
+                rgb = processing.rgb
+            else:
+                latest = self._latest_frame_by_hwnd.get(hwnd)
+                if latest is None or latest.frame_id != frame_id:
+                    return None
+                rgb = latest.rgb
+        # Stored frames are immutable.  Keep conversion/copying outside the
+        # command queue lock, just like frame ingestion.
         return Image.fromarray(rgb, mode="RGB")
 
     def get_frame_ts(self, hwnd: int, frame_id: int) -> Optional[float]:
@@ -198,6 +226,9 @@ class DjangoPlannerBridge:
         command_type: str,
         payload: Dict[str, Any],
         frame_id: Optional[int] = None,
+        *,
+        sticky: bool = False,
+        coalesce_key: Optional[str] = None,
     ) -> dict:
         hwnd = int(hwnd)
 
@@ -207,24 +238,87 @@ class DjangoPlannerBridge:
                 if processing is None:
                     raise RuntimeError(f"No processing frame for hwnd={hwnd}")
                 frame_id = processing.frame_id
+            frame_id = int(frame_id)
+
+            q = self._commands_by_hwnd[hwnd]
+            if q and int(q[-1]["frame_id"]) != frame_id:
+                # Never keep an old, not-yet-leased decision behind the active
+                # command batch.  The next frame supersedes it.
+                retained = [
+                    command
+                    for command in q
+                    if command.get("leased", False) or command.get("sticky", False)
+                ]
+                q.clear()
+                q.extend(retained)
+
+            # A continuous state command (currently F1 / centre-on-self) is
+            # refreshed on every planner tick.  Keep one unleased instance
+            # instead of allowing an old frame stream to build an endless
+            # sequence which would delay all mouse actions.
+            if coalesce_key:
+                for command in q:
+                    if (
+                        command.get("coalesce_key") == coalesce_key
+                        and not command.get("leased", False)
+                    ):
+                        command.update(
+                            frame_id=frame_id,
+                            type=str(command_type),
+                            payload=dict(payload),
+                            sticky=bool(sticky),
+                        )
+                        return self._public_command(command)
+
+            commands_for_frame = sum(
+                1 for command in q if int(command["frame_id"]) == frame_id
+            )
+            if commands_for_frame >= self.MAX_COMMANDS_PER_FRAME:
+                return self._public_command(q[-1])
 
             cmd = {
                 "id": self._next_command_id,
-                "frame_id": int(frame_id),
+                "frame_id": frame_id,
                 "type": str(command_type),
                 "payload": dict(payload),
+                "leased": False,
+                # A bootstrap command such as F1 must survive newer planner
+                # frames until the VM has acknowledged it.
+                "sticky": bool(sticky),
+                "coalesce_key": coalesce_key,
             }
             self._next_command_id += 1
-            self._commands_by_hwnd[hwnd].append(cmd)
-            return cmd
+            q.append(cmd)
+            return self._public_command(cmd)
+
+    @staticmethod
+    def _public_command(command: dict) -> dict:
+        return {
+            key: value
+            for key, value in command.items()
+            if key not in {"leased", "sticky", "coalesce_key"}
+        }
 
     def get_next_command(self, hwnd: int) -> Optional[dict]:
+        commands = self.get_next_commands(hwnd, limit=1)
+        return commands[0] if commands else None
+
+    def get_next_commands(self, hwnd: int, limit: int = 4) -> list[dict]:
+        """Return the front of one window's FIFO without leasing/removing it."""
         hwnd = int(hwnd)
+        limit = max(1, min(int(limit), self.MAX_COMMANDS_PER_FRAME))
         with self._lock:
             q = self._commands_by_hwnd.get(hwnd)
             if not q:
-                return None
-            return dict(q[0])
+                return []
+            frame_id = int(q[0]["frame_id"])
+            out: list[dict] = []
+            for command in q:
+                if int(command["frame_id"]) != frame_id or len(out) >= limit:
+                    break
+                command["leased"] = True
+                out.append(self._public_command(command))
+            return out
 
     def ack_command(self, command_id: int, hwnd: int) -> bool:
         hwnd = int(hwnd)
@@ -268,6 +362,11 @@ class DjangoPlannerBridge:
                 "hwnd": hwnd,
                 "processing_frame_id": None if processing is None else processing.frame_id,
                 "latest_frame_id": None if latest is None else latest.frame_id,
+                "processing_age_sec": (
+                    None
+                    if processing is None
+                    else round(time.monotonic() - processing.received_monotonic, 3)
+                ),
                 "queued_commands": len(q),
                 "command_ids": [int(x["id"]) for x in q],
             }

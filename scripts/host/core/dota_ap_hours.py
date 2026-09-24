@@ -2,19 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import base64
-import hmac
-import json
 import logging
-import struct
 import sys
 import time
-from pathlib import Path
 from typing import Dict, Iterable, List, Set
 
 import requests
-from steam import webauth
-from steam.guard import generate_twofactor_code
 
 # Логгер
 logger = logging.getLogger("dota_ap_hours")
@@ -23,36 +16,31 @@ logger = logging.getLogger("dota_ap_hours")
 
 
 API_BASE = "https://api.opendota.com/api"
-ALL_PICK_MODES: Set[int] = {1, 22}  # All Pick и Ranked All Pick
+# Dota 2 game_mode: 1 — All Pick, 5 — Single Draft.
+# Ranked All Pick (22) intentionally is not included.
+UNRANKED_MODES: Set[int] = {1, 5}
 OPEN_DOTA_LIMIT = 100
 
 
-def read_mafile(path: Path) -> Dict:
+def get_steam_id(username: str, password: str) -> str:
+    """Return SteamID64 through the current Steam credentials-auth endpoint."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error("Не удалось прочитать maFile: %s", e)
+        from scripts.host.core.steamid import SteamCredentialsError, get_steamid64
+    except ImportError:
+        logger.error(
+            "Не установлена зависимость 'steam'. Запустите скрипт Python из venv "
+            "или установите зависимости из requirements.txt."
+        )
         sys.exit(1)
 
-
-def login_with_guard(username: str, password: str, shared_secret_b64: str) -> str:
-
-    code = generate_twofactor_code(shared_secret_b64)
-    wa = webauth.WebAuth(username)
     try:
-        wa.login(password=password, twofactor_code=code)
+        return get_steamid64(username, password)
+    except SteamCredentialsError as e:
+        logger.error("Steam не подтвердил учётные данные: %s", e)
+        sys.exit(1)
     except Exception as e:
-        logger.error("Ошибка логина в Steam: %s", e)
+        logger.error("Не удалось получить SteamID: %s", e)
         sys.exit(1)
-
-    if not getattr(wa, "steam_id", None):
-        logger.error("Не удалось получить steam_id из сессии.")
-        sys.exit(1)
-
-    steam_id64 = (
-        str(wa.steam_id.as_64) if hasattr(wa.steam_id, "as_64") else str(wa.steam_id)
-    )
-    return steam_id64
 
 
 def steam64_to_account32(steam64: str) -> int:
@@ -163,28 +151,27 @@ def parse_log_level(level_str: str) -> int:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Сумма наигранных часов в Dota 2 (All Pick) по истории матчей (OpenDota) с логином в Steam через Guard."
+        description=(
+            "Сумма часов в неранговых All Pick и Single Draft по истории матчей "
+            "OpenDota."
+        )
     )
     parser.add_argument("--login", required=True, help="Steam логин")
     parser.add_argument("--password", required=True, help="Steam пароль")
     parser.add_argument(
-        "--mafile", required=True, help="Путь к вашему maFile JSON (SDA)"
+        "--mafile",
+        help="Необязательный устаревший параметр; для расчёта часов больше не нужен.",
     )
-    parser.add_argument(
-        "--include_ranked_ap",
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--only-all-pick",
         action="store_true",
-        default=True,
-        help="Включать Ranked All Pick (game_mode=22). По умолчанию включен.",
+        help="Считать только неранговый All Pick (game_mode=1).",
     )
-    parser.add_argument(
-        "--only_ranked",
+    mode_group.add_argument(
+        "--only-single-draft",
         action="store_true",
-        help="Считать ТОЛЬКО Ranked All Pick (22).",
-    )
-    parser.add_argument(
-        "--only_normal",
-        action="store_true",
-        help="Считать ТОЛЬКО обычный All Pick (1).",
+        help="Считать только Single Draft (game_mode=5).",
     )
     parser.add_argument(
         "--log-level",
@@ -201,30 +188,23 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    ma = read_mafile(Path(args.mafile))
+    if args.mafile:
+        logger.warning("--mafile больше не используется и может быть убран из команды.")
 
-    shared_secret = ma.get("shared_secret")
-    if not shared_secret:
-        logger.error("В maFile отсутствует 'shared_secret'.")
-        sys.exit(1)
-
-    logger.info("Логинимся в Steam…")
-    steam_id64 = login_with_guard(args.login, args.password, shared_secret)
+    logger.info("Получаем SteamID…")
+    steam_id64 = get_steam_id(args.login, args.password)
     logger.info("Ваш SteamID64: %s", steam_id64)
 
     account_id = steam64_to_account32(steam_id64)
     logger.info("account_id (OpenDota): %s", account_id)
 
     # режимы
-    if args.only_ranked and args.only_normal:
-        logger.error("Нельзя одновременно указать --only_ranked и --only_normal.")
-        sys.exit(1)
-    if args.only_ranked:
-        modes = {22}
-    elif args.only_normal:
+    if args.only_all_pick:
         modes = {1}
+    elif args.only_single_draft:
+        modes = {5}
     else:
-        modes = {1, 22}
+        modes = UNRANKED_MODES
 
     logger.info("Загружаем матчи из OpenDota… Режимы: %s", sorted(modes))
     matches = fetch_all_matches_account(account_id, modes)
@@ -232,11 +212,11 @@ def main():
 
     totals = sum_durations(matches)
     if modes == {1}:
-        label = "All Pick (обычный)"
-    elif modes == {22}:
-        label = "Ranked All Pick"
+        label = "Неранговый All Pick"
+    elif modes == {5}:
+        label = "Single Draft"
     else:
-        label = "All Pick (обычный + ranked)"
+        label = "Неранговые All Pick + Single Draft"
 
     logger.info("— — — — —")
     logger.info(
@@ -247,3 +227,7 @@ def main():
         totals["hours_float"],
     )
     logger.debug("Всего секунд: %s", totals["total_sec"])
+
+
+if __name__ == "__main__":
+    main()

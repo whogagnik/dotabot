@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
+import argparse
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from pathlib import Path
+from typing import Any, List, Tuple, Optional, Dict
 
+import json
 import time
 import logging
 from functools import wraps
@@ -98,6 +101,13 @@ HP_BROWN_ENEMY_CREEPS_UPPER = np.array([30, 15, 10], np.uint8)
 
 HP_BROWN_ALLY_CREEPS_LOWER = np.array([5, 20, 4], np.uint8)
 HP_BROWN_ALLY_CREEPS_UPPER = np.array([15, 35, 10], np.uint8)
+
+# Enemy tower health bars (RGB).  The dark brown is the unfilled part of
+# the same bar, not a separate unit type.
+ENEMY_TOWER_LOWER = np.array([155, 70, 35], np.uint8)
+ENEMY_TOWER_UPPER = np.array([190, 90, 55], np.uint8)
+HP_BROWN_ENEMY_TOWER_LOWER = np.array([85, 40, 25], np.uint8)
+HP_BROWN_ENEMY_TOWER_UPPER = np.array([95, 55, 35], np.uint8)
 
 # FIXED MANA COLOR (RGB)
 MANA_COLOR = np.array([79, 120, 249], dtype=np.uint8)
@@ -577,6 +587,7 @@ def find_hp_bars(
     bg_mode: str = "black",  # "black" или "brown"
     bg_color_ranges: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     right_side_brown_range: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    component_backend: str = "labels",
 ) -> List[HpBarBox]:
 
     h, w = frame_rgb.shape[:2]
@@ -604,23 +615,59 @@ def find_hp_bars(
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
 
-    with log_step("find_hp_bars: connectedComponentsWithStats", logging.DEBUG):
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask, connectivity=4
-        )
+    if component_backend == "labels":
+        with log_step("find_hp_bars: connectedComponentsWithStats", logging.DEBUG):
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                mask, connectivity=4
+            )
+        component_count = num_labels - 1
+
+        def components():
+            for label_id in range(1, num_labels):
+                x, y, ww, hh, _ = stats[label_id]
+                yield x, y, ww, hh, labels[y:y + hh, x:x + ww] == label_id
+    elif component_backend in ("contours", "contours_hybrid", "contours_all"):
+        with log_step("find_hp_bars: findContours", logging.DEBUG):
+            retrieval_mode = (
+                cv2.RETR_LIST if component_backend == "contours_all" else cv2.RETR_EXTERNAL
+            )
+            contours, _ = cv2.findContours(
+                mask, retrieval_mode, cv2.CHAIN_APPROX_SIMPLE
+            )
+        component_count = len(contours)
+
+        def components():
+            for contour in contours:
+                x, y, ww, hh = cv2.boundingRect(contour)
+                if (
+                    component_backend == "contours_hybrid"
+                    and (ww > w_max or hh > h_max)
+                    and ww <= w_max * 4
+                    and hh <= max(10, h_max * 4)
+                ):
+                    roi_mask = mask[y:y + hh, x:x + ww]
+                    local_count, local_labels, local_stats, _ = (
+                        cv2.connectedComponentsWithStats(roi_mask, connectivity=4)
+                    )
+                    if local_count > 2:
+                        for local_id in range(1, local_count):
+                            lx, ly, lww, lhh, _ = local_stats[local_id]
+                            yield (
+                                x + lx, y + ly, lww, lhh,
+                                local_labels[ly:ly + lhh, lx:lx + lww] == local_id,
+                            )
+                        continue
+                yield x, y, ww, hh, mask[y:y + hh, x:x + ww] > 0
+    else:
+        raise ValueError(f"Unknown component backend: {component_backend}")
 
     prelim: List[Tuple[HpBarBox, float]] = []
 
     with log_step("find_hp_bars: iterate components", logging.DEBUG):
-        for label_id in range(1, num_labels):
-            x, y, ww, hh, area = stats[label_id]
-
+        for x, y, ww, hh, comp_mask in components():
             # отсечь совсем мелкий мусор
             if ww < 4 or hh < 1 or hh > 10:
                 continue
-
-            labels_roi = labels[y : y + hh, x : x + ww]
-            comp_mask = labels_roi == label_id
 
             if right_side_mode == "creep":
                 core = largest_solid_rect(comp_mask)
@@ -720,7 +767,7 @@ def find_hp_bars(
 
     logger.debug(
         f"find_hp_bars summary: frame={_short_shape(frame_rgb)}, "
-        f"labels={num_labels - 1}, found={len(result)}, "
+        f"components={component_count}, backend={component_backend}, found={len(result)}, "
         f"require_mana={require_mana}, mode={right_side_mode}"
     )
     return result
@@ -734,6 +781,7 @@ def find_enemy_heroes_hp_bars(
     h_min: int = 4,
     h_max: int = 5,
     target_w: int | None = None,
+    component_backend: str = "labels",
 ) -> List[HpBarBox]:
     hp_ranges = [
         (ENEMY_RED_HEROES_LOWER, ENEMY_RED_HEROES_UPPER),
@@ -754,6 +802,7 @@ def find_enemy_heroes_hp_bars(
         bg_mode="black",
         bg_color_ranges=None,
         right_side_brown_range=(HP_BROWN_HEROES_LOWER, HP_BROWN_HEROES_UPPER),
+        component_backend=component_backend,
     )
 
 
@@ -765,6 +814,7 @@ def find_ally_heroes_hp_bars(
     h_min: int = 4,
     h_max: int = 5,
     target_w: int | None = None,
+    component_backend: str = "labels",
 ) -> List[HpBarBox]:
     # союзник: зелёная HP, мана под ним опциональна (если в игре её нет)
     hp_ranges = [
@@ -785,6 +835,7 @@ def find_ally_heroes_hp_bars(
         bg_mode="black",
         bg_color_ranges=None,
         right_side_brown_range=(HP_BROWN_HEROES_LOWER, HP_BROWN_HEROES_UPPER),
+        component_backend=component_backend,
     )
 
 
@@ -796,6 +847,7 @@ def find_self_heroes_hp_bars(
     h_min: int = 4,
     h_max: int = 6,
     target_w: int | None = None,
+    component_backend: str = "labels",
 ) -> List[HpBarBox]:
     # союзник: зелёная HP, мана под ним опциональна (если в игре её нет)
     hp_ranges = [
@@ -816,6 +868,7 @@ def find_self_heroes_hp_bars(
         bg_mode="black",
         bg_color_ranges=None,
         right_side_brown_range=(HP_BROWN_HEROES_LOWER, HP_BROWN_HEROES_UPPER),
+        component_backend=component_backend,
     )
 
 
@@ -827,6 +880,7 @@ def find_ally_creeps_hp_bars(
     h_min: int = 1,
     h_max: int = 2,
     target_w: int | None = None,
+    component_backend: str = "labels",
 ) -> List[HpBarBox]:
     hp_ranges = [
         (ALLY_GREEN_CREEPS_LOWER, ALLY_GREEN_CREEPS_UPPER),
@@ -855,6 +909,7 @@ def find_ally_creeps_hp_bars(
             HP_BROWN_ALLY_CREEPS_LOWER,
             HP_BROWN_ALLY_CREEPS_UPPER,
         ),
+        component_backend=component_backend,
     )
 
 
@@ -866,6 +921,7 @@ def find_enemy_creeps_hp_bars(
     h_min: int = 1,
     h_max: int = 2,
     target_w: int | None = None,
+    component_backend: str = "labels",
 ) -> List[HpBarBox]:
     hp_ranges = [
         (ENEMY_RED_CREEPS_LOWER, ENEMY_RED_CREEPS_UPPER),
@@ -894,7 +950,48 @@ def find_enemy_creeps_hp_bars(
             HP_BROWN_ENEMY_CREEPS_LOWER,
             HP_BROWN_ENEMY_CREEPS_UPPER,
         ),
+        component_backend=component_backend,
     )
+
+@log_timing(logging.DEBUG)
+def find_enemy_tower_hp_bars(
+    frame_rgb: np.ndarray,
+    w_min: int = 45,
+    w_max: int = 55,
+    h_min: int = 1,
+    h_max: int = 2,
+    target_w: int | None = None,
+    component_backend: str = "labels",
+) -> List[HpBarBox]:
+    hp_ranges = [
+        (ENEMY_TOWER_LOWER, ENEMY_TOWER_UPPER),
+        (HP_BROWN_ENEMY_TOWER_LOWER, HP_BROWN_ENEMY_TOWER_UPPER),
+    ]
+    return find_hp_bars(
+        frame_rgb,
+        hp_color_ranges=hp_ranges,
+        w_min=w_min,
+        w_max=w_max,
+        h_min=h_min,
+        h_max=h_max,
+        target_w=target_w,
+        require_mana=False,
+        right_side_mode="creep",
+        relaxed_merge=True,
+        bg_mode="brown",
+        bg_color_ranges=[
+            (
+                HP_BROWN_ENEMY_TOWER_LOWER,
+                HP_BROWN_ENEMY_TOWER_UPPER,
+            )
+        ],
+        right_side_brown_range=(
+            HP_BROWN_ENEMY_TOWER_LOWER,
+            HP_BROWN_ENEMY_TOWER_UPPER,
+        ),
+        component_backend=component_backend,
+    )
+
 
 
 @log_timing(logging.DEBUG)
@@ -959,9 +1056,8 @@ def _filter_creeps_touching_self(
     return filtered
 
 
-@log_timing(logging.DEBUG)
-def scan_hp_bars_on_screen(
-    frame_rgb: np.ndarray,
+def _scan_hp_bars_on_screen(
+    frame_rgb: np.ndarray, component_backend: str,
 ) -> Dict[str, Dict[str, List[HpBarBox]]]:
     """
     Общий сканер: на вход полный скрин (RGB),
@@ -975,20 +1071,26 @@ def scan_hp_bars_on_screen(
         "creeps": {
             "enemy": [...],
             "ally":  [...],  # уже отфильтрованные от "прилипших" к self
+        },
+        "towers": {
+            "enemy": [...],
         }
     }
     """
 
     # --- герои ---
     with log_step("scan_hp_bars_on_screen: heroes", logging.DEBUG):
-        bars_enemy_heroes = find_enemy_heroes_hp_bars(frame_rgb)
-        bars_ally_heroes = find_ally_heroes_hp_bars(frame_rgb)
-        bars_self_heroes = find_self_heroes_hp_bars(frame_rgb)
+        bars_enemy_heroes = find_enemy_heroes_hp_bars(frame_rgb, component_backend=component_backend)
+        bars_ally_heroes = find_ally_heroes_hp_bars(frame_rgb, component_backend=component_backend)
+        bars_self_heroes = find_self_heroes_hp_bars(frame_rgb, component_backend=component_backend)
 
     # --- крипы ---
     with log_step("scan_hp_bars_on_screen: creeps", logging.DEBUG):
-        bars_ally_creeps = find_ally_creeps_hp_bars(frame_rgb)
-        bars_enemy_creeps = find_enemy_creeps_hp_bars(frame_rgb)
+        bars_ally_creeps = find_ally_creeps_hp_bars(frame_rgb, component_backend=component_backend)
+        bars_enemy_creeps = find_enemy_creeps_hp_bars(frame_rgb, component_backend=component_backend)
+
+    with log_step("scan_hp_bars_on_screen: enemy towers", logging.DEBUG):
+        bars_enemy_towers = find_enemy_tower_hp_bars(frame_rgb, component_backend=component_backend)
 
     # фильтруем крипов, которые вплотную контактят с self-героем сверху
     with log_step("scan_hp_bars_on_screen: filter creeps touching self", logging.DEBUG):
@@ -1010,15 +1112,48 @@ def scan_hp_bars_on_screen(
             "enemy": bars_enemy_creeps,
             "ally": bars_ally_creeps_filtered,
         },
+        "towers": {"enemy": bars_enemy_towers},
     }
 
     logger.debug(
         "scan_hp_bars_on_screen summary: "
         f"enemy_heroes={len(bars_enemy_heroes)}, ally_heroes={len(bars_ally_heroes)}, "
         f"self_heroes={len(bars_self_heroes)}, ally_creeps={len(bars_ally_creeps_filtered)}, "
-        f"enemy_creeps={len(bars_enemy_creeps)}"
+        f"enemy_creeps={len(bars_enemy_creeps)}, enemy_towers={len(bars_enemy_towers)}"
     )
     return result
+
+
+@log_timing(logging.DEBUG)
+def scan_hp_bars_on_screen(
+    frame_rgb: np.ndarray,
+) -> Dict[str, Dict[str, List[HpBarBox]]]:
+    """Original baseline scanner. Kept stable for comparisons and fallback."""
+    return _scan_hp_bars_on_screen(frame_rgb, component_backend="labels")
+
+
+@log_timing(logging.DEBUG)
+def scan_hp_bars_on_screen_contours(
+    frame_rgb: np.ndarray,
+) -> Dict[str, Dict[str, List[HpBarBox]]]:
+    """Experimental scanner using contours instead of a full label image."""
+    return _scan_hp_bars_on_screen(frame_rgb, component_backend="contours")
+
+
+@log_timing(logging.DEBUG)
+def scan_hp_bars_on_screen_contours_hybrid(
+    frame_rgb: np.ndarray,
+) -> Dict[str, Dict[str, List[HpBarBox]]]:
+    """Contour scan with local 4-connected fallback for merged candidates."""
+    return _scan_hp_bars_on_screen(frame_rgb, component_backend="contours_hybrid")
+
+
+@log_timing(logging.DEBUG)
+def scan_hp_bars_on_screen_contours_all(
+    frame_rgb: np.ndarray,
+) -> Dict[str, Dict[str, List[HpBarBox]]]:
+    """Contour scan including components enclosed by unrelated colour regions."""
+    return _scan_hp_bars_on_screen(frame_rgb, component_backend="contours_all")
 
 
 # ======================================================================
@@ -1114,55 +1249,122 @@ def grab_roi_rgb_from_window(hwnd: int):
 
 
 # ======================================================================
-#                               DEMO
+#                    CAPTURE AND DATASET ANNOTATION
 # ======================================================================
 
-if __name__ == "__main__":
-    pid = 24104
-    hwnd = find_main_hwnd_for_pid(pid)
+_ANNOTATION_COLORS = {
+    ("heroes", "enemy"): (255, 75, 75),
+    ("heroes", "ally"): (75, 255, 75),
+    ("heroes", "self"): (75, 180, 255),
+    ("creeps", "enemy"): (255, 180, 75),
+    ("creeps", "ally"): (75, 255, 180),
+    ("towers", "enemy"): (255, 75, 255),
+}
+
+
+def _save_rgb_png_uncompressed(path: Path, rgb: np.ndarray) -> None:
+    """Write an RGB frame as lossless PNG without compression work."""
+    written = cv2.imwrite(
+        str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_PNG_COMPRESSION, 0],
+    )
+    if not written:
+        raise OSError(f"Could not write PNG capture: {path}")
+
+
+def hp_bar_annotations(scan: Dict[str, Dict[str, List[HpBarBox]]]) -> List[Dict[str, Any]]:
+    """Flatten all scanner categories into JSON-ready HP-bar annotations."""
+    annotations = []
+    for category, teams in scan.items():
+        for team, bars in teams.items():
+            for bar in bars:
+                annotations.append({
+                    "category": category,
+                    "team": team,
+                    "bbox_xyxy": [bar.x0, bar.y0, bar.x1, bar.y1],
+                    "hp_ratio": bar.hp_ratio,
+                    "mana_ratio": bar.mana_ratio,
+                    "has_mana": bar.has_mana,
+                })
+    return annotations
+
+
+def save_hp_scan_capture(
+    output_dir: Path, frame_rgb: np.ndarray,
+    scan: Dict[str, Dict[str, List[HpBarBox]]], capture_id: str,
+) -> tuple[Path, Path, Path]:
+    """Save raw RGB frame, visual markup and JSON annotations losslessly."""
+    raw_dir = output_dir / "raw"
+    marked_dir = output_dir / "marked"
+    annotations_dir = output_dir / "annotations"
+    for folder in (raw_dir, marked_dir, annotations_dir):
+        folder.mkdir(parents=True, exist_ok=True)
+
+    raw_path = raw_dir / f"{capture_id}.png"
+    marked_path = marked_dir / f"{capture_id}.png"
+    annotation_path = annotations_dir / f"{capture_id}.json"
+    # PNG is lossless; compression level 0 also avoids spending CPU compressing
+    # frames while preserving every RGB value captured from the game.
+    _save_rgb_png_uncompressed(raw_path, frame_rgb)
+
+    marked = frame_rgb.copy()
+    annotations = hp_bar_annotations(scan)
+    for annotation in annotations:
+        x0, y0, x1, y1 = annotation["bbox_xyxy"]
+        key = annotation["category"], annotation["team"]
+        color = _ANNOTATION_COLORS.get(key, (255, 255, 255))
+        cv2.rectangle(marked, (x0, y0), (x1, y1), color, 1)
+        cv2.putText(
+            marked, f"{annotation['category']}:{annotation['team']}",
+            (x0, max(10, y0 - 3)), cv2.FONT_HERSHEY_SIMPLEX, .35, color, 1,
+            cv2.LINE_AA,
+        )
+    _save_rgb_png_uncompressed(marked_path, marked)
+
+    annotation_path.write_text(json.dumps({
+        "image": raw_path.name,
+        "color_space": "RGB",
+        "image_size": {"width": int(frame_rgb.shape[1]), "height": int(frame_rgb.shape[0])},
+        "annotations": annotations,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return raw_path, marked_path, annotation_path
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Capture and annotate all Dota HP bars.")
+    parser.add_argument("--pid", type=int, default=24104, help="Dota process id")
+    parser.add_argument("--output-dir", type=Path, default=Path("runs/hp-scanner-captures"))
+    parser.add_argument("--interval", type=float, default=0.0, help="Seconds between captures")
+    parser.add_argument("--max-frames", type=int, default=0, help="0 means capture until Ctrl+C")
+    args = parser.parse_args(argv)
+    if args.interval < 0 or args.max_frames < 0:
+        parser.error("--interval and --max-frames must be non-negative")
+
+    hwnd = find_main_hwnd_for_pid(args.pid)
     if hwnd is None:
-        print("Не нашёл окно!")
-        exit()
+        print(f"Не нашёл окно Dota для PID {args.pid}.")
+        return 1
 
-    while True:
-        frame = grab_roi_rgb_from_window(hwnd)
-        if frame is None:
-            continue
+    saved = 0
+    print(f"Сохраняю кадры и разметку в {args.output_dir.resolve()}. Остановить: Ctrl+C")
+    try:
+        while args.max_frames == 0 or saved < args.max_frames:
+            frame = grab_roi_rgb_from_window(hwnd)
+            if frame is None:
+                continue
+            scan = scan_hp_bars_on_screen(frame)
+            capture_id = f"frame_{time.time_ns()}_{saved:06d}"
+            raw_path, _, annotation_path = save_hp_scan_capture(
+                args.output_dir, frame, scan, capture_id
+            )
+            saved += 1
+            print(f"[{saved}] {raw_path.name}: {len(hp_bar_annotations(scan))} HP bars; {annotation_path.name}")
+            if args.interval:
+                time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(f"Остановлено. Сохранено кадров: {saved}")
+    return 0
 
-        bars_enemy = find_enemy_heroes_hp_bars(frame)
-        bars_ally = find_ally_heroes_hp_bars(frame)
-        bars_self = find_self_heroes_hp_bars(frame)
-        bars_creeps_ally = find_ally_creeps_hp_bars(frame)
-        bars_creeps_enemy = find_enemy_creeps_hp_bars(frame)
-        print(f"Bars_enemy: {len(bars_enemy)}")
-        for i, b in enumerate(bars_enemy):
-            print(
-                f"{i}: {b.as_tuple()}, HP={b.hp_ratio:.3f}, MANA={b.mana_ratio:.3f}, has_mana={b.has_mana}"
-            )
-            cv2.rectangle(frame, (b.x0, b.y0), (b.x1, b.y1), (0, 255, 0), 1)
-        print(f"Bars_ally: {len(bars_ally)}")
-        for i, b in enumerate(bars_ally):
-            # print(f"{i}: {b.as_tuple()}, HP={b.hp_ratio:.3f}, MANA={b.mana_ratio:.3f}, has_mana={b.has_mana}")
-            cv2.rectangle(frame, (b.x0, b.y0), (b.x1, b.y1), (255, 0, 0), 1)
-        # print(f"Bars_self: {len(bars_self)}")
-        for i, b in enumerate(bars_self):
-            # print(f"{i}: {b.as_tuple()}, HP={b.hp_ratio:.3f}, MANA={b.mana_ratio:.3f}, has_mana={b.has_mana}")
-            cv2.rectangle(frame, (b.x0, b.y0), (b.x1, b.y1), (255, 0, 0), 1)
-        print(f"Bars_creeps_ally: {len(bars_creeps_ally)}")
-        for i, b in enumerate(bars_creeps_ally):
-            print(
-                f"{i}: {b.as_tuple()}, HP={b.hp_ratio:.3f}, MANA={b.mana_ratio:.3f}, has_mana={b.has_mana}"
-            )
-            cv2.rectangle(frame, (b.x0, b.y0), (b.x1, b.y1), (255, 0, 0), 1)
-        print(f"Bars_creeps_enemy: {len(bars_creeps_enemy)}")
-        for i, b in enumerate(bars_creeps_enemy):
-            print(
-                f"{i}: {b.as_tuple()}, HP={b.hp_ratio:.3f}, MANA={b.mana_ratio:.3f}, has_mana={b.has_mana}"
-            )
-            cv2.rectangle(frame, (b.x0, b.y0), (b.x1, b.y1), (255, 0, 0), 1)
 
-        img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        cv2.imshow("HP+MANA", img)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-    cv2.destroyAllWindows()
+if __name__ == "__main__":
+    raise SystemExit(main())

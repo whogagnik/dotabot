@@ -6,6 +6,8 @@ from scripts.host.django.views import (
     SubmitFrameRawView,
     GetCommandView,
     AckCommandView,
+    GetPlannerCommandView,
+    AckPlannerCommandView,
     VmLogView,
 )
 
@@ -15,5 +17,7 @@ urlpatterns = [
     path("planner/submit-frame-raw", SubmitFrameRawView.as_view(), name="planner-submit-frame-raw"),
     path("planner/get-command", GetCommandView.as_view(), name="planner-get-command"),
     path("planner/ack-command", AckCommandView.as_view(), name="planner-ack-command"),
+    path("planner/get-planner-command", GetPlannerCommandView.as_view(), name="planner-get-command"),
+    path("planner/ack-planner-command", AckPlannerCommandView.as_view(), name="planner-ack-command"),
     path("planner/log", VmLogView.as_view(), name="planner-log"),
 ]
